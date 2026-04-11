@@ -1,0 +1,116 @@
+# ecd_disambiguation.yaml
+# Injected into the ECD on every extraction run.
+# Contains: source priority block + cross-table disambiguation rules.
+# DO NOT edit field paths here without updating field_mapping.py accordingly.
+
+source_priority:
+  description: >
+    When the same field appears in multiple source documents and values conflict,
+    resolve using this priority order. The SOURCE DOCUMENT SECTIONS are labelled
+    in the combined input content with "--- SOURCE: {site_name} (raw_id=...) ---".
+  order:
+    - source: OEM official site
+      priority: 1
+      trust_reason: >
+        Direct manufacturer specification. Always authoritative on hardware specs.
+        If the OEM site states a value, use it regardless of what other sources say.
+
+    - source: YouTube transcript
+      priority: 2
+      trust_reason: >
+        Indian market reviewer with physical device. Reliable for:
+        charger_in_box, in_the_box contents, India-specific colour availability,
+        India-specific variant configurations, real-world confirmations.
+        Reviewers from Indian channels (Tech Burner, Technical Guruji, Trakin Tech,
+        Beebom, etc.) physically test the India retail unit.
+      exceptions:
+        fields_where_aggregator_wins:
+          - "displays[*].resolution_height_px"
+          - "displays[*].resolution_width_px"
+          - "charging.battery_capacity"
+          - "camera_lenses[*].megapixels"
+          - "body.length"
+          - "body.breadth"
+          - "body.height"
+          - "body.weight"
+          - "network.bands_5g"
+          - "network.bands_4g"
+        reason: >
+          Transcripts approximate or round numeric values in spoken language.
+          Aggregators have exact figures from spec sheets. For these fields,
+          prefer aggregator over transcript even though transcript has higher
+          general priority.
+
+    - source: Aggregator site (GSMArena, Smartprix)
+      priority: 3
+      trust_reason: >
+        Comprehensive spec coverage but may reflect global or EU specifications
+        rather than the India retail unit. Use as fallback when OEM and
+        transcript are both silent on a field.
+
+disambiguation_rules:
+  - rule: "Dolby Atmos"
+    note: >
+      Dolby Atmos can apply to THREE different contexts simultaneously.
+      Do NOT deduplicate — all three may be true for the same phone.
+    applies_to:
+      - path: audio.audio_codecs
+        context: "Speaker output / playback — the phone's speakers support Dolby Atmos"
+      - path: "displays[*].display_features"
+        context: "Display HDR — the screen can display Dolby Atmos HDR content"
+      - path: "camera_lenses[*].camera_features"
+        context: "Video recording — the camera records Dolby Atmos audio"
+
+  - rule: "LTPO"
+    note: >
+      LTPO is both a panel technology AND a display capability flag.
+      Populate BOTH fields — they are not redundant.
+    applies_to:
+      - path: "displays[*].panel_type"
+        context: "The panel technology itself — e.g. LTPO3 AMOLED, LTPO4 AMOLED"
+      - path: "displays[*].display_features"
+        context: "Adaptive refresh rate capability flag — add 'LTPO' or 'Adaptive Refresh Rate'"
+
+  - rule: "OIS (Optical Image Stabilisation)"
+    note: >
+      OIS applies at two levels simultaneously. Populate BOTH.
+    applies_to:
+      - path: "camera_lenses[*].stabilization"
+        context: "Per-lens stabilisation type for the specific lens that has OIS"
+      - path: "camera_lenses[*].camera_features"
+        context: "General camera system feature — the camera system supports OIS"
+
+  - rule: "Samsung App Lock"
+    maps_to: "os_and_security.security_features"
+    canonical_value: "Secure Folder"
+    note: >
+      For Samsung phones, 'App Lock' is not a standalone feature.
+      App Lock functionality lives inside Secure Folder. Map to 'Secure Folder'.
+      Do NOT create a separate 'App Lock' entry for Samsung.
+
+  - rule: "Wi-Fi calling / VoWiFi"
+    maps_to: "connectivity.wifi_technologies"
+    note: >
+      Wi-Fi Calling (VoWiFi) goes under connectivity.wifi_technologies,
+      NOT under network. It is a Wi-Fi feature, not a cellular network feature.
+
+  - rule: "5G SA vs NSA"
+    maps_to: "network.bands_5g"
+    note: >
+      SA (Standalone) and NSA (Non-Standalone) 5G modes are not band names.
+      Do NOT include 'SA' or 'NSA' in bands_5g. Extract only actual band names
+      (e.g. n28, n78, n5, n8). SA/NSA support goes in network.vo5g or
+      body_features.other_features if explicitly stated.
+
+  - rule: "USB features vs USB standard"
+    note: >
+      connectivity.usb_standard: The USB version (e.g. USB 3.2 Gen 2, USB 2.0).
+      connectivity.usb_features: Capabilities (DisplayPort, OTG, USB-C Alt Mode).
+      These are different fields. USB 3.2 Gen 2 is a standard; OTG is a feature.
+
+  - rule: "Bluetooth profiles vs version"
+    note: >
+      connectivity.bluetooth_version: The version string only (e.g. '5.4', '5.3').
+      Do NOT include profile names (A2DP, LE Audio, Auracast) in bluetooth_version.
+      Bluetooth profiles are not currently a separate field — omit them or note in
+      body_features.other_features if explicitly important.

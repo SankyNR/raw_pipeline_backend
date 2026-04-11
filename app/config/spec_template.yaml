@@ -1,0 +1,226 @@
+# spec_template.yaml
+# Extraction Output Template for Run A — Spec Extraction
+# Version: v1
+# This file is loaded at startup and passed (minus RUN_C_CALCULATED_FIELDS)
+# to the Gemini LLM as the output structure guide.
+#
+# Units: INR | mm | grams | GB | GHz | degrees C | ISO 8601 dates
+# DO NOT MODIFY field paths without updating field_mapping.py accordingly.
+
+extraction_task:
+  target_entity: "Mobile Phone"
+  schema: "mobile_specs (PostgreSQL)"
+  instructions: |
+    Extract ALL available specifications for the phone described in the input sources.
+    For fields that use lookups (marked <- lookup), output the EXACT string value from
+    the allowed values list. For junction table arrays (marked <- junction), output a
+    list of exact string values from the allowed values. Use null for missing or unknown
+    fields — never guess. All prices in INR. All dimensions in mm. Weight in grams.
+    Memory in GB. Dates in ISO 8601 (YYYY-MM-DD).
+
+  source_priority: |
+    When the same field appears in multiple sources and values conflict, resolve:
+      1st (wins) — OEM official site: always authoritative on hardware specs
+      2nd        — YouTube transcript: reliable for charger-in-box, in-box contents,
+                   India-specific features and variants
+      3rd        — Aggregator sites (GSMArena, Smartprix): used when OEM and
+                   transcript are both silent on a field
+    EXCEPTION: For numeric precision fields (resolution_px, battery_capacity,
+    exact mm dimensions, megapixels) prefer aggregator values over transcript —
+    transcripts round and approximate.
+
+  derived_fields_do_not_extract: |
+    STRICTLY FORBIDDEN — these are computed by Run C, never by the LLM:
+      - displays[*].ppi            -> computed: sqrt(h²+w²) / size_inch
+      - camera_lenses[*].sensor_size_decimal -> computed: 1.0 / sensor_size_denominator
+
+# Output structure — see extraction_templates_v3.md for full field documentation
+output:
+  brand:
+    brand_name: null
+
+  phone_identity:
+    model_name: null
+    launch_date: null
+
+  chipset:
+    chipset_name: null
+    cpu_architecture: null
+    fabrication_node: null
+    number_of_cores: null
+    cpu_high_performance: null
+    cpu_performance_cores: null
+    cpu_efficiency_cores: null
+    cpu_clock_speed: null
+    gpu_name: null
+    gpu_architecture: null
+    gpu_unit_count: null
+    gpu_unit_type: null
+    gpu_clock_speed: null
+    npu_details: null
+    npu_tops: null
+
+  variants:
+    - ram_capacity: null
+      ram_type: null
+      ram_frequency: null
+      virtual_ram_availability: null
+      virtual_ram_size: null
+      storage_capacity: null
+      storage_type: null
+      expandable_storage: null
+      launch_price: null
+      is_base_variant: null
+
+  displays:
+    - display_type: null
+      display_position: null
+      panel_type: null
+      size_inch: null
+      resolution_height_px: null
+      resolution_width_px: null
+      aspect_ratio: null
+      colour_depth: null
+      refresh_rate: null
+      brightness_hbm: null
+      brightness_peak: null
+      pwm_frequency: null
+      screen_to_body_ratio: null
+      screen_shape: null
+      glass_protection: null
+      display_features: []
+
+  body:
+    length: null
+    breadth: null
+    height: null
+    length_folded: null
+    breadth_folded: null
+    height_folded: null
+    weight: null
+    build: null
+    buttons: null
+    colors: null
+    has_stylus: null
+    stylus_features: null
+    other_features: null
+
+  charging:
+    battery_capacity: null
+    battery_type: null
+    charging_voltage: null
+    charging_ampere: null
+    charging_power: null
+    cable_type: null
+    proprietary_charging: null
+    charger_in_box: null
+    wireless_charging: null
+    wireless_charging_power: null
+    wireless_charging_standard: null
+    reverse_wireless_charging: null
+    reverse_wireless_charging_power: null
+    charger_technologies: []
+    battery_and_charging_features: null
+
+  audio:
+    speaker_count: null
+    speaker_positions: null
+    microphone_count: null
+    microphone_positions: null
+    has_3_5mm_jack: null
+    audio_features: null
+    audio_codecs: []
+
+  sensors:
+    fingerprint_sensor: null
+    other_sensors: []
+
+  connectivity:
+    wifi_standard: null
+    wifi_technologies: []
+    bluetooth_version: null
+    usb_standard: null
+    usb_features: []
+    nfc: null
+    uwb: null
+    ir_blaster: null
+    wifi_hotspot: null
+    location_services: []
+
+  network:
+    number_of_sims: null
+    esim_support: null
+    sim_configuration: null
+    sim_tray_position: null
+    bands_2g: null
+    bands_3g: null
+    bands_4g: []
+    bands_5g: []
+    cellular_features: []
+    volte: null
+    vo5g: null
+    vowifi: null
+
+  camera_overview:
+    rear_camera_setup: null
+    rear_camera_island_shape: null
+    rear_camera_island_position: null
+    front_camera_setup: null
+    front_camera_shape: null
+    front_camera_position: null
+    flash: null
+
+  camera_lenses:
+    - lens_type: null
+      sensor_model: null
+      sensor_type: null
+      megapixels: null
+      sensor_size_denominator: null
+      pixel_size: null
+      aperture: null
+      focal_length: null
+      fov: null
+      optical_zoom_capacity: null
+      digital_zoom_capacity: null
+      autofocus_type: null
+      is_macro_capable: null
+      lens_features: null
+      stabilization: []
+      camera_features: []
+
+  video_capabilities:
+    rear_video_resolutions: null
+    front_video_resolutions: null
+    slow_motion: null
+
+  os_and_security:
+    os_name: null
+    ui_skin: null
+    os_update_years: null
+    security_update_years: null
+    biometrics: []
+    unlock_methods: []
+    security_features: []
+
+  certifications:
+    ip_ratings: []
+    sar_head: null
+    sar_body: null
+    widevine_support: null
+    widevine_level: null
+    bis_certification: null
+    other_certifications: null
+    video_certifications: []
+    audio_certifications: []
+
+  ai_capabilities:
+    ai_system: null
+    processing_type: null
+    ai_features: []
+
+  extra_features: []
+
+  in_the_box:
+    - item_name: null
+      item_specification: null
+      quantity: 1
