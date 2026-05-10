@@ -330,6 +330,12 @@ displays[*].panel_type:
   "Super Retina XDR" | "LTPO Super Retina XDR" | "ProMotion Super Retina XDR OLED"
   "MicroLED"
 
+displays[*].display_features — qualitative capabilities only. NEVER include:
+  refresh rate values (dedicated field: refresh_rate)
+  bit depth values (dedicated field: colour_depth)
+  PWM/dimming values (dedicated field: pwm_frequency)
+  nits values (dedicated fields: brightness_hbm, brightness_peak)
+
 displays[*].glass_protection (drop "Corning" prefix — "Corning Gorilla Glass 5" → "Gorilla Glass 5"):
   "Gorilla Glass 3" | "Gorilla Glass 5" | "Gorilla Glass 6" | "Gorilla Glass 7"
   "Gorilla Glass Victus" | "Gorilla Glass Victus 2" | "Gorilla Glass Armor"
@@ -411,7 +417,7 @@ os_and_security.biometrics (array):
   "3D Face Recognition" | "Iris Scanner" | "Voice Recognition"
 
 --- CERTIFICATIONS ---
-certifications.widevine_level — see rule 5s (default L1 for phones >= 2018, no source needed):
+certifications.widevine_level — see BIS/WIDEVINE rule (default L1 for phones >= 2017, no source needed):
   "L1" | "L2" | "L3"
 
 certifications.ip_ratings (array):
@@ -433,7 +439,7 @@ certifications.audio_certifications (array):
 --- LOCATION SERVICES ---
 connectivity.location_services (array — always check OEM India page explicitly for NavIC):
   "GPS" | "A-GPS" | "GLONASS" | "Galileo" | "BDS" | "NavIC" | "QZSS"
-  "Dual-frequency GPS" | "WiFi Positioning" | "Cellular Positioning" | "iBeacon Micro-location"
+  "LTEPP" | "Dual-frequency GPS" | "WiFi Positioning" | "Cellular Positioning" | "iBeacon Micro-location"
 
 --- USB FEATURES ---
 connectivity.usb_features (array):

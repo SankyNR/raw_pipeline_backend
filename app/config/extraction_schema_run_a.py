@@ -237,7 +237,7 @@ class CameraOverviewData(BaseModel):
 class VideoCapabilitiesData(BaseModel):  # Change 1e: new class
     rear_video_resolutions: Optional[ExtractedString] = None
     front_video_resolutions: Optional[ExtractedString] = None
-    slow_motion: Optional[ExtractedString] = None
+    slow_motion_resolutions: Optional[ExtractedString] = None
 
 
 class PerformanceBenchmarksData(BaseModel):  # Change 1f: new class
@@ -488,7 +488,7 @@ class SimpleCameraOverviewData(BaseModel):
 class SimpleVideoCapabilitiesData(BaseModel):  # Change 1e: new class
     rear_video_resolutions: Optional[str] = None
     front_video_resolutions: Optional[str] = None
-    slow_motion: Optional[str] = None
+    slow_motion_resolutions: Optional[str] = None
 
 
 class SimplePerformanceBenchmarksData(BaseModel):  # Change 1f: new class

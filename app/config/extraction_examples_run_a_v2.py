@@ -279,9 +279,9 @@ EXAMPLE_FLAGSHIP = {
             }
         ],
         "video_capabilities": {
-            "rear_video_resolutions": {"value": "8K@24/30fps, 4K@30/60/120fps, 1080p@30/60/120/240fps", "_source": {"raw_id": 15, "evidence_text": "8K@24/30fps, 4K@30/60/120fps, 1080p@30/60/120/240fps"}},
+            "rear_video_resolutions": {"value": "8K@24/30fps, 4K@30/60fps, 1080p@30/60fps", "_source": {"raw_id": 15, "evidence_text": "8K@24/30fps, 4K@30/60/120fps, 1080p@30/60/120/240fps"}},
             "front_video_resolutions": {"value": "4K@30/60fps, 1080p@30/60fps", "_source": {"raw_id": 15, "evidence_text": "Front camera: 4K@30/60fps, 1080p@30/60fps"}},
-            "slow_motion": {"value": "4K@120fps, 1080p@240fps", "_source": {"raw_id": 15, "evidence_text": "Slow-mo: 4K@120fps, 1080p@240fps"}}
+            "slow_motion_resolutions": {"value": "4K@120fps, 1080p@240fps", "_source": {"raw_id": 15, "evidence_text": "Slow-mo: 4K@120fps, 1080p@240fps"}}
         },
         "performance_benchmarks": {
             "antutu_version": None,
@@ -306,8 +306,8 @@ EXAMPLE_FLAGSHIP = {
             "ip_ratings": ["IP68"],
             "sar_head": {"value": 1.26, "_source": {"raw_id": 15, "evidence_text": "SAR head: 1.26 W/kg"}},
             "sar_body": {"value": 0.64, "_source": {"raw_id": 15, "evidence_text": "SAR body: 0.64 W/kg"}},
-            "widevine_support": {"value": True, "_source": {"raw_id": 15, "evidence_text": "Widevine DRM: L1"}},
-            "widevine_level": {"value": "L1", "_source": {"raw_id": 15, "evidence_text": "Widevine DRM: L1"}},
+            "widevine_support": {"value": True},
+            "widevine_level": {"value": "L1"},
             "bis_certification": {"value": True},
             "other_certifications": None,
             "video_certifications": ["HDR10+ Certified", "Netflix HDR", "Netflix HD"],

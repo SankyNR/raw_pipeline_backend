@@ -324,8 +324,7 @@ _FIELD_LABELS: dict[str, str] = {
                                             "(e.g. MIL-STD-810H, safety ratings)",
 
     # Video
-    "video_capabilities.slow_motion":            "slow motion video recording capability "
-                                                 "(fps and resolution, e.g. 960fps @ 720p)",
+    "video_capabilities.slow_motion_resolutions": "slow motion video resolutions (fps > 60fps only, e.g. 1080p@120fps, 1080p@240fps)",
     "video_capabilities.rear_video_resolutions":  "rear camera maximum video recording resolution "
                                                  "(e.g. 4K @ 60fps, 8K @ 24fps)",
     "video_capabilities.front_video_resolutions": "front camera maximum video recording resolution",

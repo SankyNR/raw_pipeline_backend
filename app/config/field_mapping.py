@@ -317,7 +317,7 @@ FIELD_PRIORITY_MAP: dict[str, str] = {
     # ------------------------------------------------------------------
     "video_capabilities.rear_video_resolutions":  "skip",
     "video_capabilities.front_video_resolutions": "skip",
-    "video_capabilities.slow_motion":             "skip",
+    "video_capabilities.slow_motion_resolutions":             "skip",
 
     # ------------------------------------------------------------------
     # Performance benchmarks — skip gap enrichment; sourced during extraction only

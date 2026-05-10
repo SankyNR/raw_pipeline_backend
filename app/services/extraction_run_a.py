@@ -159,6 +159,120 @@ def _count_fields(obj, _path: str = "") -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Source section formatters — XML tags with embedded authority metadata
+# ---------------------------------------------------------------------------
+
+# Site names that are OEM official India sources.
+# Add new brands here as they are onboarded.
+_OEM_OFFICIAL_SITE_NAMES: frozenset[str] = frozenset({
+    "motorola_official",
+    "samsung_official",
+    "oneplus_official",
+    "realme_official",
+    "oppo_official",
+    "vivo_official",
+    "xiaomi_official",
+    "apple_official",
+    "google_official",
+    "nothing_official",
+    "iqoo_official",
+    "tecno_official",
+    "itel_official",
+    "lava_official",
+    "poco_official",
+    "infinix_official",
+})
+
+# Site names that are aggregators (global specs, not India-specific).
+_AGGREGATOR_SITE_NAMES: frozenset[str] = frozenset({
+    "gsmarena",
+    "gsm",
+    "smartprix",
+    "91mobiles",
+    "devicespecifications",
+    "nanoreview",
+    "kimovil",
+    "phonearena",
+})
+
+
+def _format_scraped_section(site_name: str, raw_id: int, content: str) -> str:
+    """
+    Wraps a scraped source in an XML tag with authority metadata.
+
+    OEM official sources are tagged as authoritative for all India-specific
+    fields. Aggregator sources are tagged with explicit restrictions on which
+    fields they are forbidden to supply.
+
+    The XML tag attributes are read by Gemini as structured constraints, not
+    prose rules — this gives much stronger source isolation than markdown headers.
+
+    NOTE: The combined string (including these XML tags) is still passed to
+    build_spec_json() for char offset evidence attribution — str.find() works
+    correctly against content inside XML tags.
+    """
+    if site_name in _OEM_OFFICIAL_SITE_NAMES:
+        return (
+            f'<source type="oem_official" raw_id="{raw_id}" site="{site_name}"\n'
+            f'  authority="HIGHEST — authoritative for all India specs"\n'
+            f'  variants="AUTHORITATIVE — extract ONLY variants listed in this section"\n'
+            f'  sim_config="AUTHORITATIVE — always prefer this over aggregators"\n'
+            f'  charger_in_box="AUTHORITATIVE — reflects India retail unit"\n'
+            f'  use_for="all fields">\n'
+            f'{content}\n'
+            f'</source>'
+        )
+    elif site_name in _AGGREGATOR_SITE_NAMES:
+        return (
+            f'<source type="aggregator" raw_id="{raw_id}" site="{site_name}"\n'
+            f'  authority="LOW — global specs, may not reflect India retail"\n'
+            f'  restrictions="FORBIDDEN for: variants, sim_configuration, esim_support,\n'
+            f'    charger_in_box. Use only when oem_official and transcripts are both\n'
+            f'    silent on a field. Never use to add or override variant objects.">\n'
+            f'{content}\n'
+            f'</source>'
+        )
+    else:
+        # Unknown site — treat as low authority
+        return (
+            f'<source type="other" raw_id="{raw_id}" site="{site_name}"\n'
+            f'  authority="LOW — use only as last resort fallback">\n'
+            f'{content}\n'
+            f'</source>'
+        )
+
+
+def _format_transcript_section(
+    raw_transcript_id: int,
+    rank: int,
+    content: str,
+) -> str:
+    """
+    Wraps a YouTube transcript in an XML tag with authority metadata.
+
+    Transcripts are India-based reviewers with a physical unit. They are
+    authoritative for India retail details and can CONFIRM variant counts
+    from the OEM source but cannot INTRODUCE new variants.
+
+    rank=1 is the highest-reliability transcript (by channel reliability score).
+    """
+    return (
+        f'<source type="transcript" raw_transcript_id="{raw_transcript_id}"\n'
+        f'  transcript_rank="{rank}"\n'
+        f'  authority="HIGH for India retail details"\n'
+        f'  use_for="charger_in_box, accessories, india_launch_price,\n'
+        f'    volte_vo5g_vowifi, color_availability, variant_price_confirmation"\n'
+        f'  variants="CAN CONFIRM prices for variants already found in oem_official.\n'
+        f'    CANNOT introduce new variant objects not present in oem_official.\n'
+        f'    If transcript mentions a storage tier not in OEM source, ignore it."\n'
+        f'  restrictions="Approximate numbers — defer to oem_official for exact\n'
+        f'    measurements (dimensions, resolution, battery capacity).">\n'
+        f'{content}\n'
+        f'</source>'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Source assembler
 # ---------------------------------------------------------------------------
 
@@ -172,12 +286,20 @@ async def assemble_run_a_input(
     in a fixed order for Run A (v5: multi-transcript support).
 
     CONCATENATION ORDER:
-      1. OEM official markdown  — structural anchor, clearest field layout
-      2. GSMArena markdown
-      3. Smartprix markdown
-      4. DeviceSpecifications markdown
-      5. Any other aggregator   — in fetch order
-      99. Processed transcript(s) — contextual, always last; up to 3, in rank order
+      1. OEM official markdown  — wrapped in <source type="oem_official"> XML tag
+      2. GSMArena markdown      — wrapped in <source type="aggregator"> XML tag
+      3. Smartprix markdown     — wrapped in <source type="aggregator"> XML tag
+      4. DeviceSpecifications   — wrapped in <source type="aggregator"> XML tag
+      5. Any other aggregator   — wrapped in <source type="other"> XML tag
+      99. Processed transcript(s) — wrapped in <source type="transcript" rank=N> XML tag;
+                                    up to 3, in reliability rank order (rank=1 = best)
+
+    XML source tags embed authority metadata and field-level restrictions directly
+    on each source section. Gemini reads these as structured constraints, giving
+    much stronger source isolation than plain markdown headers.
+
+    The combined string (with XML tags) is passed to build_spec_json() unchanged —
+    str.find() works correctly against content inside XML tags for char offsets.
 
     For each transcript: uses translated_transcript_path if
     youtube_raw_transcript_data.translation_status = 'translation_complete',
@@ -242,9 +364,7 @@ async def assemble_run_a_input(
             continue
 
         file_map[site_name] = raw_id
-        sections.append(
-            f"--- SOURCE: {site_name} (raw_id={raw_id}) ---\n\n{content}"
-        )
+        sections.append(_format_scraped_section(site_name, raw_id, content))
         logger.info(
             "assemble_run_a_input: fetched raw_id=%d site=%r (%d chars)",
             raw_id, site_name, len(content),
@@ -279,13 +399,13 @@ async def assemble_run_a_input(
         try:
             transcript_content = await fetch_file_content(transcript_path)
             fetched_transcript_ids.append(raw_transcript_id)
+            transcript_rank = len(fetched_transcript_ids)  # 1-indexed rank (1 = best)
             sections.append(
-                f"--- SOURCE: transcript (raw_transcript_id={raw_transcript_id}) ---\n\n"
-                f"{transcript_content}"
+                _format_transcript_section(raw_transcript_id, transcript_rank, transcript_content)
             )
             logger.info(
-                "assemble_run_a_input: fetched transcript raw_transcript_id=%d (%d chars)",
-                raw_transcript_id, len(transcript_content),
+                "assemble_run_a_input: fetched transcript raw_transcript_id=%d rank=%d (%d chars)",
+                raw_transcript_id, transcript_rank, len(transcript_content),
             )
         except Exception as exc:
             # Transcript fetch failure is logged as error (high-value input).
@@ -590,16 +710,12 @@ SENSOR SIZE DENOMINATOR — EXACT FORMAT ONLY (5n):
   If the source does not contain "1/X" optical format for a lens: output null.
   Do NOT guess or approximate. null is correct when the data is absent.
 
-REAR CAMERA SETUP — COUNT REAR LENSES ONLY (5o):
-  camera_overview.rear_camera_setup counts ONLY rear-facing camera lenses:
-    Valid rear lens types: Main, Ultra-wide, Telephoto, Periscope, Macro, Depth.
-  NEVER count the Front lens — the front camera count goes in front_camera_setup.
-  Examples:
-    Main + Ultra-wide                     → "Dual"
-    Main + Ultra-wide + Telephoto         → "Triple"
-    Main + Ultra-wide + Telephoto + Macro → "Quad"
-    Main only                             → "Single"
-  If in doubt, count the lens_type entries in camera_lenses[] that are NOT "Front".
+REAR CAMERA SETUP:
+  Count ONLY rear-facing lens types in camera_lenses[]:
+  Valid rear types: Main | Ultra-wide | Telephoto | Periscope | Macro | Depth
+  NEVER count the Front lens.
+  1 rear lens → "Single" | 2 → "Dual" | 3 → "Triple" | 4 → "Quad"
+  Count the lens objects with rear types, then map to word. Do not guess.
 
 ESIM AND SIM CONFIGURATION — LOGICAL CONSISTENCY REQUIRED (5p):
   network.esim_support and network.sim_configuration MUST be logically consistent.
@@ -648,14 +764,30 @@ WIFI TECHNOLOGIES — PROTOCOLS ONLY (5r):
   If a source lists "2.4GHz & 5GHz": set wifi_hotspot from its own evidence;
   ignore the frequency bands for wifi_technologies.
 
-VARIANTS — OEM INDIA ONLY — SOURCE-ANCHORED (5s):
-  The input has source sections labeled "--- SOURCE: {site_name} (raw_id=N) ---".
-  1. Find the OEM official India site section (motorola_official, samsung_official, etc.).
-  2. Extract ONLY variants explicitly listed in THAT section with INR prices.
-  3. Variants from sections labeled "gsmarena", "smartprix", or other aggregators → IGNORE.
-  4. Output exactly the variants from the OEM India section — no more.
-  SELF-CHECK: Does any variant object have evidence_text from a gsmarena/aggregator section?
-  If yes → delete it. Only OEM India raw_id is valid for variants.
+VARIANTS — OEM OFFICIAL ONLY — XML SOURCE ANCHORED (5s):
+  The input sources are wrapped in XML tags. Source authority is encoded in the tag:
+    <source type="oem_official" ...>  — ONLY valid source for variants
+    <source type="aggregator" ...>    — FORBIDDEN for variants (global tiers, not India)
+    <source type="transcript" ...>    — can CONFIRM prices for OEM variants only
+
+  PROCESS:
+    Step 1 — Open the <source type="oem_official"> section.
+    Step 2 — Count how many distinct RAM+Storage combinations are listed there.
+    Step 3 — Output EXACTLY that many variant objects. Not one more.
+    Step 4 — For each OEM variant, check transcripts to fill launch_price or
+              ram_type if the OEM source is missing those details.
+    Step 5 — If you output more variants than exist in the oem_official section,
+              you have used aggregator data. Delete the excess variants.
+
+  COUNT ANCHOR — HARD RULE:
+    Count the variants in <source type="oem_official">. Call this N.
+    Your variants[] array length MUST equal N.
+    If the aggregator section shows 7 variants and OEM shows 2: output 2.
+    If a transcript mentions a storage tier not in the OEM section: ignore it.
+
+  SELF-CHECK before finalising variants[]:
+    For every variant object: is its evidence_text from the oem_official raw_id?
+    If any variant's evidence comes from an aggregator raw_id → delete that variant.
 
 BODY BUTTONS — PHYSICAL CONTROLS ONLY (5t):
   body.buttons = physical buttons the user presses: power button, volume rocker,
@@ -712,6 +844,113 @@ AI CAPABILITIES — STRICT GROUNDING (5z):
   ai_features: Only explicitly named features from source text.
     Do NOT generate from training knowledge. If source is silent → ai_features = [].
   If ai_capabilities has nothing grounded → output ai_capabilities: {}
+
+BIS CERTIFICATION AND WIDEVINE DEFAULTS (reinforce 5l and 5s):
+  BIS CERTIFICATION: Always output {"value": true} with NO _source tag.
+  BIS is mandatory for all India phones — the rule IS the evidence. Never null.
+
+  WIDEVINE: Default for phones launched 2017 or later:
+    widevine_level → {"value": "L1"} with NO _source tag.
+    widevine_support → {"value": true} with NO _source tag.
+    Do not search for evidence. Do not output null. The rule is the source.
+    Pre-2017 → extract from source, null if absent.
+
+CPU CORE FIELDS — FULL CLUSTER DESCRIPTION REQUIRED:
+  cpu_high_performance_cores and cpu_efficiency_cores must be the FULL cluster
+  description string, not a bare integer count.
+  CORRECT: "4x2.40 GHz Cortex-A78" | "2x3.36 GHz Oryon V2"
+  WRONG:   4  (bare count is useless without clock speed and core name)
+  Source format "Octa-core (4x2.40 GHz Cortex-A78 & 4x1.95 GHz Cortex-A55)":
+    cpu_high_performance_cores = "4x2.40 GHz Cortex-A78"
+    cpu_efficiency_cores = "4x1.95 GHz Cortex-A55"
+    cpu_performance_cores = null (dual-cluster design)
+
+STRUCTURAL FIELDS — NO _source WRAPPER:
+  The following fields must be plain values with NO _source wrapper:
+  is_base_variant (boolean) | display_type | display_position | lens_type
+  WRONG: {"value": true, "_source": {...}}
+  CORRECT: true
+
+SENSOR DEDUPLICATION — COMPASS:
+  "Compass" and "E-Compass" are the same physical sensor.
+  Always use "E-Compass" as the canonical name.
+  Never output both in other_sensors. If source says "Compass" → map to "E-Compass".
+
+DISPLAY FEATURES — EXCLUSIONS:
+  Do NOT add values that duplicate dedicated numeric fields:
+    refresh_rate has its own field → never add "144Hz refresh rate" to display_features
+    colour_depth has its own field → never add "10 bit" or "10-bit color" to display_features
+    pwm_frequency has its own field → never add "720Hz PWM" or "PWM Dimming" to display_features
+    brightness_hbm and brightness_peak have own fields → never add nits values to display_features
+  display_features is for qualitative capabilities (HDR10+, Always-on Display,
+  Adaptive Refresh Rate, 100% DCI-P3, Game Mode, etc.) not numeric spec repetitions.
+
+BIOMETRICS — USE EXACT LOOKUP VALUES:
+  "In-display Fingerprint (Optical)" not "Fingerprint on display"
+  "In-display Fingerprint (Ultrasonic)" not "Under-display ultrasonic fingerprint"
+  "Side-mounted Fingerprint" not "Side fingerprint sensor"
+  "Face Unlock" not "Face unlock" (capitalisation matters — lookup is case-sensitive)
+  "Face ID" for Apple only
+  Map all source descriptions to the closest exact lookup value.
+
+UNLOCK METHODS — ALWAYS INCLUDE DEFAULTS:
+  All Android phones support PIN, Pattern, Password, and Swipe by default.
+  Always include: ["PIN", "Pattern", "Password", "Swipe"]
+  Add biometric methods on top when explicitly supported: "Fingerprint", "Face Unlock"
+  For iOS: ["Face ID", "Passcode"] or ["Touch ID", "Passcode"] — no pattern/swipe.
+  Never output an empty unlock_methods array for Android phones.
+  FORBIDDEN: "Smart Lock" is NOT in the lookup table — never include it.
+
+VIDEO RESOLUTIONS vs SLOW MOTION — SPLIT BY FPS THRESHOLD:
+  Sites often list all supported fps in one place:
+  "1080p@24,30,60,120,240fps" or "FHD@30fps, FHD@120fps, FHD@240fps"
+
+  SPLIT RULE — threshold is 60fps:
+    ≤60fps → goes to rear_video_resolutions or front_video_resolutions (normal video)
+    >60fps → goes to slow_motion_resolutions (slow motion capture)
+
+  Example source: "UHD@30fps, FHD@30fps, FHD@60fps, FHD@120fps, FHD@240fps"
+    rear_video_resolutions = "4K@30fps, 1080p@30fps, 1080p@60fps"
+    slow_motion_resolutions = "1080p@120fps, 1080p@240fps"
+
+  Example source: "1080p@24/30/60/120fps"
+    rear_video_resolutions = "1080p@24fps, 1080p@30fps, 1080p@60fps"
+    slow_motion_resolutions = "1080p@120fps"
+
+  If source says only "Slow Motion" with no fps → slow_motion_resolutions = null.
+  Never put >60fps framerates in rear_video_resolutions.
+  Never put ≤60fps framerates in slow_motion_resolutions.
+
+SLOW MOTION RESOLUTIONS — SOURCE LABEL REQUIRED:
+  slow_motion_resolutions must ONLY contain fps values that the source EXPLICITLY
+  labels as "Slow Motion", "Slow-mo", "Slo-mo", or "HFR" in the source text.
+
+  CORRECT: Source says "Slow Motion: 1080p@120fps" → slow_motion_resolutions = "1080p@120fps"
+  CORRECT: Source says "Slo-mo 720p@960fps" → slow_motion_resolutions = "720p@960fps"
+  WRONG:   Source says "FHD@30fps, FHD@60fps" with no slow motion label →
+           slow_motion_resolutions = null (these are regular video, not slow motion)
+
+  NEVER copy regular video fps values into slow_motion_resolutions.
+  NEVER infer slow motion capability from the phone's chipset, sensor, or video resolution alone.
+  If the source mentions "Slow Motion" but gives no fps value → slow_motion_resolutions = null.
+  If no source mentions slow motion at all → slow_motion_resolutions = null.
+  NULL DEFAULT: If no source text explicitly mentions "Slow Motion", "Slow-mo",
+  or "HFR" alongside a fps value greater than 60 → slow_motion_resolutions = null.
+  HARD CHECK: Any value ≤60fps in slow_motion_resolutions is WRONG. Delete it.
+  NEVER copy values from rear_video_resolutions into slow_motion_resolutions.
+
+VARIANT DEDUPLICATION:
+  Two variants with identical ram_capacity + storage_capacity = same SKU.
+  Keep only the lower launch_price. Delete the duplicate.
+
+VIDEO RESOLUTIONS — ONLY FROM SOURCE:
+  Never infer video capabilities from camera megapixels or chipset tier.
+  "4K@60fps" requires explicit source mention of 60fps at 4K — do not assume it.
+  If source lists "UHD@30fps" only → rear_video_resolutions = "4K@30fps" (not "4K@30/60fps").
+
+LTEPP IN LOCATION SERVICES:
+  LTEPP = LTE Positioning Protocol (cellular-based positioning).
+  Add to location_services when OEM India site lists it.
 """
 
 _FOLDABLE_RULES = """\

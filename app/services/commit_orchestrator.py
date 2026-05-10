@@ -343,7 +343,26 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
         rows_inserted += 1
 
         # ── Step 6: Upsert variants ───────────────────────────────────────────
-        variants: list[dict] = final_json.get("variants", [])
+        raw_variants: list[dict] = final_json.get("variants", [])
+        
+        # Deduplicate by (ram_capacity, storage_capacity), keeping the lowest launch_price
+        dedup_map: dict[tuple[Any, Any], dict] = {}
+        for variant in raw_variants:
+            ram = variant.get("ram_capacity")
+            storage = variant.get("storage_capacity")
+            key = (ram, storage)
+            price = variant.get("launch_price")
+            
+            if key not in dedup_map:
+                dedup_map[key] = variant
+            else:
+                existing_price = dedup_map[key].get("launch_price")
+                if price is not None:
+                    if existing_price is None or price < existing_price:
+                        dedup_map[key] = variant
+        
+        variants: list[dict] = list(dedup_map.values())
+
         for idx, variant in enumerate(variants):
             ram_type_pk = _resolve_fk(
                 variant.get("ram_type"),
@@ -1087,7 +1106,7 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
             _copy_if_present(vc_data, vcrow, {
                 "rear_video_resolutions":  "rear_video_resolutions",
                 "front_video_resolutions": "front_video_resolutions",
-                "slow_motion":             "slow_motion",
+                "slow_motion_resolutions": "slow_motion_resolutions",
             })
             if len(vcrow) > 1:  # at least one field beyond model_id
                 await _t(upsert_video_capabilities, vcrow)

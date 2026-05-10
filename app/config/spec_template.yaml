@@ -189,7 +189,7 @@ output:
   video_capabilities:
     rear_video_resolutions: null
     front_video_resolutions: null
-    slow_motion: null
+    slow_motion_resolutions: null
 
   os_and_security:
     os_name: null
