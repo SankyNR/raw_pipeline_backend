@@ -84,16 +84,31 @@ _DELTA_THRESHOLD: float = 0.20
 # ---------------------------------------------------------------------------
 
 KNOWN_SPEC_TOP_LEVEL_KEYS: frozenset[str] = frozenset({
+    # v5 schema: 'basic' split into 'brand' + 'phone_identity'
     # C4 fix: 'cameras' split into 'camera_overview' + 'camera_lenses'
     #         'os_software' + 'security' merged into 'os_and_security'
     #         'ai' renamed to 'ai_capabilities'
     # C5 fix: 'video_capabilities' added — extracted by spec_template.yaml
     #         but has no mobile_specs destination table; stripped before commit.
-    "basic",            "variants",      "body",           "displays",
-    "chipset",          "camera_overview", "camera_lenses", "charging",
-    "network",          "os_and_security", "connectivity",  "audio",
-    "sensors",          "ai_capabilities", "certifications",
-    "extra_features",   "in_the_box",    "video_capabilities",
+    "brand",
+    "phone_identity",
+    "variants",
+    "body",
+    "displays",
+    "chipset",
+    "camera_overview",
+    "camera_lenses",
+    "charging",
+    "network",
+    "os_and_security",
+    "connectivity",
+    "audio",
+    "sensors",
+    "ai_capabilities",
+    "certifications",
+    "extra_features",
+    "in_the_box",
+    "video_capabilities",
 })
 
 # ---------------------------------------------------------------------------
@@ -101,59 +116,83 @@ KNOWN_SPEC_TOP_LEVEL_KEYS: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 
 REQUIRED_FIELDS: list[tuple[str, str]] = [
-    ("basic.model_name",          "basic.model_name"),
-    ("variants[0].ram_capacity",  "variants[0].ram_capacity"),
-    ("displays[0].panel_type",    "displays[0].panel_type"),
+    ("phone_identity.model_name",  "phone_identity.model_name"),  # v5: was basic.model_name
+    ("variants[0].ram_capacity",   "variants[0].ram_capacity"),
+    ("displays[0].panel_type",     "displays[0].panel_type"),
 ]
 
 # Numeric field paths (array-wildcard notation) — type-correctness check
-# C4 fix: all paths updated to match spec_template.yaml / field_mapping.py
+# S2-P1-1 fix: all ghost v4 names removed, missing v5 fields added.
 NUMERIC_FIELD_PATTERNS: list[str] = [
-    # Charging  (battery_capacity_mah → battery_capacity)
-    "charging.battery_capacity",
-    "charging.max_charging_speed_watt",
-    "charging.wireless_charging_speed_watt",
     # Displays
-    "displays[*].refresh_rate_max_hz",
-    "displays[*].brightness_nits",
-    "displays[*].resolution_width_px",   # C4 fix: was resolution_px_width
-    "displays[*].resolution_height_px",  # C4 fix: was resolution_px_height
-    "displays[*].screen_size_inches",
-    # Camera lenses  (C4 fix: was cameras.lenses[*].*)
+    "displays[*].size_inch",
+    "displays[*].resolution_height_px",
+    "displays[*].resolution_width_px",
+    "displays[*].refresh_rate",            # was: refresh_rate_max_hz (ghost)
+    "displays[*].brightness_hbm",          # was: brightness_nits (ghost)
+    "displays[*].brightness_peak",
+    "displays[*].pwm_frequency",
+    "displays[*].screen_to_body_ratio",
+    # Charging
+    "charging.battery_capacity",
+    "charging.charging_power",             # was: max_charging_speed_watt (ghost)
+    "charging.wireless_charging_power",    # was: wireless_charging_speed_watt (ghost)
+    # Camera lenses
     "camera_lenses[*].megapixels",
     "camera_lenses[*].aperture",
-    # Body  (C4 fix: weight_grams → weight; *_mm → length/breadth/height)
-    "body.weight",
-    "body.length",
-    "body.breadth",
-    "body.height",
+    "camera_lenses[*].sensor_size_denominator",
+    "camera_lenses[*].pixel_size",
+    "camera_lenses[*].fov",
+    "camera_lenses[*].focal_length",
     # Chipset
-    "chipset.npu_tops",
     "chipset.fabrication_node",
+    "chipset.cpu_clock_speed",
+    "chipset.gpu_clock_speed",
+    "chipset.npu_tops",
     # Variants
     "variants[*].ram_capacity",
     "variants[*].storage_capacity",
+    "variants[*].launch_price",
     # Certifications
     "certifications.sar_head",
     "certifications.sar_body",
-    # OS & Security  (M4 fix: correct field names from spec_template.yaml)
-    # Wrong: "os_and_security.guaranteed_os_updates" and "security_patch_years"
-    "os_and_security.os_update_years",
-    "os_and_security.security_update_years",
+    # Body
+    "body.height",
+    "body.width",
+    "body.thickness",
+    "body.weight",
 ]
 
 # Boolean field paths (array-wildcard notation) — type-correctness check
-# Audit note: none of these paths were renamed by C4.
+# S2-P1-1 fix: ghost paths removed, missing v5 boolean fields added.
 BOOLEAN_FIELD_PATTERNS: list[str] = [
-    "charging.pd_support",
-    "charging.wireless_charging",
-    "charging.reverse_charging",
-    "charging.charger_in_box",     # was certifications.charger_in_box
-    "network.vo5g",
-    "network.vo_wifi",
+    # Connectivity
     "connectivity.nfc",
-    "connectivity.hdmi",
-    "connectivity.usb_otg",
+    "connectivity.uwb",
+    "connectivity.ir_blaster",
+    "connectivity.wifi_hotspot",
+    # Network
+    "network.esim_support",
+    "network.volte",
+    "network.vo5g",
+    "network.vowifi",              # was: network.vo_wifi (typo fixed)
+    # Charging
+    "charging.wireless_charging",
+    "charging.reverse_wireless_charging",  # was: reverse_charging (ghost)
+    "charging.charger_in_box",
+    # was: charging.pd_support        → removed: field not in ChargingData
+    # was: connectivity.hdmi          → removed: not a field in ConnectivityData
+    # was: connectivity.usb_otg       → removed: string in usb_features list, not bool
+    # Body
+    "body.has_stylus",
+    # Variants
+    "variants[*].expandable_storage",
+    "variants[*].virtual_ram_availability",
+    # Camera
+    "camera_lenses[*].is_macro_capable",
+    # Certifications
+    "certifications.bis_certification",
+    "certifications.widevine_support",
 ]
 
 # Secondary array index threshold for C8: indices >= this are warnings, not errors
@@ -504,9 +543,6 @@ async def detect_and_resolve_conflicts(
         normalized_id, enrichment_run_id,
     )
 
-    # C3 — delete existing conflict rows before re-inserting (idempotency)
-    await asyncio.to_thread(delete_conflict_log_for_phone, normalized_id)
-
     # Fetch normalized spec (Run A output)
     norm_row = await asyncio.to_thread(fetch_normalized_spec, normalized_id)
     url_registry_id: int = norm_row["url_registry_id"]
@@ -532,6 +568,14 @@ async def detect_and_resolve_conflicts(
     fill_count          = 0
     concordant_count    = 0
     conflict_ids: list[int] = []
+
+    # #7 fix: build the full payload list BEFORE touching the DB.
+    # Previously delete_conflict_log_for_phone ran at the START of this function.
+    # If any insert_merge_conflict call failed mid-loop, the deleted rows were
+    # permanently lost. Now: collect payloads → delete old rows → insert new batch.
+    # A per-field insert failure only skips that field (same as before), but the
+    # delete only happens after we've determined what to insert.
+    pending_payloads: list[dict] = []
 
     for cand in candidates:
         field_path: str   = cand["field_path"]
@@ -572,7 +616,7 @@ async def detect_and_resolve_conflicts(
             enr_tier, enr_conf,
         )
 
-        conflict_payload: dict[str, Any] = {
+        pending_payloads.append({
             "url_registry_id":         url_registry_id,
             "normalized_id":           normalized_id,
             "field_path":              field_path,
@@ -583,8 +627,16 @@ async def detect_and_resolve_conflicts(
             "resolved_by":             resolved_by,
             "resolution_note":         note,
             "resolved_at":             now_iso if resolution != "flagged" else None,
-        }
+            "_is_flagged":             resolution == "flagged",   # scratch flag, stripped below
+        })
 
+    # #7 fix: delete OLD conflict rows only after we've classified all candidates.
+    # human_override rows are protected by delete_conflict_log_for_phone's filter.
+    await asyncio.to_thread(delete_conflict_log_for_phone, normalized_id)
+
+    # Insert the new conflict batch
+    for conflict_payload in pending_payloads:
+        is_flagged = conflict_payload.pop("_is_flagged")
         try:
             conflict_id = await asyncio.to_thread(insert_merge_conflict, conflict_payload)
             conflict_ids.append(conflict_id)
@@ -592,11 +644,11 @@ async def detect_and_resolve_conflicts(
             logger.error(
                 "detect_and_resolve_conflicts: failed to insert conflict "
                 "field=%r normalized_id=%d: %s",
-                field_path, normalized_id, exc,
+                conflict_payload.get("field_path"), normalized_id, exc,
             )
             continue
 
-        if resolution == "flagged":
+        if is_flagged:
             flagged_count += 1
         else:
             auto_resolved_count += 1

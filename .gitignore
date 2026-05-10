@@ -179,3 +179,11 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+cookies.txt
+
+# Automation scripts
+start_backend.ps1
+start_backend.bat
+stop_backend.ps1
+stop_backend.bat

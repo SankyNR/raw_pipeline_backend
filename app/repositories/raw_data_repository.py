@@ -68,3 +68,24 @@ async def insert_raw_scraped_data(
         )
 
     return result.data[0]["raw_id"]
+
+
+async def delete_raw_scraped_data_by_execution(execution_id: int) -> None:
+    """
+    Deletes an orphan raw_scraped_data row by execution_id.
+
+    Called from scrape_orchestrator when insert_raw_scraped_data succeeds
+    but a subsequent step (finish_execution, set_status_scraped_raw) fails.
+    Prevents extraction from loading a row whose storage paths were deleted
+    during the failure cleanup.
+
+    The DELETE is a no-op if the row does not exist (0 rows deleted is not an error).
+    """
+    (
+        get_client()
+        .schema("pipeline")
+        .table("raw_scraped_data")
+        .delete()
+        .eq("execution_id", execution_id)
+        .execute()
+    )

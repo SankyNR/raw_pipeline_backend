@@ -10,7 +10,10 @@ from app.repositories.youtube_execution_repository import (
     create_transcript_execution,
     finish_transcript_execution,
 )
-from app.repositories.youtube_raw_transcript_repository import insert_raw_transcript_data
+from app.repositories.youtube_raw_transcript_repository import (
+    insert_raw_transcript_data,
+    delete_raw_transcript_data_by_execution,   # add this
+)
 from app.repositories.youtube_video_registry_repository import (
     claim_video_for_fetching,
     get_phone_info_for_video,
@@ -20,7 +23,7 @@ from app.repositories.youtube_video_registry_repository import (
     set_video_not_fetched,
 )
 from app.services.srt_processor import process_srt_to_txt
-from app.services.storage_service import delete_file, upload_file
+from app.services.storage_service import delete_file, upload_file, StorageDuplicateError
 from app.services.translation_service import translate_to_english
 from app.services.youtube_transcript_client import fetch_transcript_srt, get_language_priority
 from app.utils.path_builder import build_youtube_storage_paths
@@ -36,11 +39,18 @@ CONTENT_FAILURE_TYPES = (NoTranscriptFound, TranscriptsDisabled, VideoUnavailabl
 # Task 16.1 — run_transcript_pipeline()
 # ---------------------------------------------------------------------------
 
-async def run_transcript_pipeline(video_registry_id: int) -> dict:
+async def run_transcript_pipeline(video_registry_id: int, proxy_session_id: str | None = None) -> dict:
     """
     Full atomic transcript pipeline for one video.
     Fetch SRT → Translate (if non-English) → Process to TXT → Insert DB row → Mark fetched_raw.
     Returns dict with: success, exec_id, message.
+
+    Args:
+        video_registry_id: The video to process.
+        proxy_session_id:  Sticky session ID for the residential proxy. Passed directly to
+                           fetch_transcript_srt() so all videos in one batch share the same
+                           residential IP. Generate once per batch at the API layer (uuid4).
+                           None = no sticky session (proxy still used if PROXY_ENABLED=true).
 
     Invariants:
     1. exec_id = None init — failure path never crashes calling finish_transcript_execution
@@ -105,11 +115,20 @@ async def run_transcript_pipeline(video_registry_id: int) -> dict:
 
         # === STEP 1: FETCH AND STORE SRT ===
         srt_content, language_code, is_auto_generated = await fetch_transcript_srt(
-            video_row["yt_video_id"], lang_priority
+            video_row["yt_video_id"], lang_priority, proxy_session_id=proxy_session_id
         )
 
         srt_bytes = srt_content.encode("utf-8")
-        await upload_file(paths["srt_path"], srt_bytes, "text/plain")
+        try:
+            await upload_file(paths["srt_path"], srt_bytes, "text/plain")
+        except StorageDuplicateError:
+            # Change 8: 409 Duplicate — raw SRT already exists from a prior partial run.
+            # The file is intact; reuse it and continue the pipeline.
+            logger.warning(
+                "run_transcript_pipeline: raw SRT already exists at %r — "
+                "reusing existing file (prior partial run). Continuing pipeline.",
+                paths["srt_path"],
+            )
         srt_uploaded = True
         # SRT is now the immutable artifact. It is never deleted from this point,
         # even if all downstream steps fail.
@@ -170,28 +189,76 @@ async def run_transcript_pipeline(video_registry_id: int) -> dict:
         finished_at = datetime.utcnow()
         is_content_failure = isinstance(e, CONTENT_FAILURE_TYPES)
 
+        # Each cleanup step is independently guarded so that a network failure
+        # in any one step (e.g. delete_file during an internet outage) does NOT
+        # cascade and prevent the final status reset from running.
+        # Previously, an unguarded delete_file() failure would exit the entire
+        # block before set_video_not_fetched() was reached, permanently stranding
+        # the row at status='currently_fetching' with no active worker.
+
         # Clean up derivative files — but NEVER the SRT
         if srt_uploaded and paths is not None:
-            await delete_file(paths["processed_path"])
-            await delete_file(paths["translated_path"])
+            try:
+                await delete_file(paths["processed_path"])
+            except Exception as _del_exc:
+                logger.warning(
+                    "run_transcript_pipeline: delete processed_path failed "
+                    "(video_registry_id=%s): %s — continuing cleanup",
+                    video_reg_id, _del_exc,
+                )
+            try:
+                await delete_file(paths["translated_path"])
+            except Exception as _del_exc:
+                logger.warning(
+                    "run_transcript_pipeline: delete translated_path failed "
+                    "(video_registry_id=%s): %s — continuing cleanup",
+                    video_reg_id, _del_exc,
+                )
 
         # Log execution failure if the log row was created
         if exec_id is not None and started_at is not None:
-            await finish_transcript_execution(
-                exec_id,
-                False,
-                started_at,
-                finished_at,
-                language_code=language_code,
-                error_message=str(e)
-            )
+            try:
+                await finish_transcript_execution(
+                    exec_id,
+                    False,
+                    started_at,
+                    finished_at,
+                    language_code=language_code,
+                    error_message=str(e)
+                )
+            except Exception as _log_exc:
+                logger.warning(
+                    "run_transcript_pipeline: finish_transcript_execution failed "
+                    "(exec_id=%s): %s — continuing cleanup",
+                    exec_id, _log_exc,
+                )
 
-        # Reset video status based on failure type
+        # Orphan row cleanup
+        if not is_content_failure and exec_id is not None:
+            try:
+                await delete_raw_transcript_data_by_execution(exec_id)
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "run_transcript_pipeline: failed to clean orphan "
+                    "youtube_raw_transcript_data row for exec_id=%s: %s",
+                    exec_id, cleanup_exc,
+                )
+
+        # Status reset — MUST always run. Independently guarded with ERROR-level
+        # logging because a stuck 'currently_fetching' row requires manual intervention.
         if claimed and video_reg_id is not None:
-            if is_content_failure:
-                await set_video_failed(video_reg_id)       # terminal — not retried
-            else:
-                await set_video_not_fetched(video_reg_id)  # retryable
+            try:
+                if is_content_failure:
+                    await set_video_failed(video_reg_id)       # terminal — not retried
+                else:
+                    await set_video_not_fetched(video_reg_id)  # retryable
+            except Exception as _reset_exc:
+                logger.error(
+                    "CRITICAL: run_transcript_pipeline: failed to reset status for "
+                    "video_registry_id=%s: %s — row may be permanently stuck at "
+                    "currently_fetching. Manual DB intervention required.",
+                    video_reg_id, _reset_exc,
+                )
 
         return {
             "success": False,

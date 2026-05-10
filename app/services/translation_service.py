@@ -19,9 +19,18 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level singleton client
+# S4-P1-1: converted to lazy singleton to prevent import-time crash when
+# GEMINI_API_KEY is missing. Client is created on first call, not at import.
 # ---------------------------------------------------------------------------
 
-_client: genai.Client = genai.Client(api_key=GEMINI_API_KEY)
+_client: genai.Client | None = None
+
+
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        _client = genai.Client(api_key=GEMINI_API_KEY)
+    return _client
 
 _TRANSLATION_MODEL = "gemini-2.5-flash-lite"
 
@@ -69,7 +78,7 @@ async def translate_to_english(srt_content: str) -> str:
     async def _call() -> str:
         try:
             response = await asyncio.wait_for(
-                _client.aio.models.generate_content(
+                _get_client().aio.models.generate_content(
                     model=_TRANSLATION_MODEL,
                     contents=f"Translate this transcript to English:\n\n{srt_content}",
                     config=types.GenerateContentConfig(

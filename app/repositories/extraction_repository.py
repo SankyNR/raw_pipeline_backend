@@ -10,8 +10,14 @@ Async callers use asyncio.to_thread() where needed.
 """
 
 import datetime
+import logging
 
 from app.core.supabase_client import get_client
+
+_logger = logging.getLogger(__name__)
+
+def _now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +159,7 @@ def insert_pre_extraction_validation(payload: dict) -> dict:
         "can_proceed":           payload["can_proceed"],
         "blocking_reasons":      payload["blocking_reasons"],
         "warnings":              payload["warnings"],
-        "unscraped_url_ids":     payload.get("unscraped_url_ids", []),
+        # 'unscraped_url_ids' is in-memory only � no DB column, excluded from insert.
     }
 
     result = (
@@ -214,7 +220,7 @@ def fetch_raw_source_rows(raw_source_ids: list[int]) -> list[dict]:
         get_client()
         .schema("pipeline")
         .table("raw_scraped_data")
-        .select("raw_id, site_name, markdown_path")
+        .select("raw_id, markdown_path, url_registry_id, url_registry(site_name)")
         .in_("raw_id", raw_source_ids)
         .execute()
     )
@@ -228,6 +234,12 @@ def fetch_raw_source_rows(raw_source_ids: list[int]) -> list[dict]:
             f"fetch_raw_source_rows: raw_ids not found in pipeline.raw_scraped_data: "
             f"{sorted(missing)}. Possible data integrity issue."
         )
+
+    # Flatten the nested url_registry join into a top-level site_name key
+    # so callers can use r["site_name"] as before.
+    for r in rows:
+        nested = r.pop("url_registry", None) or {}
+        r["site_name"] = nested.get("site_name", "unknown")
 
     return rows
 
@@ -273,10 +285,14 @@ def insert_extraction_run(payload: dict) -> int:
     Expected payload keys:
         url_registry_id           int
         raw_source_ids            list[int]   — stored as JSONB
-        raw_transcript_id         int | None
+        raw_transcript_ids        list[int]   — JSONB array (v5: replaces single FK)
         model_used                str
-        extraction_schema_version str         — default 'v1'
+        extraction_schema_version str         — default 'v2'
         status                    str         — 'running'
+
+    All raw_transcript_ids are validated to belong to the given url_registry_id
+    before insert. Any IDs that do not match the phone are silently removed
+    and logged. This prevents cross-phone transcript contamination.
 
     Returns:
         extraction_run_id (int) of the newly inserted row.
@@ -284,12 +300,65 @@ def insert_extraction_run(payload: dict) -> int:
     Raises:
         RuntimeError: If insert returns no data.
     """
+    url_registry_id: int = payload["url_registry_id"]
+    raw_transcript_ids: list[int] = payload.get("raw_transcript_ids") or []
+
+    # Validate transcript IDs belong to this phone
+    if raw_transcript_ids:
+        try:
+            transcript_result = (
+                get_client()
+                .schema("pipeline")
+                .table("youtube_raw_transcript_data")
+                .select("raw_transcript_id, video_registry_id")
+                .in_("raw_transcript_id", raw_transcript_ids)
+                .execute()
+            )
+            transcript_rows = transcript_result.data or []
+            tid_to_vid = {
+                r["raw_transcript_id"]: r["video_registry_id"]
+                for r in transcript_rows
+            }
+
+            valid_ids: list[int] = []
+            if tid_to_vid:
+                vr_result = (
+                    get_client()
+                    .schema("pipeline")
+                    .table("youtube_video_url_registry")
+                    .select("video_registry_id, url_registry_id")
+                    .in_("video_registry_id", list(tid_to_vid.values()))
+                    .execute()
+                )
+                vid_to_owner = {
+                    r["video_registry_id"]: r["url_registry_id"]
+                    for r in (vr_result.data or [])
+                }
+                for tid, vid in tid_to_vid.items():
+                    if vid_to_owner.get(vid) == url_registry_id:
+                        valid_ids.append(tid)
+                    else:
+                        _logger.warning(
+                            "insert_extraction_run: raw_transcript_id=%d does not "
+                            "belong to url_registry_id=%d — excluded.",
+                            tid, url_registry_id,
+                        )
+            raw_transcript_ids = valid_ids
+        except Exception as exc:
+            _logger.warning(
+                "insert_extraction_run: secondary transcript ownership check failed (%s). "
+                "Proceeding with original IDs — primary validation already passed.",
+                exc,
+            )
+            # DO NOT clear raw_transcript_ids
+            # Keep original IDs
+
     db_payload = {
-        "url_registry_id":           payload["url_registry_id"],
+        "url_registry_id":           url_registry_id,
         "raw_source_ids":            payload["raw_source_ids"],
-        "raw_transcript_id":         payload.get("raw_transcript_id"),
+        "raw_transcript_ids":        raw_transcript_ids,
         "model_used":                payload["model_used"],
-        "extraction_schema_version": payload.get("extraction_schema_version", "v1"),
+        "extraction_schema_version": payload.get("extraction_schema_version", "v2"),
         "status":                    payload.get("status", "running"),
     }
 
@@ -304,7 +373,7 @@ def insert_extraction_run(payload: dict) -> int:
     if not result.data:
         raise RuntimeError(
             f"insert_extraction_run: no data returned for "
-            f"url_registry_id={payload['url_registry_id']}."
+            f"url_registry_id={url_registry_id}."
         )
     return result.data[0]["extraction_run_id"]
 
@@ -328,7 +397,7 @@ def update_extraction_run(run_id: int, updates: dict) -> None:
     safe_updates = {}
     for k, v in updates.items():
         if v == "now()":
-            safe_updates[k] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            safe_updates[k] = _now_iso()
         else:
             safe_updates[k] = v
 
@@ -494,7 +563,7 @@ def update_experience_run(run_id: int, updates: dict) -> None:
     safe_updates = {}
     for k, v in updates.items():
         if v == "now()":
-            safe_updates[k] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            safe_updates[k] = _now_iso()
         else:
             safe_updates[k] = v
 
@@ -515,7 +584,11 @@ def update_experience_run(run_id: int, updates: dict) -> None:
 
 def bulk_insert_phone_experiences(rows: list[dict]) -> int:
     """
-    Bulk inserts experience rows into pipeline.phone_experiences.
+    Plain INSERT. Idempotency is handled by the supersede model —
+    supersede_experiences() marks all existing active rows as is_superseded=TRUE
+    before each Run B batch, and every run gets a fresh exp_run_id. Exact-text
+    deduplication within active rows is enforced by the partial unique index
+    idx_phone_exp_unique_active_text.
 
     Expected keys per row:
         url_registry_id  int
@@ -549,7 +622,13 @@ def bulk_insert_phone_experiences(rows: list[dict]) -> int:
             f"bulk_insert_phone_experiences: insert returned no data for "
             f"exp_run_id={rows[0].get('exp_run_id')}."
         )
+    if len(result.data) != len(rows):
+        raise RuntimeError(
+            f"bulk_insert_phone_experiences: expected {len(rows)} rows inserted, "
+            f"got {len(result.data)}. Possible partial failure or constraint violation."
+        )
     return len(result.data)
+
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +709,7 @@ def update_normalisation_run(run_id: int, updates: dict) -> None:
     safe_updates = {}
     for k, v in updates.items():
         if v == "now()":
-            safe_updates[k] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            safe_updates[k] = _now_iso()
         else:
             safe_updates[k] = v
 
@@ -931,7 +1010,7 @@ def update_enrichment_run(run_id: int, payload: dict) -> None:
     if "finished_at" not in payload:
         payload = {
             **payload,
-            "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "finished_at": _now_iso(),
         }
     (
         get_client()
@@ -964,6 +1043,7 @@ def fetch_gap_fields_for_enrichment(normalized_id: int) -> list[dict]:
         )
         .eq("normalized_id", normalized_id)
         .eq("enrichment_attempted", False)
+        .neq("priority", "skip")          # L7.2: exclude skip-priority fields from enrichment
         .execute()
     )
     rows = result.data or []
@@ -1455,8 +1535,9 @@ def fetch_latest_pre_ui_validation(normalized_id: int) -> dict | None:
 
 def fetch_phone_experience_count(url_registry_id: int) -> int:
     """
-    Returns the count of phone_experiences rows with is_suppressed=FALSE
-    AND confidence >= 0.50 for this phone. Used in Phase 7.5 Run B minimum check.
+    Returns the count of phone_experiences rows with is_suppressed=FALSE,
+    is_superseded=FALSE, and confidence >= 0.50 for this phone.
+    Used in Phase 7.5 Run B minimum check.
     """
     result = (
         get_client()
@@ -1465,6 +1546,7 @@ def fetch_phone_experience_count(url_registry_id: int) -> int:
         .select("experience_id", count="exact")
         .eq("url_registry_id", url_registry_id)
         .eq("is_suppressed", False)
+        .eq("is_superseded", False)
         .gte("confidence", 0.50)
         .execute()
     )
@@ -1587,16 +1669,21 @@ def fetch_oem_raw_ids_for_phone(url_registry_id: int) -> set[int]:
         return set()
 
     # Step 2: Filter to OEM official rows by site_name convention
+    # raw_scraped_data has no site_name; join url_registry via url_registry_id FK.
+    # Fetch all rows then filter client-side to those with site_name ending in _official.
     scraped_result = (
         get_client()
         .schema("pipeline")
         .table("raw_scraped_data")
-        .select("raw_id, site_name")
+        .select("raw_id, url_registry(site_name)")
         .in_("raw_id", raw_source_ids)
-        .like("site_name", "%_official")
         .execute()
     )
-    return {row["raw_id"] for row in (scraped_result.data or [])}
+    return {
+        row["raw_id"]
+        for row in (scraped_result.data or [])
+        if (row.get("url_registry") or {}).get("site_name", "").endswith("_official")
+    }
 
 
 # ===========================================================================
@@ -1707,7 +1794,7 @@ def close_admin_review_session(session_id: int, outcome: str) -> None:
         .table("admin_review_sessions")
         .update({
             "session_outcome": outcome,
-            "closed_at":       datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "closed_at":       _now_iso(),
         })
         .eq("session_id", session_id)
         .execute()
@@ -1893,7 +1980,7 @@ def update_conflict_resolution(
                 f"Admin ({admin_user}) manually resolved. "
                 f"Chosen value: {resolved_value!r}"
             ),
-            "resolved_at":     datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "resolved_at":     _now_iso(),
         })
         .eq("conflict_id", conflict_id)
         .execute()
@@ -1932,7 +2019,7 @@ def approve_spec(
     Sets spec_human_approved=TRUE and records approver identity.
     Also recomputes ready_for_commit.
     """
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now = _now_iso()
     (
         get_client()
         .schema("pipeline")
@@ -2013,8 +2100,12 @@ def update_gate_conditions(final_id: int, patch: dict) -> None:
 
 def fetch_experiences_for_phone(url_registry_id: int) -> list[dict]:
     """
-    Returns all phone_experiences rows for this phone, ordered by category_id.
-    Includes admin_edited and is_suppressed flags for UI colour coding.
+    Returns all active (non-superseded) phone_experiences rows for this phone,
+    ordered by category_id. Includes admin_edited and is_suppressed flags for
+    UI colour coding.
+
+    IMPORTANT: Always filters is_superseded=FALSE. Superseded rows from
+    previous Run B re-runs must never be surfaced to the admin UI.
     """
     result = (
         get_client()
@@ -2026,6 +2117,7 @@ def fetch_experiences_for_phone(url_registry_id: int) -> list[dict]:
             "is_verified, admin_edited, created_at, updated_at"
         )
         .eq("url_registry_id", url_registry_id)
+        .eq("is_superseded", False)
         .order("category_id")
         .execute()
     )
@@ -2133,7 +2225,7 @@ def approve_experiences(
     Sets experience_human_approved=TRUE and experience_entries_reviewed=TRUE.
     Also recomputes ready_for_commit.
     """
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now = _now_iso()
     (
         get_client()
         .schema("pipeline")
@@ -2205,22 +2297,23 @@ def resolve_staging_entry(
     resolution: 'inserted_new' | 'mapped_to_existing' | 'commit_as_null'
 
     M2 fix: the column is 'reviewed_at' (not 'resolved_at') per pipeline schema.
-    M3 fix: 'commit_as_null' is not in the schema CHECK constraint
-            ('pending_review' | 'inserted_new' | 'mapped_to_existing' | 'rejected').
-            We remap it to 'rejected' before writing.
+    M3 fix: 'commit_as_null' is a first-class status in the DB constraint
+            ('pending_review' | 'inserted_new' | 'mapped_to_existing' | 'rejected'
+             | 'committed_as_null').
+            The request value 'commit_as_null' is mapped to DB status 'committed_as_null'.
 
     resolved_lookup_id: the PK of the inserted/mapped lookup row (None for commit_as_null)
     """
-    # M3: normalise status to a value the CHECK constraint accepts
-    _STATUS_REMAP = {
-        "commit_as_null": "rejected",
+    # Map the API resolution value to the exact DB CHECK constraint value
+    _STATUS_MAP = {
+        "commit_as_null": "committed_as_null",
     }
-    safe_status = _STATUS_REMAP.get(resolution, resolution)
+    db_status = _STATUS_MAP.get(resolution, resolution)
 
     update_payload: dict = {
-        "status":             safe_status,
+        "status":             db_status,
         "resolved_lookup_id": resolved_lookup_id,
-        "reviewed_at":        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "reviewed_at":        _now_iso(),
     }
     (
         get_client()
@@ -2322,8 +2415,9 @@ def fetch_gate_conditions_live(final_id: int) -> dict | None:
 
 def fetch_non_suppressed_experiences_for_commit(url_registry_id: int) -> list[dict]:
     """
-    Returns all non-suppressed phone_experiences rows for the final Run B check.
-    Only these rows will be committed. Returns experience_id, experience_text, confidence.
+    Returns all non-suppressed, non-superseded phone_experiences rows for the
+    final Run B check. Only these rows will be committed.
+    Returns experience_id, experience_text, confidence.
     """
     result = (
         get_client()
@@ -2332,6 +2426,7 @@ def fetch_non_suppressed_experiences_for_commit(url_registry_id: int) -> list[di
         .select("experience_id, experience_text, confidence")
         .eq("url_registry_id", url_registry_id)
         .eq("is_suppressed", False)
+        .eq("is_superseded", False)
         .execute()
     )
     return result.data or []
@@ -2505,7 +2600,6 @@ def update_inference_run(
       errors present AND rules_written > 0   → 'partial_failure'
       errors present AND rules_written == 0  → 'failed'
     """
-    import datetime as _dt
     if errors and rules_written == 0:
         status = "failed"
     elif errors:
@@ -2523,83 +2617,68 @@ def update_inference_run(
             "rules_skipped":   rules_skipped,
             "errors":          errors,
             "status":          status,
-            "finished_at":     _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "finished_at":     _now_iso(),
         })
         .eq("inference_run_id", inference_run_id)
         .execute()
     )
 
 
-# ---------------------------------------------------------------------------
-# Phase L0 (LangExtract Migration) — jsonl_path updates
-# ---------------------------------------------------------------------------
-
-def update_spec_run_jsonl_path(extraction_run_id: int, jsonl_path: str) -> None:
-    """
-    Sets the jsonl_path column on a spec_extraction_runs row.
-
-    Called by langextract_run_a.py after the JSONL file is successfully uploaded
-    to Supabase Storage. The path is used by the visualization endpoint
-    (GET /approval/visualization/spec/{run_id}) to generate HTML on demand.
-
-    Args:
-        extraction_run_id: PK of the spec_extraction_runs row.
-        jsonl_path:        Storage path, e.g.
-                           "samsung/galaxy-s25-ultra/extractions/spec_42.jsonl"
-
-    Raises:
-        RuntimeError: If the extraction_run_id is not found.
-    """
-    result = (
-        get_client()
-        .schema("pipeline")
-        .table("spec_extraction_runs")
-        .update({"jsonl_path": jsonl_path})
-        .eq("extraction_run_id", extraction_run_id)
-        .execute()
-    )
-    if not result.data:
-        raise RuntimeError(
-            f"update_spec_run_jsonl_path: extraction_run_id={extraction_run_id} "
-            f"not found or no update applied."
-        )
-
-
-def update_exp_run_jsonl_path(exp_run_id: int, jsonl_path: str) -> None:
-    """
-    Sets the jsonl_path column on an experience_extraction_runs row.
-
-    Called by langextract_run_b.py after the per-transcript JSONL file is
-    successfully uploaded to Supabase Storage. The path is used by the
-    visualization endpoint (GET /approval/visualization/exp/{exp_run_id})
-    to generate HTML on demand.
-
-    Args:
-        exp_run_id:  PK of the experience_extraction_runs row.
-        jsonl_path:  Storage path, e.g.
-                     "samsung/galaxy-s25-ultra/extractions/exp_17.jsonl"
-
-    Raises:
-        RuntimeError: If the exp_run_id is not found.
-    """
-    result = (
-        get_client()
-        .schema("pipeline")
-        .table("experience_extraction_runs")
-        .update({"jsonl_path": jsonl_path})
-        .eq("exp_run_id", exp_run_id)
-        .execute()
-    )
-    if not result.data:
-        raise RuntimeError(
-            f"update_exp_run_jsonl_path: exp_run_id={exp_run_id} "
-            f"not found or no update applied."
-        )
 
 
 # ---------------------------------------------------------------------------
 # Phase L6 — Auto-resolution helpers for POST /extraction/run-phone
 # ---------------------------------------------------------------------------
+
+def fetch_canonical_id_by_brand_model(brand: str, model_name: str) -> int:
+    """
+    Resolves a (brand, model_name) pair to a single canonical url_id.
+
+    Uses the GSMArena row as the canonical anchor — it is always present,
+    always unique per phone, and is the standard anchor used for YouTube
+    enrichment and all downstream pipeline stages.
+
+    Args:
+        brand:      Brand name, e.g. "Samsung"  (case-sensitive, must match DB)
+        model_name: Model name, e.g. "Galaxy S25 Ultra" (case-sensitive)
+
+    Returns:
+        url_id (int) of the GSMArena url_registry row for this phone.
+
+    Raises:
+        ValueError: If no GSMArena row is found for the given brand/model,
+                    or if more than one row is found (data integrity violation).
+    """
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("url_registry")
+        .select("url_id")
+        .eq("brand", brand)
+        .eq("model_name", model_name)
+        .eq("site_name", "gsmarena")
+        .execute()
+    )
+
+    rows = result.data or []
+
+    if len(rows) == 0:
+        raise ValueError(
+            f"fetch_canonical_id_by_brand_model: no GSMArena anchor found for "
+            f"brand={brand!r} model_name={model_name!r}. "
+            f"Ensure the phone exists in pipeline.url_registry with site_name='gsmarena'."
+        )
+
+    if len(rows) > 1:
+        url_ids = [r["url_id"] for r in rows]
+        raise ValueError(
+            f"fetch_canonical_id_by_brand_model: data integrity violation — "
+            f"{len(rows)} GSMArena rows found for brand={brand!r} model_name={model_name!r}. "
+            f"Expected exactly 1. url_ids found: {url_ids}"
+        )
+
+    return rows[0]["url_id"]
+
 
 def fetch_sources_for_run_phone(
     canonical_url_id: int,
@@ -2608,25 +2687,22 @@ def fetch_sources_for_run_phone(
     Auto-resolves all source IDs needed for run-phone from brand/model.
 
     Collects:
-        raw_source_ids     — all raw_scraped_data.raw_id rows for this phone
-                             with status IN ('scraped_raw', 'stored_mainDB')
-        raw_transcript_ids — all youtube_raw_transcript_data.raw_transcript_id rows
-                             with fetch_status = 'fetched_raw' (joined via
-                             youtube_video_url_registry)
-        brand              — brand name from url_registry
-        model_name         — model name from url_registry
-
-    Transcript priority for best_transcript_id:
-        Priority 1: highest channel_reliability_score (if column exists & populated)
-        Priority 2 (fallback): highest word_count_processed
-        If neither column exists or all are null: first in list
+        raw_source_ids       — all raw_scraped_data.raw_id rows for this phone
+        top3_transcript_ids  — top 3 raw_transcript_ids ordered by
+                               channel_reliability_score DESC, file_size_bytes DESC.
+                               Fewer if fewer are available.
+        raw_transcript_ids   — ALL available transcript IDs (for Run B)
+        brand                — brand name from url_registry
+        model_name           — model name from url_registry
+        best_transcript_id   — highest-priority single ID (first of top3, or None)
 
     Returns:
         {
             "brand":                str,
             "model_name":           str,
             "raw_source_ids":       list[int],
-            "raw_transcript_ids":   list[int],
+            "top3_transcript_ids":  list[int],   # up to 3, ordered by reliability
+            "raw_transcript_ids":   list[int],   # all available
             "best_transcript_id":   int | None,
         }
 
@@ -2652,18 +2728,29 @@ def fetch_sources_for_run_phone(
     brand = anchor.data[0]["brand"]
     model_name = anchor.data[0]["model_name"]
 
-    # Step 2 — Fetch all raw_scraped_data rows for this phone
-    # Matches by joining through url_registry brand+model_name to get all
-    # url_ids for this phone, then filtering raw_scraped_data.
-    # Simpler: use canonical_url_id directly since raw_scraped_data uses url_registry_id.
-    # raw_scraped_data uses url_registry_id FK (same as canonical_url_id anchor).
+    # Step 2 — Fetch ALL url_registry rows for this brand + model_name, so every
+    # registered URL (GSMArena, OEM official site, etc.) contributes its scrape.
+    # canonical_url_id is still the FK anchor for all other pipeline references;
+    # only source file assembly is broadened here.
+    all_url_result = (
+        client
+        .schema("pipeline")
+        .table("url_registry")
+        .select("url_id")
+        .eq("brand", brand)
+        .eq("model_name", model_name)
+        .execute()
+    )
+    all_url_ids = [r["url_id"] for r in (all_url_result.data or [])]
+    if not all_url_ids:
+        all_url_ids = [canonical_url_id]  # Fallback — should never happen
+
     scraped_result = (
         client
         .schema("pipeline")
         .table("raw_scraped_data")
-        .select("raw_id, scrape_status")
-        .eq("url_registry_id", canonical_url_id)
-        .in_("scrape_status", ["scraped_raw", "stored_mainDB"])
+        .select("raw_id, status")
+        .in_("url_registry_id", all_url_ids)
         .execute()
     )
     raw_source_ids = [r["raw_id"] for r in (scraped_result.data or [])]
@@ -2675,14 +2762,26 @@ def fetch_sources_for_run_phone(
         client
         .schema("pipeline")
         .table("youtube_video_url_registry")
-        .select("video_registry_id")
+        .select("video_registry_id, channel_id")
         .eq("url_registry_id", canonical_url_id)
         .eq("status", "fetched_raw")
+        # L8.2: exclude comparison and group_review videos — their transcripts
+        # produce contaminated Stage 1 candidates (competitor mentions, diluted
+        # per-phone signals). video_type='unknown' (DB default for all existing
+        # rows) is NOT excluded so legacy transcripts continue to work.
+        .not_.in_("video_type", ["comparison", "group_review"])
         .execute()
     )
-    video_ids = [r["video_registry_id"] for r in (video_result.data or [])]
+    video_rows = video_result.data or []
+    video_ids = [r["video_registry_id"] for r in video_rows]
+    # Build map: video_registry_id → channel_id for later reliability join
+    vid_to_channel: dict[int, int | None] = {
+        r["video_registry_id"]: r.get("channel_id")
+        for r in video_rows
+    }
 
     raw_transcript_ids: list[int] = []
+    top3_transcript_ids: list[int] = []
     best_transcript_id: int | None = None
 
     if video_ids:
@@ -2690,88 +2789,413 @@ def fetch_sources_for_run_phone(
             client
             .schema("pipeline")
             .table("youtube_raw_transcript_data")
-            .select(
-                "raw_transcript_id, channel_reliability_score, word_count_processed"
-            )
+            .select("raw_transcript_id, video_registry_id, file_size_bytes, fetched_at")
             .in_("video_registry_id", video_ids)
             .execute()
         )
         transcript_rows = transcript_result.data or []
         raw_transcript_ids = [r["raw_transcript_id"] for r in transcript_rows]
 
-        # Priority 1: sort by channel_reliability_score DESC (nulls last)
-        # Priority 2: sort by word_count_processed DESC (nulls last)
+        # Fetch channel_reliability_score for all unique channel_ids
+        channel_ids = list({
+            cid for cid in vid_to_channel.values() if cid is not None
+        })
+        channel_reliability: dict[int, float] = {}
+        if channel_ids:
+            try:
+                ch_result = (
+                    client
+                    .schema("pipeline")
+                    .table("youtube_channels")
+                    .select("channel_id, channel_reliability_score")
+                    .in_("channel_id", channel_ids)
+                    .execute()
+                )
+                for ch in (ch_result.data or []):
+                    if ch.get("channel_reliability_score") is not None:
+                        channel_reliability[ch["channel_id"]] = float(
+                            ch["channel_reliability_score"]
+                        )
+            except Exception:
+                pass  # Fall back to file_size_bytes only
+
         def _sort_key(r: dict) -> tuple:
-            score = r.get("channel_reliability_score") or 0
-            words = r.get("word_count_processed") or 0
-            return (-score, -words)
+            vid = r["video_registry_id"]
+            cid = vid_to_channel.get(vid)
+            reliability = channel_reliability.get(cid, 0.0) if cid else 0.0
+            file_size = r.get("file_size_bytes") or 0
+            # Descending: negate both for ascending sort
+            return (-reliability, -file_size)
 
         sorted_rows = sorted(transcript_rows, key=_sort_key)
-        best_transcript_id = sorted_rows[0]["raw_transcript_id"] if sorted_rows else None
+        top3_transcript_ids = [
+            r["raw_transcript_id"] for r in sorted_rows[:3]
+        ]
+        best_transcript_id = top3_transcript_ids[0] if top3_transcript_ids else None
 
     return {
-        "brand":              brand,
-        "model_name":         model_name,
-        "raw_source_ids":     raw_source_ids,
-        "raw_transcript_ids": raw_transcript_ids,
-        "best_transcript_id": best_transcript_id,
+        "brand":               brand,
+        "model_name":          model_name,
+        "raw_source_ids":      raw_source_ids,
+        "top3_transcript_ids": top3_transcript_ids,
+        "raw_transcript_ids":  raw_transcript_ids,
+        "best_transcript_id":  best_transcript_id,
     }
 
 
-def fetch_run_jsonl_path(run_type: str, run_id: int) -> str | None:
+def supersede_experiences(url_registry_id: int) -> int:
     """
-    Fetches the jsonl_path column from either spec_extraction_runs or
-    experience_extraction_runs, identified by run_type.
+    Marks all current active phone_experiences rows for this phone as superseded.
 
-    Used by GET /approval/visualization/{run_type}/{run_id} to retrieve
-    the JSONL file path for on-demand HTML generation.
+    Called at the start of run_experience_extraction_batch() — AFTER gate
+    validation passes — before inserting new rows. This ensures valid approved
+    data is never lost if the gate fails.
 
-    Args:
-        run_type: "spec" | "exp"
-        run_id:   PK of the run row (extraction_run_id or exp_run_id)
+    Only rows where is_superseded=FALSE are touched. Rows already superseded
+    (from previous re-runs) are left unchanged.
 
     Returns:
-        Storage path string, or None if jsonl_path is null (JSONL upload failed).
+        Count of rows marked as superseded (0 if no active rows existed).
 
     Raises:
-        ValueError: If run_type is invalid or run_id not found.
+        RuntimeError: On unexpected DB error.
+    """
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("phone_experiences")
+        .update({"is_superseded": True})
+        .eq("url_registry_id", url_registry_id)
+        .eq("is_superseded", False)
+        .execute()
+    )
+    return len(result.data or [])
+
+
+def validate_source_ids_belong_to_phone(
+    canonical_url_id: int,
+    raw_source_ids: list[int],
+    raw_transcript_ids: list[int],
+) -> dict:
+    """
+    Validates that all provided IDs belong to the phone identified by canonical_url_id.
+
+    SECURITY INVARIANT: In manual mode the admin selects IDs from a UI checklist.
+    This function ensures no ID from a different phone has been passed — either
+    by mistake or by a direct API call bypassing the UI.
+
+    For raw_source_ids:
+        Checks raw_scraped_data.url_registry_id == canonical_url_id for every ID.
+
+    For raw_transcript_ids:
+        Resolves youtube_raw_transcript_data → video_registry_id →
+        youtube_video_url_registry.url_registry_id and checks it equals
+        canonical_url_id for every transcript ID.
+
+    Returns:
+        {
+            "valid":                  bool,
+            "foreign_source_ids":     list[int],  — raw_ids from wrong phone OR not found in DB
+            "foreign_transcript_ids": list[int],  — transcript_ids from wrong phone
+        }
+        "valid" is True only when BOTH foreign lists are empty.
+
+    Raises:
+        Nothing. All DB errors are swallowed and treated as invalid (safe default).
+    """
+    client = get_client()
+    foreign_source_ids: list[int] = []
+    foreign_transcript_ids: list[int] = []
+
+    # ── Check raw_source_ids ownership ──────────────────────────────────────
+    if raw_source_ids:
+        try:
+            result = (
+                client
+                .schema("pipeline")
+                .table("raw_scraped_data")
+                .select("raw_id, url_registry_id")
+                .in_("raw_id", raw_source_ids)
+                .execute()
+            )
+            rows = result.data or []
+
+            # IDs not returned by the DB do not exist — treat as foreign
+            returned_ids = {row["raw_id"] for row in rows}
+            missing_in_db = set(raw_source_ids) - returned_ids
+            foreign_source_ids.extend(sorted(missing_in_db))
+
+            # IDs that exist but belong to a different phone
+            for row in rows:
+                if row["url_registry_id"] != canonical_url_id:
+                    foreign_source_ids.append(row["raw_id"])
+
+        except Exception:
+            # On any DB error treat ALL supplied IDs as unverified — safe default.
+            foreign_source_ids = list(raw_source_ids)
+
+    # ── Check raw_transcript_ids ownership ──────────────────────────────────
+    if raw_transcript_ids:
+        try:
+            # Step 1: raw_transcript_id → video_registry_id
+            transcript_result = (
+                client
+                .schema("pipeline")
+                .table("youtube_raw_transcript_data")
+                .select("raw_transcript_id, video_registry_id")
+                .in_("raw_transcript_id", raw_transcript_ids)
+                .execute()
+            )
+            transcript_rows = transcript_result.data or []
+
+            # Map: raw_transcript_id → video_registry_id
+            tid_to_vid: dict[int, int] = {
+                r["raw_transcript_id"]: r["video_registry_id"]
+                for r in transcript_rows
+            }
+
+            if tid_to_vid:
+                # Step 2: video_registry_id → url_registry_id
+                vr_result = (
+                    client
+                    .schema("pipeline")
+                    .table("youtube_video_url_registry")
+                    .select("video_registry_id, url_registry_id")
+                    .in_("video_registry_id", list(tid_to_vid.values()))
+                    .execute()
+                )
+                # Map: video_registry_id → url_registry_id
+                vid_to_owner: dict[int, int] = {
+                    r["video_registry_id"]: r["url_registry_id"]
+                    for r in (vr_result.data or [])
+                }
+
+                for transcript_id, video_id in tid_to_vid.items():
+                    owner = vid_to_owner.get(video_id)
+                    if owner != canonical_url_id:
+                        foreign_transcript_ids.append(transcript_id)
+
+            # Transcripts whose raw_transcript_id was not found in DB at all
+            missing_in_db = set(raw_transcript_ids) - set(tid_to_vid.keys())
+            foreign_transcript_ids.extend(sorted(missing_in_db))
+
+        except Exception:
+            # On any DB error treat ALL supplied transcript IDs as unverified.
+            foreign_transcript_ids = list(raw_transcript_ids)
+
+    return {
+        "valid":                  not foreign_source_ids and not foreign_transcript_ids,
+        "foreign_source_ids":     foreign_source_ids,
+        "foreign_transcript_ids": foreign_transcript_ids,
+    }
+
+
+def fetch_evidence_json_for_final(final_id: int) -> dict | None:
+    """
+    Fetches evidence_json for a phone identified by final_id.
+
+    Traversal chain:
+        final_merged_json.final_id
+        → final_merged_json.normalized_id
+        → spec_extraction_output.output_id  (via normalized_spec.output_id)
+        → spec_extraction_output.evidence_json (JSONB)
+
+    Returns:
+        The evidence_json dict, or None if any step in the chain is missing.
     """
     client = get_client()
 
-    if run_type == "spec":
-        result = (
-            client
-            .schema("pipeline")
-            .table("spec_extraction_runs")
-            .select("jsonl_path")
-            .eq("extraction_run_id", run_id)
-            .execute()
-        )
-        if not result.data:
-            raise ValueError(
-                f"fetch_run_jsonl_path: spec run_id={run_id} not found "
-                "in pipeline.spec_extraction_runs."
-            )
-        return result.data[0].get("jsonl_path")
+    # Step 1 — Resolve normalized_id from final_id
+    fmj_result = (
+        client
+        .schema("pipeline")
+        .table("final_merged_json")
+        .select("normalized_id")
+        .eq("final_id", final_id)
+        .execute()
+    )
+    if not fmj_result.data:
+        return None
+    normalized_id: int = fmj_result.data[0]["normalized_id"]
 
-    elif run_type == "exp":
-        result = (
-            client
-            .schema("pipeline")
-            .table("experience_extraction_runs")
-            .select("jsonl_path")
-            .eq("exp_run_id", run_id)
-            .execute()
-        )
-        if not result.data:
-            raise ValueError(
-                f"fetch_run_jsonl_path: exp run_id={run_id} not found "
-                "in pipeline.experience_extraction_runs."
-            )
-        return result.data[0].get("jsonl_path")
+    # Step 2 — Resolve output_id from normalized_spec
+    ns_result = (
+        client
+        .schema("pipeline")
+        .table("normalized_spec_json")
+        .select("output_id")
+        .eq("normalized_id", normalized_id)
+        .execute()
+    )
+    if not ns_result.data:
+        return None
+    output_id: int = ns_result.data[0]["output_id"]
 
-    else:
-        raise ValueError(
-            f"fetch_run_jsonl_path: invalid run_type={run_type!r}. "
-            "Must be 'spec' or 'exp'."
+    # Step 3 — Fetch evidence_json from spec_extraction_output
+    eo_result = (
+        client
+        .schema("pipeline")
+        .table("spec_extraction_output")
+        .select("evidence_json")
+        .eq("output_id", output_id)
+        .execute()
+    )
+    if not eo_result.data:
+        return None
+    return eo_result.data[0].get("evidence_json")
+
+
+# ===========================================================================
+# Phase L8.2 — Two-Stage Experience System
+# ===========================================================================
+
+
+def fetch_existing_candidates_for_transcript(
+    url_registry_id: int,
+    raw_transcript_id: int,
+) -> list[dict]:
+    """
+    Check whether Stage 1 has already been run for this (phone, transcript) pair.
+    Returns all phone_experience_candidates rows for the pair.
+    Empty list  → Stage 1 not yet run → run Stage 1.
+    Non-empty   → candidates exist   → skip Stage 1, reuse.
+    """
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("phone_experience_candidates")
+        .select(
+            "candidate_id, experience_text, sentiment, evidence_quote, "
+            "category, confidence, raw_transcript_id"
         )
+        .eq("url_registry_id", url_registry_id)
+        .eq("raw_transcript_id", raw_transcript_id)
+        .execute()
+    )
+    return result.data or []
+
+
+def fetch_all_candidates_for_phone(url_registry_id: int) -> list[dict]:
+    """
+    Fetch ALL Stage 1 candidates for a phone.
+    Fed to Stage 2 aggregation as the complete candidate set.
+    Ordered by raw_transcript_id then candidate_id for deterministic input.
+    """
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("phone_experience_candidates")
+        .select(
+            "candidate_id, raw_transcript_id, experience_text, sentiment, "
+            "evidence_quote, category, confidence"
+        )
+        .eq("url_registry_id", url_registry_id)
+        .order("raw_transcript_id")
+        .order("candidate_id")
+        .execute()
+    )
+    return result.data or []
+
+
+def bulk_insert_experience_candidates(rows: list[dict]) -> int:
+    """
+    Bulk insert Stage 1 candidates into phone_experience_candidates.
+    Expected keys per row:
+        url_registry_id, raw_transcript_id, exp_run_id,
+        experience_text, sentiment, evidence_quote (str|None),
+        category, confidence (float)
+    Returns count inserted.
+    """
+    if not rows:
+        return 0
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("phone_experience_candidates")
+        .insert(rows)
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError(
+            f"bulk_insert_experience_candidates: insert returned no data "
+            f"(exp_run_id={rows[0].get('exp_run_id')})."
+        )
+    return len(result.data)
+
+
+def insert_aggregation_run(payload: dict) -> int:
+    """
+    Insert a new experience_aggregation_runs row (status='running').
+    Expected keys: url_registry_id, model_used, schema_version,
+        total_candidates_input, transcripts_input,
+        new_transcripts_count, reused_transcripts_count, status.
+    Returns aggregation_run_id.
+    """
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("experience_aggregation_runs")
+        .insert(payload)
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError(
+            f"insert_aggregation_run: no data returned "
+            f"(url_registry_id={payload.get('url_registry_id')})."
+        )
+    return result.data[0]["aggregation_run_id"]
+
+
+def update_aggregation_run(run_id: int, updates: dict) -> None:
+    """
+    Update an experience_aggregation_runs row by aggregation_run_id.
+    Pass "now()" as a string value for any timestamp field — this function
+    resolves it to a real UTC ISO timestamp before inserting.
+    """
+    import datetime
+    safe = {}
+    for k, v in updates.items():
+        if v == "now()":
+            safe[k] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        else:
+            safe[k] = v
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("experience_aggregation_runs")
+        .update(safe)
+        .eq("aggregation_run_id", run_id)
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError(
+            f"update_aggregation_run: aggregation_run_id={run_id} not found."
+        )
+
+
+def bulk_insert_aggregated_experiences(rows: list[dict]) -> int:
+    """
+    Bulk insert Stage 2-aggregated experiences into phone_experiences.
+    Expected keys per row:
+        url_registry_id, aggregation_run_id, exp_run_id (None for Stage 2 rows),
+        raw_transcript_id, category_id, experience_text, sentiment,
+        evidence_quote (required — never None), confidence,
+        source_transcript_count (int)
+    Returns count inserted.
+    """
+    if not rows:
+        return 0
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("phone_experiences")
+        .insert(rows)
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError(
+            f"bulk_insert_aggregated_experiences: insert returned no data "
+            f"(aggregation_run_id={rows[0].get('aggregation_run_id')})."
+        )
+    return len(result.data)
+

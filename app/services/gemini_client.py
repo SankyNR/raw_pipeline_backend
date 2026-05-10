@@ -29,6 +29,8 @@ import logging
 import re
 from typing import Any
 
+from pydantic import BaseModel
+
 from google import genai
 from google.genai import errors, types
 
@@ -46,7 +48,15 @@ EXTRACTION_MODEL = "gemini-2.5-flash-lite"
 # Module-level singleton client (M6 fix — instantiated ONCE, not per call)
 # ---------------------------------------------------------------------------
 
-_client: genai.Client = genai.Client(api_key=GEMINI_API_KEY)
+_client: genai.Client | None = None
+
+def get_gemini_client() -> genai.Client:
+    global _client
+    if _client is None:
+        if not GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY is not set")
+        _client = genai.Client(api_key=GEMINI_API_KEY)
+    return _client
 
 
 # ---------------------------------------------------------------------------
@@ -103,13 +113,16 @@ def _classify_gemini_exception(exc: Exception) -> type[Exception]:
 # Internal — retry engine
 # ---------------------------------------------------------------------------
 
-async def _retry_with_backoff(coro_factory, max_retries: int = 3):
+async def _retry_with_backoff(coro_factory, max_retries: int = 3, label: str = "gemini"):
     """
     Runs `coro_factory()` (a zero-argument callable returning a coroutine)
     with exponential backoff retries for rate-limit and transient errors.
 
     Backoff schedule: 2s → 4s → 8s (2 ** (attempt + 1)).
     Non-retryable errors propagate immediately without sleeping.
+
+    Args:
+        label: Caller name for structured error logs (e.g. "call_gemini_json").
     """
     for attempt in range(max_retries):
         try:
@@ -117,18 +130,35 @@ async def _retry_with_backoff(coro_factory, max_retries: int = 3):
         except (GeminiRateLimitError, GeminiTransientError) as exc:
             if attempt == max_retries - 1:
                 logger.error(
-                    "Gemini call failed after %d attempts: %s", max_retries, exc
+                    "Gemini call failed after %d attempts [%s]: %s",
+                    max_retries, label, exc,
                 )
                 raise
             wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
             logger.warning(
-                "Gemini transient/rate-limit error (attempt %d/%d), "
+                "Gemini transient/rate-limit error (attempt %d/%d) [%s], "
                 "retrying in %ds: %s",
-                attempt + 1, max_retries, wait, exc,
+                attempt + 1, max_retries, label, wait, exc,
             )
             await asyncio.sleep(wait)
         except GeminiNonRetryableError:
             raise  # No point retrying — bad prompt, invalid schema, etc.
+
+
+# ---------------------------------------------------------------------------
+# Safe float coercion helper (for grounded enrichment confidence values)
+# ---------------------------------------------------------------------------
+
+def _safe_float(val, default: float = 0.5) -> float:
+    """
+    Coerces an enrichment confidence value to float.
+    Handles model responses like "0.90 (Confirmed)" by stripping non-numeric
+    trailing text before conversion. Falls back to `default` on any error.
+    """
+    try:
+        return float(str(val).split()[0].rstrip('.,)'))
+    except (ValueError, TypeError):
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +202,24 @@ def _extract_json_object(text: str) -> str:
             start = min(obj_start, arr_start)
             close = "}" if start == obj_start else "]"
 
-        end = stripped.rfind(close)
+        # Brace-balanced scan: find the end of the FIRST complete JSON object.
+        # rfind() was wrong — it found the last closing delimiter, which when
+        # Gemini returns NDJSON (same object repeated on multiple lines) spanned
+        # all repetitions and produced invalid JSON for json.loads().
+        # This scanner counts open/close delimiters and stops at the first
+        # complete balanced object, correctly handling nested braces.
+        open_delim  = "{" if close == "}" else "["
+        close_delim = close
+        depth = 0
+        end = -1
+        for i in range(start, len(stripped)):
+            if stripped[i] == open_delim:
+                depth += 1
+            elif stripped[i] == close_delim:
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
         if end > start:
             return stripped[start:end + 1]
 
@@ -183,6 +230,22 @@ def _extract_json_object(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Task 0.2 — call_gemini_grounded
 # ---------------------------------------------------------------------------
+
+async def _resolve_grounding_redirect(redirect_url: str, timeout: float = 3.0) -> str | None:
+    """
+    Follows a Vertex AI grounding redirect URL to extract the real source URL.
+    Issues a HEAD request with redirect-following DISABLED.
+    Returns the Location header value (real URL), or None on any error / timeout.
+    A 3-second timeout prevents this from slowing enrichment on network issues.
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
+            resp = await client.head(redirect_url)
+            return resp.headers.get("location") or None
+    except Exception:
+        return None
+
 
 async def call_gemini_grounded(
     prompt: str,
@@ -239,7 +302,7 @@ async def call_gemini_grounded(
 
     async def _call():
         try:
-            response = await _client.aio.models.generate_content(
+            response = await get_gemini_client().aio.models.generate_content(
                 model=EXTRACTION_MODEL,
                 contents=full_prompt,
                 config=types.GenerateContentConfig(
@@ -253,14 +316,16 @@ async def call_gemini_grounded(
             )
 
             raw_text = response.text
-            if raw_text is None:
+            if not raw_text or not raw_text.strip():
                 raise GeminiNonRetryableError(
-                    "Gemini grounded call returned empty response (text=None)."
+                    "call_gemini_grounded: empty or whitespace response."
                 )
 
             # Parse JSON — strip fences and extract first { → last } for robustness
             cleaned = _extract_json_object(raw_text)
             try:
+                # Strip any backslash that isn't part of a valid JSON escape sequence (\| → |, etc.)
+                cleaned = re.sub(r'\\([^"\\/bfnrtu\n\r])', r'\1', cleaned)
                 parsed = json.loads(cleaned)
             except json.JSONDecodeError as exc:
                 raise GeminiNonRetryableError(
@@ -278,16 +343,24 @@ async def call_gemini_grounded(
                     .grounding_chunks
                 )
                 if grounding_chunks:
-                    source_url = grounding_chunks[0].web.uri
-                    if source_url:
-                        from urllib.parse import urlparse
-                        source_domain = urlparse(source_url).netloc
+                    raw_uri = grounding_chunks[0].web.uri
+                    if raw_uri:
+                        # Gemini returns a Vertex AI redirect URL, not the real source.
+                        # Resolve it with a single HEAD request to get the actual domain.
+                        if "vertexaisearch.cloud.google.com" in raw_uri:
+                            resolved = await _resolve_grounding_redirect(raw_uri)
+                            source_url = resolved or raw_uri  # fall back to redirect if resolve fails
+                        else:
+                            source_url = raw_uri
+                        if source_url:
+                            from urllib.parse import urlparse
+                            source_domain = urlparse(source_url).netloc
             except (AttributeError, IndexError, TypeError):
                 pass  # Grounding metadata may be absent — treat as parametric
 
             return {
                 "value":         parsed.get("value"),
-                "confidence":    float(parsed.get("confidence", 0.5)),
+                "confidence":    _safe_float(parsed.get("confidence", 0.5)),
                 "evidence":      parsed.get("evidence", ""),
                 "source_url":    source_url,
                 "source_domain": source_domain,
@@ -299,4 +372,103 @@ async def call_gemini_grounded(
             error_class = _classify_gemini_exception(exc)
             raise error_class(f"call_gemini_grounded error: {exc}") from exc
 
-    return await _retry_with_backoff(_call, max_retries=max_retries)
+    return await _retry_with_backoff(_call, max_retries=max_retries, label="call_gemini_grounded")
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 — call_gemini_json (v5 extraction engine)
+# ---------------------------------------------------------------------------
+
+async def call_gemini_json(
+    system_prompt: str,
+    user_content: str,
+    output_schema: type | None,
+    temperature: float = 0.1,
+    max_retries: int = 3,
+) -> dict[str, Any]:
+    """
+    Calls Gemini with JSON mode enforced (response_mime_type="application/json").
+    Used for all extraction calls: Run A (spec) and Run B (experience).
+
+    One API call per extraction. No chaining, no AFC, no tool calling.
+
+    Args:
+        system_prompt:  ECD for Run A; experience system prompt for Run B.
+        user_content:   Assembled sources string (Run A) or transcript text (Run B).
+        output_schema:  Must be a Pydantic BaseModel subclass (NOT a dict or raw type).
+                        The Gemini SDK requires a structured schema object.
+                        Passing a raw dict will fail or disable schema enforcement.
+        temperature:    0.1 for Run A (deterministic); 0.3 for Run B (expressive).
+        max_retries:    Maximum retry attempts (backoff: 2s → 4s → 8s).
+
+    Returns:
+        Parsed dict matching output_schema structure.
+
+    Raises:
+        GeminiNonRetryableError: If output_schema is not a Pydantic BaseModel subclass,
+                                 or if the response is empty/unparseable.
+        GeminiRateLimitError, GeminiTransientError: On transient API failures.
+    """
+    if output_schema is not None and not (isinstance(output_schema, type) and issubclass(output_schema, BaseModel)):
+        raise GeminiNonRetryableError(
+            "output_schema must be a Pydantic BaseModel subclass or None. "
+            f"Got: {type(output_schema).__name__}"
+        )
+
+    async def _call():
+        try:
+            response = await get_gemini_client().aio.models.generate_content(
+                model=EXTRACTION_MODEL,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[types.Part(text=user_content)],
+                    )
+                ],
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=temperature,
+                    response_mime_type="application/json",
+                    **({
+                        "response_schema": output_schema
+                    } if output_schema is not None else {}),
+                ),
+            )
+
+            raw_text = response.text
+            if not raw_text or not raw_text.strip():
+                raise GeminiNonRetryableError(
+                    "call_gemini_json: empty or whitespace response."
+                )
+
+            try:
+                # Strip any backslash that isn't part of a valid JSON escape sequence (\| → |, etc.)
+                raw_text = re.sub(r'\\([^"\\/bfnrtu\n\r])', r'\1', raw_text)
+                parsed = json.loads(raw_text)
+                logger.debug(
+                    "call_gemini_json success | model=%s | response_chars=%d",
+                    EXTRACTION_MODEL, len(raw_text),
+                )
+                return parsed
+            except json.JSONDecodeError as exc:
+                cleaned = _extract_json_object(raw_text)
+                try:
+                    parsed = json.loads(cleaned)
+                    logger.debug(
+                        "call_gemini_json success (fallback parse) | model=%s | response_chars=%d",
+                        EXTRACTION_MODEL, len(raw_text),
+                    )
+                    return parsed
+                except json.JSONDecodeError:
+                    raise GeminiNonRetryableError(
+                        f"call_gemini_json: JSON decode failed: {exc}. "
+                        f"Raw (first 300): {raw_text[:300]}"
+                    ) from exc
+
+        except (GeminiRateLimitError, GeminiTransientError, GeminiNonRetryableError):
+            raise
+        except Exception as exc:
+            error_class = _classify_gemini_exception(exc)
+            raise error_class(f"call_gemini_json error: {exc}") from exc
+
+    return await _retry_with_backoff(_call, max_retries=max_retries, label="call_gemini_json")

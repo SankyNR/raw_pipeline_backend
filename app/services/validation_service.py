@@ -419,14 +419,14 @@ async def run_pre_ui_validation(
     )
     evidence_json: dict = (ext_output or {}).get("evidence_json") or {}
 
-    # Also fetch any enrichment candidate field_paths (these have implicit evidence)
-    enriched_fields: set[str] = set()
+    # Fetch enrichment candidates once — used by both Check 4 and Check 6.
+    enrichment_candidates: list[dict] = []
     enrichment_run_id = final_row.get("enrichment_run_id")
     if enrichment_run_id is not None:
-        cands = await asyncio.to_thread(
+        enrichment_candidates = await asyncio.to_thread(
             fetch_selected_enrichment_candidates, enrichment_run_id
         )
-        enriched_fields = {c["field_path"] for c in cands}
+    enriched_fields = {c["field_path"] for c in enrichment_candidates}
 
     # Collect all non-null leaf fields in final_json
     non_null_fields = _collect_non_null_paths(final_json)
@@ -460,24 +460,18 @@ async def run_pre_ui_validation(
             ),
         })
 
-    # ------------------------------------------------------------------
     # Check 6 — Confidence floor (WARNING only)
-    # ------------------------------------------------------------------
-    if enrichment_run_id is not None:
-        cands = await asyncio.to_thread(
-            fetch_selected_enrichment_candidates, enrichment_run_id
-        )
-        for cand in cands:
-            conf = float(cand.get("confidence", 1.0))
-            if conf < 0.30:
-                warnings.append({
-                    "check":   "low_confidence",
-                    "field":   cand["field_path"],
-                    "message": (
-                        f"Enrichment confidence {conf:.2f} is below the floor 0.30. "
-                        f"Value may be unreliable. Admin should verify."
-                    ),
-                })
+    for cand in enrichment_candidates:
+        conf = float(cand.get("confidence", 1.0))
+        if conf < 0.30:
+            warnings.append({
+                "check":   "low_confidence",
+                "field":   cand["field_path"],
+                "message": (
+                    f"Enrichment confidence {conf:.2f} is below the floor 0.30. "
+                    f"Value may be unreliable. Admin should verify."
+                ),
+            })
 
     # ------------------------------------------------------------------
     # Persist result
@@ -573,6 +567,12 @@ def _collect_non_null_paths(obj: object, prefix: str = "") -> list[str]:
             paths.extend(_collect_non_null_paths(v, path))
     elif isinstance(obj, list):
         for i, v in enumerate(obj):
+            # Skip plain string items — these are junction array values
+            # (e.g. ["HDR10", "LTE Band 1"]) and are intentionally ungrounded.
+            # Counting them as leaf paths generates hundreds of spurious
+            # missing_evidence warnings per flagship phone.
+            if isinstance(v, str):
+                continue
             path = f"{prefix}[{i}]"
             paths.extend(_collect_non_null_paths(v, path))
     else:
@@ -602,18 +602,10 @@ from app.services.conflict_resolver import (        # noqa: E402 — section-lev
     _path_has_secondary_index,
 )
 
-# Brands whose phones are expected to have two display entries
-_FOLDABLE_BRANDS: frozenset[str] = frozenset({
-    "samsung",  # Galaxy Z series
-    "motorola", # Razr series
-    "google",   # Pixel Fold
-    "oppo",     # Find N series
-    "vivo",     # X Fold series
-    "honor",    # Magic V series
-    "huawei",   # Mate X series
-    "xiaomi",   # Mix Fold series
-    "oneplus",  # Open
-})
+# S2-P1-2: _FOLDABLE_BRANDS removed — brand-based foldable detection was causing
+# every standard Galaxy/Pixel/Moto device to generate spurious foldable_single_display
+# warnings. Check 5 now uses display_type presence (Inner+Cover) as the signal.
+# fetch_brand_for_phone is retained for other potential uses in this module.
 
 # Experience confidence floor for committed entries
 _COMMITTED_EXPERIENCE_CONFIDENCE_FLOOR = 0.50
@@ -875,29 +867,38 @@ async def run_pre_commit_validation(
 
     # ------------------------------------------------------------------
     # Check 5 — Structural consistency (warnings only)
+    # S2-P1-2: replaced brand-based (_FOLDABLE_BRANDS) detection with
+    # display_type structure-based detection. Brand check was firing for
+    # every standard Samsung/Pixel/Motorola phone.
     # ------------------------------------------------------------------
-    brand = await asyncio.to_thread(fetch_brand_for_phone, url_registry_id)
-    brand_lower = (brand or "").lower().strip()
-    is_foldable_brand = brand_lower in _FOLDABLE_BRANDS
+    displays = final_json.get("displays") or []
+    display_count = len(displays)
 
-    displays = final_json.get("displays")
-    display_count = len(displays) if isinstance(displays, list) else 0
+    has_inner = any(
+        str(d.get("display_type", "")).lower() == "inner"
+        for d in displays if isinstance(d, dict)
+    )
+    has_cover = any(
+        str(d.get("display_type", "")).lower() == "cover"
+        for d in displays if isinstance(d, dict)
+    )
+    is_foldable_structure = has_inner and has_cover
 
-    if is_foldable_brand and display_count < 2:
+    if is_foldable_structure and display_count < 2:
         warnings.append({
             "check":   "foldable_single_display",
             "message": (
-                f"Brand '{brand}' is in FOLDABLE_BRANDS but displays has only "
-                f"{display_count} entry. Verify this phone is not a foldable model."
+                "Phone has Inner/Cover display_type entries but fewer than 2 display objects. "
+                "Verify the display structure is complete."
             ),
         })
 
-    if not is_foldable_brand and display_count > 1:
+    if not is_foldable_structure and display_count > 1:
         warnings.append({
             "check":   "non_foldable_multiple_displays",
             "message": (
-                f"Brand '{brand}' is not in FOLDABLE_BRANDS but displays has "
-                f"{display_count} entries. Verify this is not a data error."
+                f"Phone has {display_count} display entries but no Inner/Cover type detected. "
+                "Verify this is not a data error."
             ),
         })
 

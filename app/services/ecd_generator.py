@@ -138,9 +138,8 @@ def _build_source_priority_block() -> str:
             fields = exc_block.get("fields_where_aggregator_wins", [])
             reason = exc_block.get("reason", "").strip()
             if fields:
-                lines.append(f"    EXCEPTION — aggregator beats transcript for:")
-                for f in fields:
-                    lines.append(f"      - {f}")
+                fields_str = " | ".join(fields)
+                lines.append(f"    EXCEPTION — aggregator beats transcript for exact measurements: {fields_str}")
                 lines.append(f"    Reason: {reason}")
         lines.append("")
     return "\n".join(lines)
@@ -181,19 +180,19 @@ def _build_phone_type_instructions(phone_type: str) -> str:
         return (
             "=== PHONE TYPE: FOLDABLE (BOOK-FOLD) ===\n"
             "This is a book-fold foldable (e.g. Galaxy Z Fold). Rules:\n"
-            "• body.length/breadth/height = UNFOLDED (open) state.\n"
-            "• body.length_folded/breadth_folded/height_folded = FOLDED (closed) state.\n"
+            "• body.height/width/thickness = UNFOLDED (open) state.\n"
+            "• body.height_folded/width_folded/thickness_folded = FOLDED (closed) state.\n"
             "• displays: MUST have exactly 2 entries.\n"
-            "  - Cover screen: display_type='Cover', display_position='Primary'\n"
-            "  - Inner screen: display_type='Inner', display_position='Secondary'\n"
+            "  - Inner screen: display_type='Inner', display_position='Primary'\n"
+            "  - Cover screen: display_type='Cover', display_position='Secondary'\n"
             "• NEVER average specs across the two screens.\n"
         )
     if phone_type == PHONE_TYPE_FLIPPABLE:
         return (
             "=== PHONE TYPE: FLIPPABLE (CLAMSHELL) ===\n"
             "This is a clamshell foldable (e.g. Galaxy Z Flip, Motorola Razr). Rules:\n"
-            "• body.length/breadth/height = UNFOLDED (open) state.\n"
-            "• body.length_folded/breadth_folded/height_folded = FOLDED (closed) state.\n"
+            "• body.height/width/thickness = UNFOLDED (open) state.\n"
+            "• body.height_folded/width_folded/thickness_folded = FOLDED (closed) state.\n"
             "• displays: MUST have exactly 2 entries.\n"
             "  - Inner screen: display_type='Inner', display_position='Primary'\n"
             "  - Cover screen: display_type='Cover', display_position='Secondary'\n"
@@ -203,7 +202,7 @@ def _build_phone_type_instructions(phone_type: str) -> str:
     return (
         "=== PHONE TYPE: STANDARD ===\n"
         "This is a standard (non-foldable) phone. Rules:\n"
-        "• body.length_folded / breadth_folded / height_folded = always null.\n"
+        "• body.height_folded / width_folded / thickness_folded = always null.\n"
         "• displays: exactly 1 entry.\n"
         "  - display_type='Main', display_position='Primary'\n"
     )
@@ -217,90 +216,48 @@ def _build_critical_rules_block() -> str:
     return """\
 === CRITICAL EXTRACTION RULES ===
 
-1. DERIVED FIELDS — NEVER EXTRACT
-   Run C computes these. Extracting them causes pipeline conflicts:
-   • displays[*].ppi                       → computed: sqrt(h²+w²) / size_inch
-   • camera_lenses[*].sensor_size_decimal  → computed: 1.0 / sensor_size_denominator
+1. DERIVED FIELDS — NEVER EXTRACT (Run C computes these):
+   displays[*].ppi → sqrt(h²+w²) / size_inch
+   camera_lenses[*].sensor_size_decimal → 1.0 / sensor_size_denominator
 
-2. LOOKUP MATCHING
-   • Always output exact strings from the allowed values (see FIELD SCHEMA below).
-   • Case-sensitive: "LPDDR5X" not "lpddr5x", "Li-Po" not "Li-po".
-   • If no match: output null. Never invent a new string value.
+2. LOOKUP MATCHING: Output exact strings from allowed values. Case-sensitive. \
+No match → null. Never invent a string.
 
-3. SENSOR SIZE
-   • sensor_size_denominator = the number after "1/" in "1/X inch"
-     e.g. "1/1.56 inch" → sensor_size_denominator: 1.56
+3. SENSOR SIZE: sensor_size_denominator = number after "1/" in "1/X inch". \
+e.g. "1/1.56 inch" → 1.56. Null if notation absent.
 
-4. VARIANT INTEGRITY
-   • ram_capacity = PHYSICAL RAM only. Never sum physical + virtual RAM.
-   • is_base_variant = true for exactly ONE variant per phone.
+4. VARIANT INTEGRITY: ram_capacity = physical RAM only. is_base_variant = true on exactly ONE variant.
 
-5. APERTURE
-   • Lower aperture = BETTER (wider aperture, more light).
-   • "f/1.7" → aperture: 1.7. Store the numeric value only.
+5. APERTURE: "f/1.7" → aperture: 1.7. Store numeric only. Lower = wider = better.
 
-6. CHARGER IN BOX — INDIA CRITICAL
-   • Must reflect the INDIA RETAIL UNIT specifically.
-   • International "no charger" news ≠ India unit policy.
-   • If not explicitly stated in sources: output null.
+6. CHARGER IN BOX: India retail unit only. International policy ≠ India. Null if not stated.
 
-7. NAVIC — INDIA PRIORITY
-   • Always check all sources explicitly for NavIC support.
-   • Absence from aggregators ≠ absence from phone.
+7. NAVIC: Always check OEM India page explicitly. Absence from aggregators ≠ not supported.
 
-8. SAR VALUES — INDIA STANDARD
-   • India uses 0mm separation (tec.fptc.gov.in).
-   • GSMArena SAR values use EU 10mm separation — NOT India values.
+8. SAR: India = 0mm separation. GSMArena = EU 10mm. Never use GSMArena SAR for India.
 
-9. USB SPEED VS CONNECTOR
-   • Type-C connector ≠ USB 3.x speed. Most budget phones use USB 2.0 over Type-C.
-   • Verify usb_standard from the explicit data transfer rate in specs.
+9. USB SPEED: Type-C connector ≠ USB 3.x. Verify usb_standard from explicit transfer rate in specs.
 
-10. BOOLEAN INFERENCE FORBIDDEN
-    • Do NOT set pd_support from "USB Type-C" alone.
-    • Do NOT set vo5g from "5G phone" alone — requires explicit VoNR/Vo5G statement.
-    • Only set booleans when the source explicitly confirms the feature.
+10. BOOLEAN INFERENCE FORBIDDEN: Never set pd_support from "USB Type-C" alone. \
+Never set vo5g from "5G phone" alone. Booleans require explicit source confirmation.
 
-11. NULL VS OMIT
-    • Use explicit null for missing scalar fields.
-    • Use [] for missing array/junction fields.
-    • NEVER omit a key from the JSON output.
+11. NULL VS OMIT: Explicit null for missing scalars. [] for missing arrays. Never omit a key.
 
-12. ARRAY ORDERING (STRICT)
-    • camera_lenses MUST be ordered: Main → Ultra-wide → Telephoto → Macro → Depth
-      The index position in the output array determines the FK mapping in the DB.
-      Wrong order = wrong lens type committed. Verify against OEM specs.
-    • variants MUST be ordered: ascending by RAM capacity first, then storage.
-      Example: 6GB/128GB → 8GB/128GB → 8GB/256GB → 12GB/256GB.
-      is_base_variant=true MUST be set on exactly the first (lowest) variant.
-    • displays MUST follow the ordering in Rule [PHONE TYPE] above.
+12. ARRAY ORDERING (STRICT — wrong order = wrong DB mapping):
+    camera_lenses: Main → Ultra-wide → Telephoto → Macro → Depth → Front
+    variants: ascending RAM first, then storage. is_base_variant=true on the first (lowest) variant.
+    displays: per phone type rules above.
 
-13. PER-FIELD EVIDENCE (REQUIRED)
-    For EVERY non-null field you extract, wrap the value with evidence:
-    {
-      "value":       <the extracted value>,
-      "evidence":    "exact sentence from source",
-      "source_type": "scraped|transcript",
-      "source_name": "<site_name from the --- SOURCE: <site_name> --- header>"
-    }
-    Fields with null values output: null (no evidence wrapper needed).
-    Use source_type="scraped" for OEM/aggregator sources, "transcript" for YouTube.
-    source_name MUST match the header of the section you drew the value from,
-    e.g. "gsmarena", "samsung_official", "smartprix", or "transcript".
+13. EVIDENCE (every non-null scalar MUST have this wrapper):
+    Scraped:    {"value": X, "_source": {"raw_id": N, "evidence_text": "verbatim substring"}}
+    Transcript: {"value": X, "_source": {"raw_transcript_id": N, "evidence_text": "verbatim substring"}}
+    Rules: evidence_text = exact verbatim substring, never paraphrased. One source per field. \
+Null fields → null directly, no _source. \
+Junction arrays (bands_5g, display_features) and structural fields \
+(display_type, lens_type, is_base_variant) → plain value, no _source.
 
-14. STORAGE AND RAM UNITS — ALWAYS OUTPUT IN GB (MANDATORY)
-    The normaliser strips numeric suffixes AFTER you output them. If you output
-    "1TB", it becomes integer 1. If you output "1024GB", it becomes integer 1024.
-    1024 is correct. 1 is wrong. The pipeline has no unit conversion — YOU must convert.
-
-    storage_capacity: ALWAYS in GB. Convert TB → GB if needed.
-      Examples: 128GB → 128   |   256GB → 256   |   1TB → 1024   |   512GB → 512
-    ram_capacity: ALWAYS in GB. Modern phones are always GB — no conversion needed.
-      Examples: 6GB → 6   |   8GB → 8   |   12GB → 12
-      If a source says MB (extremely rare): convert. 4096MB → 4.
-
-    NEVER output raw TB values. NEVER omit the GB suffix (the normaliser needs it
-    to confirm the number is storage, not a ppi or Hz value).
+14. STORAGE/RAM IN GB (MANDATORY): Output in GB always. 1TB → 1024. \
+The normaliser strips suffixes but has zero unit conversion. Wrong unit = wrong DB value.
 """
 
 
@@ -319,6 +276,172 @@ def _build_spec_template_block() -> str:
 # ---------------------------------------------------------------------------
 # Task 0.4 — build_ecd (main public API)
 # ---------------------------------------------------------------------------
+
+def _build_lookup_values_block() -> str:
+    """
+    Injects the canonical allowed values for every lookup field into the ECD.
+    This is the single most important accuracy fix: when the LLM knows the exact
+    canonical string to output, the normalizer can exact-match it without fuzzy
+    matching or staging. This eliminates the majority of false gaps and prevents
+    wasted enrichment queries.
+
+    Values are hardcoded here from the live DB lookup tables.
+    Update this function whenever new lookup rows are added to the DB.
+    """
+    return """\=== LOOKUP FIELD ALLOWED VALUES ===
+Output EXACTLY one of the listed strings — character-for-character, \
+including capitalisation, spaces, and punctuation. Output null if no value matches. \
+NEVER invent a new string.
+
+--- CONNECTIVITY ---
+connectivity.wifi_standard:
+  "Wi-Fi (802.11b/g)" | "Wi-Fi 4 (802.11n)" | "Wi-Fi 5 (802.11ac)"
+  "Wi-Fi 6 (802.11ax)" | "Wi-Fi 6E (802.11ax)" | "Wi-Fi 7 (802.11be)"
+
+connectivity.bluetooth_version (version number only):
+  "4.0" | "4.1" | "4.2" | "5.0" | "5.1" | "5.2" | "5.3" | "5.4" | "6.0"
+
+connectivity.usb_standard (verify from data transfer rate, not connector alone):
+  "USB-C 2.0" | "USB-C 3.2 Gen 1" | "USB-C 3.2 Gen 2"
+  "USB Type-C 2.0" | "USB Type-C 3.2 Gen 2" | "USB Type-C 4.0" | "Lightning"
+
+connectivity.wifi_technologies (array — protocols only, no frequency bands or hotspot):
+  "OFDMA" | "MU-MIMO" | "SU-MIMO" | "2x2 MIMO" | "4x4 MIMO" | "8x8 MIMO"
+  "Beamforming" | "TWT" | "WPA3" | "Wi-Fi Direct" | "1024-QAM" | "256-QAM"
+  "4096-QAM" | "MLO" | "ETH320"
+
+--- NETWORK ---
+network.sim_configuration:
+  "Single SIM (Nano-SIM)" | "Dual SIM (Nano-SIM, dual stand-by)"
+  "Dual SIM (Nano-SIM, single stand-by)" | "Nano-SIM + eSIM"
+  "Dual SIM + eSIM" | "Dual eSIM" | "Triple SIM" | "Hybrid SIM (Nano-SIM + microSD)"
+
+network.cellular_features (array):
+  "5G SA" | "5G NSA" | "5G Dual Connectivity (EN-DC) (LTE + NR Dual Connectivity)"
+  "Carrier Aggregation" | "4x4 MIMO (Cellular)" | "2x2 MIMO (Cellular)"
+  "Dual 5G Standby" | "5G Advanced Ready" | "Satellite Emergency Messaging"
+
+--- DISPLAY ---
+displays[*].panel_type:
+  "AMOLED" | "Super AMOLED" | "Dynamic AMOLED" | "Dynamic AMOLED 2X"
+  "LTPO Dynamic AMOLED" | "LTPO Super AMOLED" | "LTPO OLED" | "Fluid AMOLED"
+  "LTPO Fluid AMOLED" | "P-OLED" | "pOLED" | "IPS LCD" | "TFT LCD" | "PLS LCD"
+  "Super Actua OLED" | "Liquid Retina" | "Liquid Retina XDR"
+  "Super Retina XDR" | "LTPO Super Retina XDR" | "ProMotion Super Retina XDR OLED"
+  "MicroLED"
+
+displays[*].glass_protection (drop "Corning" prefix — "Corning Gorilla Glass 5" → "Gorilla Glass 5"):
+  "Gorilla Glass 3" | "Gorilla Glass 5" | "Gorilla Glass 6" | "Gorilla Glass 7"
+  "Gorilla Glass Victus" | "Gorilla Glass Victus 2" | "Gorilla Glass Armor"
+  "Corning Gorilla Armor 2" | "Corning Gorilla Glass Ceramic"
+  "Ceramic Shield" | "Ceramic Shield 2" | "Dragon Crystal Glass"
+  "Kunlun Glass" | "Armor Glass" | "Panda Glass" | "Tempered Glass" | "No Protection"
+
+displays[*].screen_shape:
+  "Flat" | "Curved" | "2.5D Curved" | "2.5 curved" | "Edge Display"
+  "Waterfall Display" | "Micro Quad-curved" | "Foldable" | "Rollable"
+
+--- VARIANTS ---
+variants[*].ram_type:
+  "LPDDR4" | "LPDDR4X" | "LPDDR5" | "LPDDR5X" | "LPDDR6" | "DDR4" | "DDR5" | "LPDDR3" | "Unknown"
+
+variants[*].storage_type:
+  "UFS 2.1" | "UFS 2.2" | "UFS 3.0" | "UFS 3.1" | "UFS 4.0" | "UFS 4.1"
+  "eMMC 5.1" | "eMMC 5.0" | "eMMC 4.5" | "NVMe" | "NVMe PCIe 3.0" | "NVMe PCIe 4.0" | "Unknown"
+
+--- CHARGING ---
+charging.battery_type:
+  "Li-Po" | "Li-Ion" | "Silicon-Carbon" | "Non-Removable Li-Polymer"
+  "Non-Removable Si/C Li-ion" | "Graphene"
+
+charging.cable_type:
+  "USB Type-C to Type-C" | "Type-C to Type-C" | "Type-A to Type-C"
+  "USB Type-A to Type-C" | "Type-A to Lightning" | "Type-C to Lightning"
+
+charging.proprietary_charging (brand's official marketing name; null for Apple, Google Pixel, Nothing):
+  "TurboPower" | "SUPERVOOC" | "SuperVOOC" | "SuperVOOC 2.0" | "Warp Charge"
+  "Dart Charge" | "Dash Charge" | "VOOC" | "SuperDart" | "FlashCharge"
+  "Super FlashCharge" | "HyperCharge" | "Mi Turbo Charge" | "Super Fast Charging"
+  "Super Fast Charging 2.0" | "Adaptive Fast Charging" | "Honor SuperCharge"
+  "Huawei SuperCharge" | "All-Round FastCharge" | "All-Round FastCharge 2.0"
+  "All-Round FastCharge 3.0"
+
+charging.wireless_charging_standard:
+  "Qi" | "Qi2" | "Qi2 / PMA" | "Qi2 / PMA / MagSafe" | "Qi2.2 / PMA" | "MagSafe"
+
+charging.charger_technologies (array — LLM may fill from training data when not stated in source):
+  "GaN" | "GaN + PD" | "Power Delivery (PD)" | "PD 3.0" | "PD 3.1" | "PD 3.2"
+  "PPS" | "Quick Charge 3.0" | "Quick Charge 4.0" | "Quick Charge 5.0"
+
+--- CAMERA ---
+camera_lenses[*].lens_type (array order rule applies — Main→Ultra-wide→Telephoto→Macro→Depth→Front):
+  "Main" | "Ultra-wide" | "Telephoto" | "Periscope" | "Macro" | "Depth" | "Front"
+
+camera_lenses[*].autofocus_type:
+  "PDAF" | "Quad PDAF" | "Dual Pixel PDAF" | "Multi-directional PDAF"
+  "Omni-directional PDAF" | "Super PDAF" | "All-Pixel Focus" | "Hybrid AF"
+  "Contrast AF" | "Laser AF" | "ToF 3D" | "Manual Focus" | "Fixed Focus"
+
+camera_lenses[*].stabilization (array):
+  "OIS" | "EIS" | "Gimbal OIS" | "Sensor-shift OIS" | "Action Mode"
+  "Super Steady" | "No Stabilization"
+
+--- OS & SECURITY ---
+os_and_security.os_name:
+  "Android 11" | "Android 12" | "Android 13" | "Android 14" | "Android 15"
+  "Android 16" | "iOS 16" | "iOS 17" | "iOS 18" | "iOS 26.0"
+  "HarmonyOS 4.0" | "HarmonyOS 4.2"
+
+os_and_security.ui_skin:
+  "My UX" | "Hello UI" | "Hello UX" | "One UI 6" | "One UI 6.1" | "One UI 7" | "One UI 8"
+  "OxygenOS 14" | "OxygenOS 15" | "OxygenOS 16"
+  "ColorOS 14" | "ColorOS 15" | "ColorOS 16"
+  "Funtouch OS 14" | "Funtouch OS 15" | "Funtouch OS 15 / Origin OS 6" | "OriginOS 5" | "OriginOS 6"
+  "HyperOS" | "HyperOS 2" | "HyperOS 3" | "MIUI 14"
+  "Realme UI 5" | "Realme UI 6" | "Realme UI 7"
+  "Nothing OS 2" | "Nothing OS 3"
+  "Pixel UI" | "Pixel UI (Material 3 Expressive)" | "Stock Android"
+  "iOS" | "iOS 26.0 Liquid Glass UI"
+
+os_and_security.biometrics (array):
+  "Side-mounted Fingerprint" | "In-display Fingerprint (Optical)"
+  "In-display Fingerprint (Ultrasonic)" | "Rear-mounted Fingerprint"
+  "Fingerprint (Side-mounted)" | "Fingerprint (Under-display Ultrasonic)"
+  "Face Unlock" | "Face Unlock (2D)" | "Face ID" | "Face ID (3D TrueDepth)"
+  "3D Face Recognition" | "Iris Scanner" | "Voice Recognition"
+
+--- CERTIFICATIONS ---
+certifications.widevine_level — see rule 5s (default L1 for phones >= 2018, no source needed):
+  "L1" | "L2" | "L3"
+
+certifications.ip_ratings (array):
+  "IP67" | "IP68" | "IP68K" | "IP69" | "IP69K" | "IP54" | "IP53" | "IP64" | "IPX8" | "IP48" | "IP4X"
+
+certifications.video_certifications (array):
+  "Dolby Vision" | "Dolby Vision Certified" | "HDR10+ Certified"
+  "Netflix HD" | "Netflix HDR" | "YouTube HDR" | "Amazon Prime Video HD"
+  "DisplayHDR 400" | "DisplayHDR 600" | "DisplayHDR 1000"
+  "TÜV Rheinland Eye Comfort" | "TÜV Rheinland Flicker Free"
+  "TÜV Rheinland Low Blue Light" | "TÜV Rheinland Circadian Friendly" | "SGS Eye Care Display"
+
+certifications.audio_certifications (array):
+  "Dolby Atmos" | "Dolby Atmos Certified" | "Dolby Digital Plus"
+  "Hi-Res Audio Certified" | "Hi-Res Audio Wireless"
+  "DTS:X Certified" | "THX Certified" | "JBL Tuned"
+  "Qualcomm Snapdragon Sound" | "Spatial Audio Support" | "Spatial Sound" | "360 Reality Audio"
+
+--- LOCATION SERVICES ---
+connectivity.location_services (array — always check OEM India page explicitly for NavIC):
+  "GPS" | "A-GPS" | "GLONASS" | "Galileo" | "BDS" | "NavIC" | "QZSS"
+  "Dual-frequency GPS" | "WiFi Positioning" | "Cellular Positioning" | "iBeacon Micro-location"
+
+--- USB FEATURES ---
+connectivity.usb_features (array):
+  "OTG" | "DisplayPort" | "USB Power Delivery" | "Desktop Mode"
+  "Reverse Charging" | "USB Tethering" | "Audio Adapter Accessory Mode"
+"""
+
+
 
 def invalidate_ecd_cache() -> None:
     """
@@ -383,6 +506,7 @@ def build_ecd(
         _build_disambiguation_block(),
         _build_critical_rules_block(),
         _build_spec_template_block(),
+        _build_lookup_values_block(),    # L7.3 Fix 2: inject canonical lookup values
     ]
 
     # A6 — Inject transcript context block only when a transcript is present

@@ -18,9 +18,12 @@ Both functions are async because URL-based screenshots require an async HTTP fet
 
 import base64
 import io
+import logging
 
 import httpx
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -167,15 +170,26 @@ async def extract_screenshots(response: dict, template_name: str) -> dict:
 
     # --- motorola: 3 screenshots — skip first, use second (before) and third (after) ---
     elif template_name == "motorola_config_template":
-        before = _wrap(await assemble_screenshot(screenshots[1]))
-        after  = _wrap(await assemble_screenshot(screenshots[2]))
+        # motorola expects 3 screenshots — guard against Firecrawl returning fewer
+        if len(screenshots) < 3:
+            logger.warning(
+                "extract_screenshots: motorola_config_template expected 3 screenshots, "
+                "got %d. Falling back to first available.",
+                len(screenshots),
+            )
+            before = _wrap(await assemble_screenshot(screenshots[0])) if screenshots else None
+            after  = _wrap(await assemble_screenshot(screenshots[1])) if len(screenshots) > 1 else None
+        else:
+            before = _wrap(await assemble_screenshot(screenshots[1]))
+            after  = _wrap(await assemble_screenshot(screenshots[2]))
 
     # --- All 2-screenshot templates (gsmarena, pixel_newer, pixel_older, nothing,
     #     samsung_direct_scrape, samsung_one-click, samsung_specs-expand_*,
     #     smartprix, google_pixel_newer/older, etc.) ---
     else:
-        before = _wrap(await assemble_screenshot(screenshots[0]))
-        after  = _wrap(await assemble_screenshot(screenshots[1]))
+        # Default 2-screenshot templates — guard against Firecrawl returning only 1
+        before = _wrap(await assemble_screenshot(screenshots[0])) if screenshots else None
+        after  = _wrap(await assemble_screenshot(screenshots[1])) if len(screenshots) > 1 else None
 
     return {"before": before, "after": after}
 

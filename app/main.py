@@ -3,7 +3,9 @@ Raw Data Pipeline — FastAPI Application Entry Point
 
 Startup:
   - Validates all required environment variables (see app/core/config.py)
-  - Mounts the admin router
+  - Pre-warms ECD YAML cache
+  - Populates normaliser lookup cache
+  - Mounts all routers
 
 Run with:
   uvicorn app.main:app --reload
@@ -29,27 +31,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs once on server startup before accepting requests."""
-    validate_config()
-    pre_warm_ecd()          # Task 0.4 — load and validate ECD YAML files immediately
-    await build_lookup_cache()  # Task 4.1 — populate LOOKUP_CACHE for normaliser
-
-    # MIN-3: Verify lx.io.create_html_from_jsonl exists in the installed LangExtract version.
-    # If the API changed (e.g. to lx.visualize), this fails at startup rather than first use.
-    try:
-        import langextract as lx
-        if not callable(getattr(lx.io, "create_html_from_jsonl", None)):
-            raise AttributeError(
-                "lx.io.create_html_from_jsonl is not callable in the installed LangExtract "
-                "version. Check the installed version and update the visualization endpoint "
-                "in app/api/approval.py accordingly."
-            )
-        logger.info("Startup: lx.io.create_html_from_jsonl verified OK.")
-    except AttributeError as exc:
-        raise RuntimeError(f"LangExtract API mismatch: {exc}") from exc
-
-    logger.info("Raw pipeline backend started.")
+    validate_config()                 # includes v2 coverage check
+    pre_warm_ecd()                    # Task 0.4 — load and validate ECD YAML files
+    await build_lookup_cache()        # Task 4.1 — populate LOOKUP_CACHE for normaliser
+    logger.info("Extraction pipeline backend (v5) started.")
     yield
-    logger.info("Raw pipeline backend shut down.")
+    logger.info("Extraction pipeline backend shut down.")
 
 
 app = FastAPI(
@@ -58,6 +45,14 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# FIX-11: Attach rate limiter — extraction endpoints use @limiter.limit() decorators
+from app.api.extraction import limiter  # noqa: E402
+from slowapi import _rate_limit_exceeded_handler  # noqa: E402
+from slowapi.errors import RateLimitExceeded  # noqa: E402
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.include_router(admin_lookup.router)
 app.include_router(scraper.router)

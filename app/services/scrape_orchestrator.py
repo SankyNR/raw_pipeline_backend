@@ -16,13 +16,17 @@ Failure handling invariants:
 """
 
 import logging
+import re
 from datetime import datetime
 
 from fastapi import HTTPException
 
 from app.repositories.config_repository import get_config_template, get_lookup_source
 from app.repositories.execution_repository import create_execution, finish_execution
-from app.repositories.raw_data_repository import insert_raw_scraped_data
+from app.repositories.raw_data_repository import (
+    insert_raw_scraped_data,
+    delete_raw_scraped_data_by_execution,   # add this
+)
 from app.repositories.url_registry_repository import (
     claim_for_scraping,
     get_url_registry_row,
@@ -103,8 +107,29 @@ async def run_scrape(brand: str, model_name: str, site_name: str) -> dict:
 
         # 9. Success block — track uploads for cleanup on partial failure
         uploaded_paths = []
+        raw_scraped_data_inserted = False   # Track if DB row was created — for orphan cleanup
         try:
             markdown_content = response["data"]["markdown"]
+            # Strip invalid JSON escape sequences (e.g. \| \™) introduced by Firecrawl's
+            # markdown renderer. These cause json.loads() to fail if Gemini copies them
+            # verbatim into evidence_text fields in the extraction output.
+            # 1. Strip invalid JSON escape sequences (e.g. \| \™) from Firecrawl markdown.
+            #    Gemini copies evidence_text verbatim — invalid escapes crash json.loads().
+            markdown_content = re.sub(r'\\([^"\\/bfnrtu\n\r])', r'\1', markdown_content)
+            # 2. Strip markdown hyperlinks, preserving only the visible label.
+            #    Firecrawl wraps many spec values and headers in links e.g.:
+            #    [Technology](https://www.gsmarena.com/network-bands.php3) → Technology
+            #    [eSIM](https://www.gsmarena.com/glossary.php3?term=esim) → eSIM
+            #    These URLs waste tokens, pollute evidence_text, and increase hallucination risk.
+            #    Table structure, bullets, and separators are NOT affected by this regex.
+            markdown_content = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', markdown_content)
+            # 3. Remove ALL blank lines entirely (including whitespace-only lines).
+            #    Firecrawl produces excessive vertical whitespace between sections.
+            #    Removes both single and multiple consecutive blank lines.
+            #    Before: "Line A\n\nLine B\n\n\n\nLine C"
+            #    After:  "Line A\nLine B\nLine C"
+            markdown_content = re.sub(r'\n\s*\n+', '\n', markdown_content)
+            
             markdown_bytes   = markdown_content.encode("utf-8")  # explicit UTF-8
             screenshots      = await extract_screenshots(response, template["template_name"])
             paths            = build_storage_paths(brand, model_name, site_name)
@@ -146,6 +171,7 @@ async def run_scrape(brand: str, model_name: str, site_name: str) -> dict:
                 screenshot_after_path=after_path,
                 file_size_bytes=len(markdown_bytes),
             )
+            raw_scraped_data_inserted = True    # Row exists in DB from this point on
 
             await finish_execution(execution_id, True, started_at, finished_at)
             await set_status_scraped_raw(url_id)
@@ -162,6 +188,18 @@ async def run_scrape(brand: str, model_name: str, site_name: str) -> dict:
             # shadow the original error.
             for path in uploaded_paths:
                 await delete_file(path)
+
+            # Orphan row cleanup: if the DB insert succeeded before this exception,
+            # delete the row to prevent extraction from loading a row with deleted storage paths.
+            if raw_scraped_data_inserted:
+                try:
+                    await delete_raw_scraped_data_by_execution(execution_id)
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "run_scrape: failed to clean orphan raw_scraped_data row "
+                        "for execution_id=%s: %s",
+                        execution_id, cleanup_exc,
+                    )
             raise  # re-raise so the outer except handles logging and status reset
 
     except HTTPException:

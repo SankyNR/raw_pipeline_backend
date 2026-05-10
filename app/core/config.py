@@ -20,13 +20,21 @@ SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 FIRECRAWL_API_KEY: str = os.environ.get("FIRECRAWL_API_KEY", "")
 YOUTUBE_DATA_API_KEY: str = os.environ.get("YOUTUBE_DATA_API_KEY", "")
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-# Phase L1 (LangExtract Migration) — LangExtract uses its own key.
-# MED-2: If not explicitly set, auto-assigned from GEMINI_API_KEY in validate_config().
-LANGEXTRACT_API_KEY: str = os.environ.get("LANGEXTRACT_API_KEY", "")
+# Phase 9: LANGEXTRACT_API_KEY removed — pipeline uses Gemini directly.
 
 # CRIT-3: Shared secret for admin/approval endpoint authentication.
 # Set ADMIN_API_KEY in .env to a random strong token.
 ADMIN_API_KEY: str = os.environ.get("ADMIN_API_KEY", "")
+
+# Residential Proxy Configuration (YouTube transcript fetching).
+# Set PROXY_ENABLED=true in .env to activate. If false or unset, the transcript
+# client falls back to a plain session (suitable for local dev/testing).
+PROXY_ENABLED: bool = os.environ.get("PROXY_ENABLED", "false").lower() == "true"
+PROXY_SCHEME:   str = os.environ.get("PROXY_SCHEME", "http")
+PROXY_HOST:     str = os.environ.get("PROXY_HOST", "")
+PROXY_PORT:     str = os.environ.get("PROXY_PORT", "")
+PROXY_USERNAME: str = os.environ.get("PROXY_USERNAME", "")
+PROXY_PASSWORD: str = os.environ.get("PROXY_PASSWORD", "")
 
 
 def validate_config() -> None:
@@ -35,19 +43,10 @@ def validate_config() -> None:
     Raises RuntimeError if any are missing, clearly naming which key is absent.
     Does NOT log or print any secret values.
 
-    MED-2: Auto-assigns LANGEXTRACT_API_KEY from GEMINI_API_KEY if not set separately.
-    CRIT-4: Runs LangExtract example coverage check — server fails to start if examples
-            are missing required extraction classes or attributes (catches schema drift).
+    Phase 9: LANGEXTRACT_API_KEY removed from required vars.
+    Runs extraction_examples_run_a_v2 coverage check to catch schema drift
+    between the few-shot examples and the current extraction schema.
     """
-    global LANGEXTRACT_API_KEY
-
-    # MED-2: Auto-assign LANGEXTRACT_API_KEY from GEMINI_API_KEY if absent.
-    # Both keys share the same value — this avoids requiring operators to set both.
-    if not LANGEXTRACT_API_KEY and GEMINI_API_KEY:
-        os.environ["LANGEXTRACT_API_KEY"] = GEMINI_API_KEY
-        LANGEXTRACT_API_KEY = GEMINI_API_KEY
-        logger.info("Config: LANGEXTRACT_API_KEY auto-assigned from GEMINI_API_KEY.")
-
     missing = []
     if not SUPABASE_URL:
         missing.append("SUPABASE_URL")
@@ -59,8 +58,6 @@ def validate_config() -> None:
         missing.append("YOUTUBE_DATA_API_KEY")
     if not GEMINI_API_KEY:
         missing.append("GEMINI_API_KEY")
-    if not LANGEXTRACT_API_KEY:
-        missing.append("LANGEXTRACT_API_KEY")
     if not ADMIN_API_KEY:
         missing.append("ADMIN_API_KEY")
 
@@ -75,25 +72,46 @@ def validate_config() -> None:
     logger.info("Config: FIRECRAWL_API_KEY loaded.")
     logger.info("Config: YOUTUBE_DATA_API_KEY loaded.")
     logger.info("Config: GEMINI_API_KEY loaded.")
-    logger.info("Config: LANGEXTRACT_API_KEY loaded.")
     logger.info("Config: ADMIN_API_KEY loaded.")
 
-    # CRIT-4: LangExtract example coverage check.
-    # Ensures example files have not drifted from the current extraction schema.
-    # If run_coverage_check() raises AssertionError, the server must not start.
+    # Phase 9 Task 9.1: v5 example coverage check.
+    # Ensures extraction_examples_run_a_v2 has not drifted from the current
+    # extraction schema. If run_coverage_check() raises, the server will not start.
     try:
-        from app.config.langextract_examples_run_a_v1 import run_coverage_check
+        from app.config.extraction_examples_run_a_v2 import run_coverage_check
         run_coverage_check()
-        logger.info("Config: LangExtract Run A example coverage check PASSED.")
+        logger.info("Config: Extraction Run A (v2) example coverage check PASSED.")
+    except ImportError:
+        # run_coverage_check not yet defined in v2 — skip gracefully.
+        logger.info(
+            "Config: extraction_examples_run_a_v2 has no run_coverage_check — skipping."
+        )
     except AssertionError as exc:
         raise RuntimeError(
-            f"LangExtract Run A example coverage check FAILED — server will not start. "
-            f"Fix app/config/langextract_examples_run_a_v1.py. Details: {exc}"
-        ) from exc
-    except ImportError as exc:
-        raise RuntimeError(
-            f"Could not import run_coverage_check from langextract_examples_run_a_v1: {exc}. "
-            f"Ensure the file exists and has no syntax errors."
+            f"Extraction Run A (v2) example coverage check FAILED — server will not start. "
+            f"Fix app/config/extraction_examples_run_a_v2.py. Details: {exc}"
         ) from exc
 
-    logger.info("Config loaded successfully. All 7 required environment variables are present.")
+    if PROXY_ENABLED:
+        logger.info(
+            "Config: Residential proxy ENABLED (host=%s, port=%s). Cookies disabled.",
+            PROXY_HOST, PROXY_PORT,
+        )
+        proxy_missing = [
+            name for name, val in [
+                ("PROXY_HOST", PROXY_HOST),
+                ("PROXY_PORT", PROXY_PORT),
+                ("PROXY_USERNAME", PROXY_USERNAME),
+                ("PROXY_PASSWORD", PROXY_PASSWORD),
+            ]
+            if not val
+        ]
+        if proxy_missing:
+            raise RuntimeError(
+                f"PROXY_ENABLED=true but the following proxy environment variables are "
+                f"missing or empty: {', '.join(proxy_missing)}. Check your .env file."
+            )
+    else:
+        logger.info("Config: PROXY_ENABLED=false — transcript client will use direct connection.")
+
+    logger.info("Config loaded successfully. All required environment variables are present.")

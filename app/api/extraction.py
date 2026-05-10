@@ -5,15 +5,15 @@ Phase 1 — Pre-Extraction Validation:
     POST /extraction/validate
     GET  /extraction/validation-status/{canonical_url_id}
 
-Phase 2 — Run A: Spec Extraction:
-    POST /extraction/run-a
-
-Phase 3 — Run A + Run B: Parallel Trigger:
-    POST /extraction/run-all
+Phase 2 — Extraction:
+    POST /extraction/run-a    — Spec extraction. Manual or auto mode.
+    POST /extraction/run-b    — Experience extraction. Manual or auto mode.
+    POST /extraction/run-all  — Both pipelines in parallel. Manual or auto mode.
 
 Phase 4 — Normalisation:
     POST /extraction/normalise
     POST /extraction/cache/refresh
+    schema_version
 
 Phase 5 — Gap Analysis:
     POST /extraction/gaps
@@ -31,18 +31,22 @@ Phase 7.5 — Pre-UI Validation:
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
+from app.core.constants import GATE_ERROR_PREFIX as _GATE_ERROR_PREFIX
 from app.services.validation_service import (
     run_pre_extraction_validation,
     get_validation_status,
     run_pre_ui_validation,
     get_pre_ui_validation_status,
 )
-from app.services.langextract_run_a import run_spec_extraction_lx
-from app.services.langextract_run_b import run_experience_extraction_batch
+from app.services.extraction_run_a import run_spec_extraction
+from app.services.extraction_run_b import run_experience_extraction_batch
 from app.services.normalizer import run_normalisation
 from app.services.gap_analyzer import detect_missing_fields
 from app.services.enrichment_orchestrator import run_enrichment
@@ -50,10 +54,19 @@ from app.services.conflict_resolver import (
     detect_and_resolve_conflicts,
     build_final_merged_json,
 )
+from app.repositories.pipeline_run_repository import (
+    create_pipeline_run,
+    fetch_pipeline_run,
+    fetch_recent_pipeline_runs,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/extraction", tags=["extraction"])
+
+# FIX-11: Rate limiter — key by remote IP.
+# Instantiated here so main.py can attach it to app.state.limiter.
+limiter = Limiter(key_func=get_remote_address)
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +74,15 @@ router = APIRouter(prefix="/extraction", tags=["extraction"])
 # ---------------------------------------------------------------------------
 
 class ValidateRequest(BaseModel):
-    canonical_url_id: int
+    """
+    Request model for POST /extraction/validate.
+
+    Accepts brand + model_name instead of canonical_url_id.
+    The backend resolves canonical_url_id internally via the GSMArena anchor.
+    Both fields are stripped of whitespace before use.
+    """
+    brand:      str
+    model_name: str
 
 
 class ValidationStatusResponse(BaseModel):
@@ -89,7 +110,10 @@ class ValidationStatusResponse(BaseModel):
 @router.post("/validate", response_model=ValidationStatusResponse)
 async def validate_phone(body: ValidateRequest):
     """
-    Runs pre-extraction validation for the given canonical_url_id.
+    Runs pre-extraction validation for the phone identified by brand + model_name.
+
+    Resolves canonical_url_id (GSMArena anchor) internally, then runs the full
+    validation check and writes a new pre_extraction_validation row.
 
     Checks:
     - All registered URLs have been attempted (no unattempted scrapes)
@@ -109,23 +133,45 @@ async def validate_phone(body: ValidateRequest):
     authoritative. Check can_proceed before triggering Run A.
 
     Raises:
-        HTTP 404: If canonical_url_id does not exist in url_registry.
+        HTTP 400: If brand or model_name is empty.
+        HTTP 404: If phone not found in url_registry (no GSMArena row).
         HTTP 500: On unexpected DB or service error.
     """
+    from app.repositories.extraction_repository import fetch_canonical_id_by_brand_model
+
+    brand, model_name = _normalize_brand_model(body.brand, body.model_name)
+
+    # Resolve canonical_url_id from brand + model_name
+    try:
+        canonical_url_id = await asyncio.to_thread(
+            fetch_canonical_id_by_brand_model, brand, model_name
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "PHONE_NOT_FOUND", "message": str(exc)},
+        )
+
     try:
         record = await run_pre_extraction_validation(
-            canonical_url_id=body.canonical_url_id,
+            canonical_url_id=canonical_url_id,
             validated_by="admin_manual",
         )
         return record
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "PHONE_NOT_FOUND", "message": str(exc)},
+        )
     except Exception as exc:
         logger.exception(
-            "validate_phone: unexpected error for canonical_url_id=%d",
-            body.canonical_url_id,
+            "validate_phone: unexpected error for brand=%r model_name=%r",
+            brand, model_name,
         )
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "INTERNAL_ERROR", "message": str(exc)},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -168,123 +214,73 @@ async def get_phone_validation_status(canonical_url_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Task 2.3 — POST /extraction/run-a
+# FIX-10: Unified extraction request / response models
 # ---------------------------------------------------------------------------
 
-class RunARequest(BaseModel):
-    canonical_url_id: int
-    raw_source_ids: list[int]
-    raw_transcript_id: int | None = None
-    brand: str
+class ExtractionRequest(BaseModel):
+    """
+    Unified request model for all three extraction endpoints.
+
+    MODES — controlled by auto_resolve flag:
+
+    AUTO mode (auto_resolve=True):
+        Required:  brand, model_name
+        Forbidden: raw_source_ids, raw_transcript_ids
+        Behaviour: Backend resolves canonical_url_id and ALL available source IDs
+                   automatically from the DB.
+
+    MANUAL mode (auto_resolve=False):
+        Required:  brand, model_name, raw_source_ids (for run-a and run-all),
+                   raw_transcript_ids (for run-b)
+        Behaviour: Backend resolves canonical_url_id from brand+model_name, then
+                   validates that all provided IDs belong to that phone.
+
+    NOTE: canonical_url_id is NEVER accepted from the caller. It is always resolved
+    internally. This removes ambiguity and prevents callers from referencing the
+    wrong anchor row.
+
+    STRICT RULES (enforced in _validate_extraction_request helper):
+        - auto_resolve=True  + raw_source_ids or raw_transcript_ids present → HTTP 400
+        - auto_resolve=False + raw_source_ids empty (run-a, run-all)        → HTTP 400
+        - auto_resolve=False + raw_transcript_ids empty (run-b)             → HTTP 400
+        - brand or model_name missing or empty string                       → HTTP 400
+        - brand/model_name pair not found in DB (no GSMArena row)           → HTTP 404
+    """
+    model_config = {"protected_namespaces": ()}
+
+    # Mode toggle — required, no default to force explicit caller decision
+    auto_resolve: bool
+
+    # Both modes — always required
+    brand:      str
     model_name: str
-    schema_version: str = "v1"
+
+    # Manual mode only — must be empty/absent in auto mode
+    raw_source_ids:    list[int] = []
+    raw_transcript_ids: list[int] = []
+
+    # Shared
+    schema_version: str = "v2"
 
 
 class RunAResponse(BaseModel):
     success: bool
     output_id: int | None
     run_id: int | None = None    # B6: None for failure path — -1 is not a valid DB ID
+    pipeline_run_id: str | None = None  # Global tracking UUID (pipeline.pipeline_runs)
     message: str
     failed_source_ids: list[int] = []
 
 
-# Prefix used by run_spec_extraction gate check (A2) so the API can distinguish
-# "validation not passed" (422) from "url_id not found" (404).
-_GATE_ERROR_PREFIX = "Pre-extraction validation not passed"
-
-
-@router.post("/run-a", response_model=RunAResponse)
-async def trigger_run_a(body: RunARequest):
-    """
-    Triggers Run A (spec extraction) for the given phone.
-
-    Run A flow:
-    1. Gate check — verifies Phase 1 validation passed (can_proceed=true).
-       This is enforced in run_spec_extraction, not delegated to the UI.
-    2. Fetches all source files from Supabase Storage (scraped markdown).
-    3. Optionally fetches the processed/translated transcript.
-    4. Concatenates sources in priority order: OEM → GSMArena → Smartprix → transcript.
-    5. Calls Gemini with the ECD + spec template to extract structured specs.
-    6. Stores partial_json + evidence_json in spec_extraction_output.
-    7. Records the extraction run in spec_extraction_runs.
-
-    Prerequisite: POST /extraction/validate must have returned can_proceed=TRUE
-    for this canonical_url_id. The validation gate IS enforced server-side in
-    run_spec_extraction — calling this endpoint without a passing validation
-    record will return HTTP 422.
-
-    Args:
-        canonical_url_id:  The url_registry.url_id anchor for this phone.
-        raw_source_ids:    List of raw_scraped_data.raw_id values to include.
-        raw_transcript_id: youtube_raw_transcript_data.raw_transcript_id, or null.
-        brand:             Brand name (for logging and legacy fallback).
-        model_name:        Model name (keyword-matched for foldable/flippable detection).
-        schema_version:    Extraction schema version. Default 'v1'.
-
-    Returns:
-        Run result including output_id, run_id, field counts, failed_source_ids.
-
-    Raises:
-        HTTP 400: If raw_source_ids is empty and no transcript provided.
-        HTTP 404: If canonical_url_id does not exist in url_registry.
-        HTTP 422: If Phase 1 validation has not been run or can_proceed=false.
-        HTTP 500: On Gemini error, storage fetch error, or DB error.
-    """
-    if not body.raw_source_ids and body.raw_transcript_id is None:
-        raise HTTPException(
-            status_code=400,
-            detail="raw_source_ids cannot be empty when raw_transcript_id is null. "
-                   "Provide at least one source file to extract from.",
-        )
-
-    try:
-        result = await run_spec_extraction_lx(
-            url_registry_id=body.canonical_url_id,
-            raw_source_ids=body.raw_source_ids,
-            raw_transcript_id=body.raw_transcript_id,
-            brand=body.brand,
-            model_name=body.model_name,
-            schema_version=body.schema_version,
-        )
-        return result
-
-    except ValueError as exc:
-        # Gate check failure (A2) → 422 Unprocessable Entity
-        # Missing url_registry_id → 404 Not Found
-        if str(exc).startswith(_GATE_ERROR_PREFIX):
-            raise HTTPException(status_code=422, detail=str(exc))
-        raise HTTPException(status_code=404, detail=str(exc))
-    except Exception as exc:
-        logger.exception(
-            "trigger_run_a: unexpected error for canonical_url_id=%d",
-            body.canonical_url_id,
-        )
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Task 3.3 — POST /extraction/run-all  (parallel Run A + Run B)
-# ▶ CHANGED L6: accepts raw_transcript_ids: list[int] (plural) for multi-transcript
-#   Run B. Keeps raw_transcript_id: int as deprecated alias that wraps to a list.
-# ---------------------------------------------------------------------------
-
-class RunAllRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    canonical_url_id: int
-    raw_source_ids: list[int]
-    raw_transcript_ids: list[int] = []   # NEW — primary (plural) field
-    raw_transcript_id: int | None = None # DEPRECATED alias — wraps to [raw_transcript_id]
-    brand: str
-    model_name: str
-    schema_version: str = "v1"
-
-
 class RunBResult(BaseModel):
     success: bool
-    exp_run_id: int | None = None
-    experiences_extracted: int = 0
-    experiences_filtered: int = 0
-    transcripts_processed: int = 0
+    aggregation_run_id: int | None = None       # Stage 2 run ID (two-stage system)
+    exp_run_id: int | None = None               # Legacy field — kept for compat, now unused
+    pipeline_run_id: str | None = None
+    experiences_extracted: int = 0              # Final Stage 2 output count
+    new_transcripts: int = 0                    # Transcripts that ran Stage 1 fresh
+    reused_transcripts: int = 0                 # Transcripts whose candidates were reused
+    transcripts_processed: int = 0              # new_transcripts + reused_transcripts
     transcripts_failed: int = 0
     message: str
     error: str | None = None
@@ -296,53 +292,612 @@ class RunAllResponse(BaseModel):
     both_succeeded: bool
 
 
-@router.post("/run-all", response_model=RunAllResponse)
-async def trigger_run_all(body: RunAllRequest):
+def _normalize_brand_model(brand: str, model_name: str) -> tuple[str, str]:
     """
-    Triggers Run A (LangExtract spec extraction) and Run B (LangExtract experience
-    extraction) in parallel via asyncio.gather.
+    Strips leading/trailing whitespace from brand and model_name.
 
-    Run A and Run B are independent — failure of one does NOT block the other.
-    Both results are returned independently.
+    Does NOT change case. The DB stores brand/model_name in their canonical
+    casing (e.g. "Samsung", "Galaxy S25 Ultra"). The admin UI populates dropdowns
+    directly from the DB so casing will always match in normal use. Stripping
+    whitespace guards against copy-paste or direct API calls with accidental spaces.
 
-    Run B accepts:
-      raw_transcript_ids: list[int]  — NEW primary field (multi-transcript)
-      raw_transcript_id:  int        — DEPRECATED alias (single transcript, still accepted)
-      If both present, raw_transcript_ids is used. The deprecated alias is ignored.
+    Called at the top of every handler before any DB interaction.
+    """
+    return brand.strip(), model_name.strip()
 
-    Both runs enforce the Phase 1 validation gate (can_proceed=true).
-    Returns HTTP 422 if gate has not been passed.
+
+def _validate_extraction_request(
+    body: ExtractionRequest,
+    requires_sources: bool = True,
+    requires_transcripts: bool = False,
+) -> None:
+    """
+    Validates ExtractionRequest for mode consistency. Raises HTTPException on failure.
+
+    brand and model_name are always required — enforced here explicitly so the
+    error message is clear even though Pydantic would also reject empty strings.
+
+    Args:
+        requires_sources:     True for run-a and run-all (scraped markdown needed).
+        requires_transcripts: True for run-b only (transcript data needed).
+    """
+    # ── Both modes: brand + model_name must be non-empty strings ────────────
+    if not body.brand or not body.brand.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error":   "INVALID_REQUEST",
+                "message": "'brand' is required and must be a non-empty string.",
+            },
+        )
+    if not body.model_name or not body.model_name.strip():
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error":   "INVALID_REQUEST",
+                "message": "'model_name' is required and must be a non-empty string.",
+            },
+        )
+
+    if body.auto_resolve:
+        # ── AUTO MODE: raw ID lists must be absent ───────────────────────────
+        if body.raw_source_ids or body.raw_transcript_ids:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error":   "INVALID_REQUEST",
+                    "message": (
+                        "auto_resolve=true is mutually exclusive with raw_source_ids "
+                        "and raw_transcript_ids. Remove those fields or set "
+                        "auto_resolve=false to provide IDs manually."
+                    ),
+                },
+            )
+    else:
+        # ── MANUAL MODE: required ID lists must be provided ─────────────────
+        if requires_sources and not body.raw_source_ids:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error":   "INVALID_REQUEST",
+                    "message": (
+                        "Manual mode requires 'raw_source_ids' for this endpoint. "
+                        "Provide at least one raw_scraped_data.raw_id."
+                    ),
+                },
+            )
+        if requires_transcripts and not body.raw_transcript_ids:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error":   "INVALID_REQUEST",
+                    "message": (
+                        "Manual mode requires 'raw_transcript_ids' for /run-b. "
+                        "Provide at least one youtube_raw_transcript_data.raw_transcript_id."
+                    ),
+                },
+            )
+
+
+# ---------------------------------------------------------------------------
+# FIX-12 — POST /extraction/run-a  (unified manual + auto)
+# ---------------------------------------------------------------------------
+
+@router.post("/run-a", response_model=RunAResponse)
+@limiter.limit("10/minute")
+async def trigger_run_a(request: Request, body: ExtractionRequest):
+    """
+    POST /extraction/run-a — Spec extraction (Run A) for one phone.
+
+    MODES:
+      Auto   (auto_resolve=true):  Requires brand + model_name only.
+                                   Backend resolves ALL source IDs from DB.
+                                   Uses top3_transcript_ids (top 3 by channel_reliability_score DESC, file_size_bytes DESC).
+      Manual (auto_resolve=false): Requires brand + model_name + raw_source_ids.
+                                   Optional: raw_transcript_ids (first is used for Run A).
+                                   Backend validates all IDs belong to this phone.
+
+    Both modes:
+      - Resolve canonical_url_id from brand + model_name (GSMArena anchor).
+      - Run pre-extraction validation automatically (fresh check, writes new record).
+      - Enforce the Phase 1 validation gate (can_proceed=true).
 
     Raises:
-        HTTP 422: If Phase 1 validation gate has not been passed.
-        HTTP 500: On unexpected orchestration error.
+        HTTP 400: Mode validation failure or cross-phone IDs detected.
+        HTTP 404: Phone not found in DB.
+        HTTP 422: Pre-extraction validation failed (blocking reasons returned).
+        HTTP 429: Rate limit exceeded (10/minute).
+        HTTP 500: Extraction or storage error.
     """
-    # Resolve transcript ID list — new plural field takes precedence over deprecated alias
-    transcript_ids: list[int]
-    if body.raw_transcript_ids:
-        transcript_ids = body.raw_transcript_ids
-    elif body.raw_transcript_id is not None:
-        transcript_ids = [body.raw_transcript_id]   # backward compat wrap
-    else:
-        transcript_ids = []
-
-    # Fire Run A (LX) + Run B batch in parallel
-    run_a_coro = run_spec_extraction_lx(
-        url_registry_id=body.canonical_url_id,
-        raw_source_ids=body.raw_source_ids,
-        raw_transcript_id=transcript_ids[0] if transcript_ids else None,
-        brand=body.brand,
-        model_name=body.model_name,
-        schema_version=body.schema_version,
+    from app.repositories.extraction_repository import (
+        fetch_canonical_id_by_brand_model,
+        fetch_sources_for_run_phone,
+        validate_source_ids_belong_to_phone,
     )
 
-    if transcript_ids:
-        run_b_coro = run_experience_extraction_batch(
-            url_registry_id=body.canonical_url_id,
-            raw_transcript_ids=transcript_ids,
-            brand=body.brand,
-            model_name=body.model_name,
+    _validate_extraction_request(body, requires_sources=True, requires_transcripts=False)
+
+    brand, model_name = _normalize_brand_model(body.brand, body.model_name)
+
+    # ── Step 1: Resolve canonical_url_id (both modes) ───────────────────────
+    try:
+        canonical_url_id = await asyncio.to_thread(
+            fetch_canonical_id_by_brand_model, brand, model_name
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "PHONE_NOT_FOUND", "message": str(exc)},
+        )
+
+    # ── Step 2: Resolve / validate source IDs (mode-specific) ───────────────
+    if body.auto_resolve:
+        try:
+            resolved = await asyncio.to_thread(fetch_sources_for_run_phone, canonical_url_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "PHONE_NOT_FOUND", "message": str(exc)},
+            )
+
+        raw_source_ids      = resolved["raw_source_ids"]
+        top3_transcript_ids = resolved["top3_transcript_ids"]
+
+
+        logger.info(
+            "trigger_run_a [auto]: url_id=%d brand=%r model=%r sources=%s top3_transcripts=%s",
+            canonical_url_id, brand, model_name, raw_source_ids, top3_transcript_ids,
+        )
+    else:
+        # Manual mode: validate that all provided IDs belong to this phone
+        raw_source_ids      = body.raw_source_ids
+        top3_transcript_ids = body.raw_transcript_ids
+
+        ownership = await asyncio.to_thread(
+            validate_source_ids_belong_to_phone,
+            canonical_url_id,
+            raw_source_ids,
+            body.raw_transcript_ids,
+        )
+        if not ownership["valid"]:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error":   "FOREIGN_IDS_DETECTED",
+                    "message": (
+                        "One or more provided IDs do not belong to the resolved phone. "
+                        "This request has been blocked to prevent data contamination."
+                    ),
+                    "foreign_source_ids":     ownership["foreign_source_ids"],
+                    "foreign_transcript_ids": ownership["foreign_transcript_ids"],
+                },
+            )
+
+        logger.info(
+            "trigger_run_a [manual]: url_id=%d brand=%r model=%r sources=%s transcripts=%s",
+            canonical_url_id, brand, model_name, raw_source_ids, top3_transcript_ids,
+        )
+
+    # ── Step 3: Fresh pre-extraction validation (auto-runs before every trigger) ──
+    validation_record = await run_pre_extraction_validation(
+        canonical_url_id=canonical_url_id,
+        validated_by="auto_pre_run",
+    )
+    if not validation_record.get("can_proceed"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error":            "PRE_VALIDATION_FAILED",
+                "message":          "Pre-extraction validation did not pass. See blocking_reasons.",
+                "blocking_reasons": validation_record.get("blocking_reasons", []),
+                "warnings":         validation_record.get("warnings", []),
+            },
+        )
+
+    # ── Step 4: Run extraction ────────────────────────────────────────────
+    # Create the pipeline_runs row BEFORE calling the service so we have the UUID.
+    # If create_pipeline_run fails, pipeline_run_id stays None and _track() is a no-op.
+    pipeline_run_id: str | None = None
+    try:
+        pipeline_run_id = await asyncio.to_thread(
+            create_pipeline_run, canonical_url_id, "run_a"
+        )
+    except Exception as _pr_exc:
+        logger.warning("trigger_run_a: could not create pipeline_runs row: %s", _pr_exc)
+
+    try:
+        result = await run_spec_extraction(
+            url_registry_id=canonical_url_id,
+            raw_source_ids=raw_source_ids,
+            raw_transcript_ids=top3_transcript_ids,
+            brand=brand,
+            model_name=model_name,
             schema_version=body.schema_version,
+            pipeline_run_id=pipeline_run_id,
+        )
+        return RunAResponse(**result, pipeline_run_id=pipeline_run_id)
+    except ValueError as exc:
+        if str(exc).startswith(_GATE_ERROR_PREFIX):
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "EXTRACTION_GATE_FAILED", "message": str(exc)},
+            )
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "NOT_FOUND", "message": str(exc)},
+        )
+    except Exception as exc:
+        logger.exception(
+            "trigger_run_a: unexpected error for canonical_url_id=%s", canonical_url_id
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "INTERNAL_ERROR", "message": str(exc)},
+        )
+
+
+# ---------------------------------------------------------------------------
+# FIX-13 — POST /extraction/run-b  (NEW endpoint, manual + auto)
+# ---------------------------------------------------------------------------
+
+@router.post("/run-b", response_model=RunBResult)
+@limiter.limit("10/minute")
+async def trigger_run_b(request: Request, body: ExtractionRequest):
+    """
+    POST /extraction/run-b — Experience extraction (Run B) for one phone.
+
+    Fires one Gemini call per transcript, parallel, semaphore-capped at 5.
+
+    MODES:
+      Auto   (auto_resolve=true):  Requires brand + model_name. Resolves ALL available
+                                   transcripts for this phone (status='fetched_raw').
+      Manual (auto_resolve=false): Requires brand + model_name + raw_transcript_ids.
+                                   Backend validates all transcript IDs belong to this phone.
+
+    Both modes:
+      - Resolve canonical_url_id from brand + model_name (GSMArena anchor).
+      - Run pre-extraction validation automatically (fresh check, writes new record).
+      - Enforce the Phase 1 validation gate.
+
+    Experience extraction supersedes all existing active phone_experiences rows
+    (is_superseded=FALSE → TRUE) before inserting new ones. Gate check must pass first.
+
+    Raises:
+        HTTP 400: Mode validation failure, cross-phone IDs, or no transcripts available.
+        HTTP 404: Phone not found in DB.
+        HTTP 422: Pre-extraction validation failed (blocking reasons returned).
+        HTTP 429: Rate limit exceeded (10/minute).
+        HTTP 500: Extraction error.
+    """
+    from app.repositories.extraction_repository import (
+        fetch_canonical_id_by_brand_model,
+        fetch_sources_for_run_phone,
+        validate_source_ids_belong_to_phone,
+    )
+    from app.repositories.pipeline_run_repository import create_pipeline_run
+
+    _validate_extraction_request(body, requires_sources=False, requires_transcripts=True)
+
+    brand, model_name = _normalize_brand_model(body.brand, body.model_name)
+
+    # ── Step 1: Resolve canonical_url_id (both modes) ───────────────────────
+    try:
+        canonical_url_id = await asyncio.to_thread(
+            fetch_canonical_id_by_brand_model, brand, model_name
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "PHONE_NOT_FOUND", "message": str(exc)},
+        )
+
+    # ── Step 2: Resolve / validate transcript IDs (mode-specific) ─────────────
+    if body.auto_resolve:
+        try:
+            resolved = await asyncio.to_thread(fetch_sources_for_run_phone, canonical_url_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "PHONE_NOT_FOUND", "message": str(exc)},
+            )
+
+        raw_transcript_ids = resolved["raw_transcript_ids"]
+
+        if not raw_transcript_ids:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error":   "NO_TRANSCRIPTS_AVAILABLE",
+                    "message": (
+                        f"No transcripts found for {brand!r} {model_name!r} "
+                        "(status='fetched_raw'). Fetch transcripts before running Run B."
+                    ),
+                },
+            )
+
+        logger.info(
+            "trigger_run_b [auto]: url_id=%d brand=%r model=%r transcripts=%s",
+            canonical_url_id, brand, model_name, raw_transcript_ids,
+        )
+    else:
+        # Manual mode: validate that all provided transcript IDs belong to this phone
+        raw_transcript_ids = body.raw_transcript_ids
+
+        ownership = await asyncio.to_thread(
+            validate_source_ids_belong_to_phone,
+            canonical_url_id,
+            [],  # no source IDs for run-b
+            raw_transcript_ids,
+        )
+        if not ownership["valid"]:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error":   "FOREIGN_IDS_DETECTED",
+                    "message": (
+                        "One or more transcript IDs do not belong to the resolved phone. "
+                        "This request has been blocked to prevent data contamination."
+                    ),
+                    "foreign_source_ids":     ownership["foreign_source_ids"],
+                    "foreign_transcript_ids": ownership["foreign_transcript_ids"],
+                },
+            )
+
+        logger.info(
+            "trigger_run_b [manual]: url_id=%d brand=%r model=%r transcripts=%s",
+            canonical_url_id, brand, model_name, raw_transcript_ids,
+        )
+
+    # ── Step 3: Fresh pre-extraction validation (auto-runs before every trigger) ──
+    validation_record = await run_pre_extraction_validation(
+        canonical_url_id=canonical_url_id,
+        validated_by="auto_pre_run",
+    )
+    if not validation_record.get("can_proceed"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error":            "PRE_VALIDATION_FAILED",
+                "message":          "Pre-extraction validation did not pass. See blocking_reasons.",
+                "blocking_reasons": validation_record.get("blocking_reasons", []),
+                "warnings":         validation_record.get("warnings", []),
+            },
+        )
+
+    # ── Step 4: Run extraction ────────────────────────────────────────────
+    pipeline_run_id: str | None = None
+    try:
+        pipeline_run_id = await asyncio.to_thread(
+            create_pipeline_run, canonical_url_id, "run_b",
+            len(raw_transcript_ids),
+        )
+    except Exception as _pr_exc:
+        logger.warning("trigger_run_b: could not create pipeline_runs row: %s", _pr_exc)
+
+    try:
+        run_b_raw = await run_experience_extraction_batch(
+            url_registry_id=canonical_url_id,
+            raw_transcript_ids=raw_transcript_ids,
+            brand=brand,
+            model_name=model_name,
+            schema_version=body.schema_version,
+            pipeline_run_id=pipeline_run_id,
+        )
+    except ValueError as exc:
+        if str(exc).startswith(_GATE_ERROR_PREFIX):
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "EXTRACTION_GATE_FAILED", "message": str(exc)},
+            )
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "NOT_FOUND", "message": str(exc)},
+        )
+    except Exception as exc:
+        logger.exception(
+            "trigger_run_b: unexpected error for canonical_url_id=%s", canonical_url_id
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "INTERNAL_ERROR", "message": str(exc)},
+        )
+
+    # run_b_raw is now a dict (two-stage system)
+    if isinstance(run_b_raw, Exception):
+        return RunBResult(
+            success=False,
+            pipeline_run_id=pipeline_run_id,
+            message=f"Run B failed: {run_b_raw}",
+            error=str(run_b_raw),
+        )
+
+    new_t    = run_b_raw.get("new_transcripts", 0)
+    reused_t = run_b_raw.get("reused_transcripts", 0)
+    return RunBResult(
+        success=run_b_raw.get("success", False),
+        aggregation_run_id=run_b_raw.get("aggregation_run_id"),
+        pipeline_run_id=pipeline_run_id,
+        experiences_extracted=run_b_raw.get("experiences_output", 0),
+        new_transcripts=new_t,
+        reused_transcripts=reused_t,
+        transcripts_processed=new_t + reused_t,
+        transcripts_failed=len(raw_transcript_ids) - (new_t + reused_t),
+        message=run_b_raw.get("message", ""),
+        error=run_b_raw.get("error"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# FIX-14 — POST /extraction/run-all  (unified manual + auto, single gate check)
+# ---------------------------------------------------------------------------
+
+@router.post("/run-all", response_model=RunAllResponse)
+@limiter.limit("5/minute")
+async def trigger_run_all(request: Request, body: ExtractionRequest):
+    """
+    POST /extraction/run-all — Run A + Run B in parallel for one phone.
+
+    MODES:
+      Auto   (auto_resolve=true):  Requires brand + model_name only. Resolves all IDs.
+                                   Run A uses top3_transcript_ids. Run B uses all transcripts.
+      Manual (auto_resolve=false): Requires brand + model_name + raw_source_ids.
+                                   raw_transcript_ids is optional (Run B skipped if empty).
+                                   Backend validates all IDs belong to this phone.
+
+    Both modes:
+      - Resolve canonical_url_id from brand + model_name (GSMArena anchor).
+      - Run pre-extraction validation ONCE before launching both runs.
+      - If the gate fails, a single HTTP 422 is returned before any run records are created.
+
+    Run A and Run B are launched in parallel (asyncio.gather). Failure of one does NOT
+    block the other. Both results are returned independently in RunAllResponse.
+
+    Raises:
+        HTTP 400: Mode validation failure or cross-phone IDs detected.
+        HTTP 404: Phone not found in DB.
+        HTTP 422: Pre-extraction validation failed (checked once, before any launch).
+        HTTP 429: Rate limit exceeded (5/minute).
+        HTTP 500: Unexpected orchestration error.
+    """
+    from app.repositories.extraction_repository import (
+        fetch_canonical_id_by_brand_model,
+        fetch_sources_for_run_phone,
+        validate_source_ids_belong_to_phone,
+    )
+    from app.repositories.pipeline_run_repository import create_pipeline_run
+
+    _validate_extraction_request(body, requires_sources=True, requires_transcripts=False)
+
+    brand, model_name = _normalize_brand_model(body.brand, body.model_name)
+
+    # ── Step 1: Resolve canonical_url_id (both modes) ───────────────────────
+    try:
+        canonical_url_id = await asyncio.to_thread(
+            fetch_canonical_id_by_brand_model, brand, model_name
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "PHONE_NOT_FOUND", "message": str(exc)},
+        )
+
+    # ── Step 2: Resolve / validate IDs (mode-specific) ───────────────────────
+    if body.auto_resolve:
+        try:
+            resolved = await asyncio.to_thread(fetch_sources_for_run_phone, canonical_url_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "PHONE_NOT_FOUND", "message": str(exc)},
+            )
+
+        raw_source_ids      = resolved["raw_source_ids"]
+        raw_transcript_ids  = resolved["raw_transcript_ids"]
+        top3_transcript_ids = resolved["top3_transcript_ids"]
+
+
+        logger.info(
+            "trigger_run_all [auto]: url_id=%d brand=%r model=%r "
+            "sources=%s transcripts=%s top3_transcripts=%s",
+            canonical_url_id, brand, model_name,
+            raw_source_ids, raw_transcript_ids, top3_transcript_ids,
+        )
+    else:
+        # Manual mode: validate all provided IDs belong to this phone
+        raw_source_ids     = body.raw_source_ids
+        raw_transcript_ids = body.raw_transcript_ids
+
+        ownership = await asyncio.to_thread(
+            validate_source_ids_belong_to_phone,
+            canonical_url_id,
+            raw_source_ids,
+            raw_transcript_ids,
+        )
+        if not ownership["valid"]:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error":   "FOREIGN_IDS_DETECTED",
+                    "message": (
+                        "One or more provided IDs do not belong to the resolved phone. "
+                        "This request has been blocked to prevent data contamination."
+                    ),
+                    "foreign_source_ids":     ownership["foreign_source_ids"],
+                    "foreign_transcript_ids": ownership["foreign_transcript_ids"],
+                },
+            )
+
+        top3_transcript_ids = raw_transcript_ids[:3]
+
+        if len(raw_transcript_ids) > 3:
+            logger.warning(
+                "trigger_run_all [manual]: %d transcript IDs provided — "
+                "Run A uses top 3 only (IDs: %s). Run B uses all %d.",
+                len(raw_transcript_ids),
+                raw_transcript_ids[:3],
+                len(raw_transcript_ids),
+            )
+
+        logger.info(
+            "trigger_run_all [manual]: url_id=%d brand=%r model=%r "
+            "sources=%s transcripts=%s top3_transcripts=%s",
+            canonical_url_id, brand, model_name,
+            raw_source_ids, raw_transcript_ids, top3_transcript_ids,
+        )
+
+    # ── Step 3: Single fresh pre-extraction validation BEFORE launching both runs ──
+    validation_record = await run_pre_extraction_validation(
+        canonical_url_id=canonical_url_id,
+        validated_by="auto_pre_run",
+    )
+    if not validation_record.get("can_proceed"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error":            "PRE_VALIDATION_FAILED",
+                "message":          "Pre-extraction validation did not pass. See blocking_reasons.",
+                "blocking_reasons": validation_record.get("blocking_reasons", []),
+                "warnings":         validation_record.get("warnings", []),
+            },
+        )
+
+    # ── Step 4: Launch Run A + Run B in parallel ────────────────────────────────
+    # Create one pipeline_runs row per run (run_a and run_b are independent).
+    pipeline_run_id_a: str | None = None
+    pipeline_run_id_b: str | None = None
+    try:
+        pipeline_run_id_a = await asyncio.to_thread(
+            create_pipeline_run, canonical_url_id, "run_a"
+        )
+    except Exception as _pr_exc:
+        logger.warning("trigger_run_all: could not create run_a pipeline_runs row: %s", _pr_exc)
+    if raw_transcript_ids:
+        try:
+            pipeline_run_id_b = await asyncio.to_thread(
+                create_pipeline_run, canonical_url_id, "run_b",
+                len(raw_transcript_ids),
+            )
+        except Exception as _pr_exc:
+            logger.warning("trigger_run_all: could not create run_b pipeline_runs row: %s", _pr_exc)
+
+    run_a_coro = run_spec_extraction(
+        url_registry_id=canonical_url_id,
+        raw_source_ids=raw_source_ids,
+        raw_transcript_ids=top3_transcript_ids,
+        brand=brand,
+        model_name=model_name,
+        schema_version=body.schema_version,
+        pipeline_run_id=pipeline_run_id_a,
+    )
+
+    if raw_transcript_ids:
+        run_b_coro = run_experience_extraction_batch(
+            url_registry_id=canonical_url_id,
+            raw_transcript_ids=raw_transcript_ids,
+            brand=brand,
+            model_name=model_name,
+            schema_version=body.schema_version,
+            pipeline_run_id=pipeline_run_id_b,
         )
     else:
         async def _no_transcripts():
@@ -352,36 +907,25 @@ async def trigger_run_all(body: RunAllRequest):
     results = await asyncio.gather(run_a_coro, run_b_coro, return_exceptions=True)
     run_a_result, run_b_raw = results
 
-    # -------------------------------------------------------------------------
-    # Process Run A result
-    # -------------------------------------------------------------------------
+    # Process Run A
     if isinstance(run_a_result, Exception):
         exc = run_a_result
-        if str(exc).startswith(_GATE_ERROR_PREFIX):
-            raise HTTPException(status_code=422, detail=str(exc))
+        logger.exception(
+            "trigger_run_all: Run A failed for url_id=%d: %s", canonical_url_id, exc
+        )
         run_a_response = RunAResponse(
-            success=False,
-            output_id=None,
-            run_id=None,
-            message=f"Run A failed: {exc}",
-            failed_source_ids=[],
+            success=False, output_id=None, run_id=None,
+            message=f"Run A failed: {exc}", failed_source_ids=[],
         )
     else:
         run_a_response = RunAResponse(**run_a_result)
 
-    # -------------------------------------------------------------------------
-    # Process Run B batch results
-    # run_b_raw is list[dict | Exception], one per transcript
-    # -------------------------------------------------------------------------
+    # Process Run B — run_b_raw is now a dict (two-stage system)
     if isinstance(run_b_raw, Exception):
-        # Gate-level failure before any tasks launched
-        exc = run_b_raw
-        if str(exc).startswith(_GATE_ERROR_PREFIX):
-            raise HTTPException(status_code=422, detail=str(exc))
         run_b_response = RunBResult(
             success=False,
-            message=f"Run B batch failed to start: {exc}",
-            error=str(exc),
+            message=f"Run B batch failed: {run_b_raw}",
+            error=str(run_b_raw),
         )
     elif not run_b_raw:
         run_b_response = RunBResult(
@@ -389,25 +933,18 @@ async def trigger_run_all(body: RunAllRequest):
             message="No transcripts provided — Run B skipped.",
         )
     else:
-        successes = [r for r in run_b_raw if isinstance(r, dict) and r.get("success")]
-        failures = [r for r in run_b_raw if isinstance(r, Exception)]
-        total_extracted = sum(r.get("experiences_extracted", 0) for r in successes)
-        total_filtered = sum(r.get("experiences_filtered", 0) for r in successes)
-        best_exp_run_id = successes[0].get("exp_run_id") if successes else None
-
+        new_t    = run_b_raw.get("new_transcripts", 0)
+        reused_t = run_b_raw.get("reused_transcripts", 0)
         run_b_response = RunBResult(
-            success=len(failures) == 0,
-            exp_run_id=best_exp_run_id,
-            experiences_extracted=total_extracted,
-            experiences_filtered=total_filtered,
-            transcripts_processed=len(successes),
-            transcripts_failed=len(failures),
-            message=(
-                f"Run B (LX) complete. {len(successes)}/{len(run_b_raw)} transcripts "
-                f"succeeded. {total_extracted} experiences extracted, "
-                f"{total_filtered} below confidence threshold."
-            ),
-            error=str(failures[0]) if failures else None,
+            success=run_b_raw.get("success", False),
+            aggregation_run_id=run_b_raw.get("aggregation_run_id"),
+            experiences_extracted=run_b_raw.get("experiences_output", 0),
+            new_transcripts=new_t,
+            reused_transcripts=reused_t,
+            transcripts_processed=new_t + reused_t,
+            transcripts_failed=len(raw_transcript_ids) - (new_t + reused_t),
+            message=run_b_raw.get("message", ""),
+            error=run_b_raw.get("error"),
         )
 
     return RunAllResponse(
@@ -418,197 +955,92 @@ async def trigger_run_all(body: RunAllRequest):
 
 
 # ---------------------------------------------------------------------------
-# Phase L6 — POST /extraction/run-phone  (auto-resolve + parallel launch)
+# GET /extraction/run-status/{run_id}  — Poll a pipeline run's live status
 # ---------------------------------------------------------------------------
 
-class RunPhoneRequest(BaseModel):
-    model_config = {"protected_namespaces": ()}
-    canonical_url_id: int
-    schema_version: str = "v1"
-
-
-class RunPhoneRunBSummary(BaseModel):
-    transcripts_processed: int
-    transcripts_failed: int
-    experiences_extracted: int
-    experiences_filtered: int
-    exp_run_ids: list[int]
-    error: str | None = None
-
-
-class RunPhoneResponse(BaseModel):
-    success: bool
-    brand: str
-    model_name: str
-    canonical_url_id: int
-    raw_source_ids_used: list[int]
-    raw_transcript_ids_used: list[int]
-    best_transcript_id: int | None
-    run_a: RunAResponse
-    run_b: RunPhoneRunBSummary
-    both_succeeded: bool
-    message: str
-
-
-@router.post("/run-phone", response_model=RunPhoneResponse)
-async def trigger_run_phone(body: RunPhoneRequest):
+@router.get("/run-status/{run_id}")
+async def get_run_status(run_id: str):
     """
-    POST /extraction/run-phone — primary extraction trigger.
+    Returns the current status of a pipeline run by its UUID.
 
-    Accepts only canonical_url_id. Auto-resolves all source IDs:
-      1. brand + model_name       ← url_registry anchor row
-      2. raw_source_ids           ← all raw_scraped_data with
-                                    status IN ('scraped_raw', 'stored_mainDB')
-      3. raw_transcript_ids       ← all youtube_raw_transcript_data with
-                                    status='fetched_raw' (via video_registry)
-      4. best_transcript_id       ← highest channel_reliability_score,
-                                    then highest word_count_processed
+    Designed for Admin UI polling (1.5s interval while status='running').
+    The UI should stop polling when status is 'completed', 'partial', or 'failed'.
 
-    Fires Run A (one LangExtract spec call) and Run B batch (one call per
-    transcript, semaphore-capped at 5) simultaneously via asyncio.gather.
-
-    Run A receives best_transcript_id as its transcript input.
-    Run B batch receives ALL raw_transcript_ids for full experience coverage.
+    Computed fields:
+        elapsed_seconds  — integer seconds since started_at (computed server-side)
+        processed        — alias for processed_items
+        total            — alias for total_items
+        failed           — alias for failed_items
 
     Raises:
-        HTTP 404: If canonical_url_id not found in url_registry.
-        HTTP 400: If no scraped sources found (cannot run extraction).
-        HTTP 422: If Phase 1 validation gate not passed.
-        HTTP 500: On unexpected orchestration error.
+        HTTP 404: If run_id is not found in pipeline.pipeline_runs.
+        HTTP 500: On unexpected DB error.
     """
-    from app.repositories.extraction_repository import fetch_sources_for_run_phone
-
-    # Step 1 — Auto-resolve sources
     try:
-        resolved = await asyncio.to_thread(
-            fetch_sources_for_run_phone, body.canonical_url_id
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        row = await asyncio.to_thread(fetch_pipeline_run, run_id)
+    except Exception as exc:
+        logger.exception("get_run_status: DB error for run_id=%s", run_id)
+        raise HTTPException(status_code=500, detail=str(exc))
 
-    brand = resolved["brand"]
-    model_name = resolved["model_name"]
-    raw_source_ids = resolved["raw_source_ids"]
-    raw_transcript_ids = resolved["raw_transcript_ids"]
-    best_transcript_id = resolved["best_transcript_id"]
-
-    if not raw_source_ids:
+    if row is None:
         raise HTTPException(
-            status_code=400,
-            detail=(
-                f"No scraped sources found for canonical_url_id={body.canonical_url_id} "
-                f"({brand} {model_name}). Run the scraper first and ensure status is "
-                "'scraped_raw' or 'stored_mainDB'."
-            ),
+            status_code=404,
+            detail=f"run_id={run_id!r} not found in pipeline.pipeline_runs.",
         )
 
-    logger.info(
-        "trigger_run_phone: canonical_url_id=%d brand=%r model=%r "
-        "raw_source_ids=%s raw_transcript_ids=%s best_transcript_id=%s",
-        body.canonical_url_id, brand, model_name,
-        raw_source_ids, raw_transcript_ids, best_transcript_id,
-    )
+    started_at = row.get("started_at")
+    elapsed = 0
+    if started_at:
+        start = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        elapsed = int((datetime.now(timezone.utc) - start).total_seconds())
 
-    # Step 2 — Launch Run A + Run B in parallel
-    run_a_coro = run_spec_extraction_lx(
-        url_registry_id=body.canonical_url_id,
-        raw_source_ids=raw_source_ids,
-        raw_transcript_id=best_transcript_id,
-        brand=brand,
-        model_name=model_name,
-        schema_version=body.schema_version,
-    )
+    return {
+        "run_id":          row["run_id"],
+        "run_type":        row["run_type"],
+        "status":          row["status"],
+        "current_stage":   row.get("current_stage"),
+        "current_step":    row.get("current_step"),
+        "processed":       row.get("processed_items", 0),
+        "total":           row.get("total_items"),
+        "failed":          row.get("failed_items", 0),
+        "elapsed_seconds": elapsed,
+        "started_at":      row.get("started_at"),
+        "completed_at":    row.get("completed_at"),
+        "updated_at":      row.get("updated_at"),
+        "error_summary":   row.get("error_summary") or [],
+    }
 
-    if raw_transcript_ids:
-        run_b_coro = run_experience_extraction_batch(
-            url_registry_id=body.canonical_url_id,
-            raw_transcript_ids=raw_transcript_ids,
-            brand=brand,
-            model_name=model_name,
-            schema_version=body.schema_version,
+
+# ---------------------------------------------------------------------------
+# GET /extraction/recent-runs  — Run history for a phone
+# ---------------------------------------------------------------------------
+
+@router.get("/recent-runs")
+async def get_recent_runs(
+    url_registry_id: int = Query(..., description="pipeline.url_registry.url_id"),
+    limit: int = Query(default=10, ge=1, le=50, description="Max rows to return"),
+):
+    """
+    Returns the N most recent pipeline runs for the given phone, ordered
+    by started_at DESC.
+
+    Used by the Admin UI to show run history and let the admin re-attach
+    to an in-progress run after a page refresh.
+
+    Raises:
+        HTTP 500: On unexpected DB error.
+    """
+    try:
+        rows = await asyncio.to_thread(
+            fetch_recent_pipeline_runs, url_registry_id, limit
         )
-    else:
-        async def _no_transcripts():
-            return []
-        run_b_coro = _no_transcripts()
-
-    results = await asyncio.gather(run_a_coro, run_b_coro, return_exceptions=True)
-    run_a_result, run_b_raw = results
-
-    # -------------------------------------------------------------------------
-    # Process Run A result
-    # -------------------------------------------------------------------------
-    if isinstance(run_a_result, Exception):
-        exc = run_a_result
-        if str(exc).startswith(_GATE_ERROR_PREFIX):
-            raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
         logger.exception(
-            "trigger_run_phone: Run A failed for canonical_url_id=%d: %s",
-            body.canonical_url_id, exc,
+            "get_recent_runs: DB error for url_registry_id=%d", url_registry_id
         )
-        run_a_response = RunAResponse(
-            success=False,
-            output_id=None,
-            run_id=None,
-            message=f"Run A failed: {exc}",
-            failed_source_ids=[],
-        )
-    else:
-        run_a_response = RunAResponse(**run_a_result)
+        raise HTTPException(status_code=500, detail=str(exc))
 
-    # -------------------------------------------------------------------------
-    # Process Run B batch results
-    # -------------------------------------------------------------------------
-    if isinstance(run_b_raw, Exception):
-        exc = run_b_raw
-        if str(exc).startswith(_GATE_ERROR_PREFIX):
-            raise HTTPException(status_code=422, detail=str(exc))
-        run_b_summary = RunPhoneRunBSummary(
-            transcripts_processed=0,
-            transcripts_failed=len(raw_transcript_ids),
-            experiences_extracted=0,
-            experiences_filtered=0,
-            exp_run_ids=[],
-            error=str(exc),
-        )
-    else:
-        b_successes = [r for r in run_b_raw if isinstance(r, dict) and r.get("success")]
-        b_failures = [r for r in run_b_raw if isinstance(r, Exception)]
-        run_b_summary = RunPhoneRunBSummary(
-            transcripts_processed=len(b_successes),
-            transcripts_failed=len(b_failures),
-            experiences_extracted=sum(r.get("experiences_extracted", 0) for r in b_successes),
-            experiences_filtered=sum(r.get("experiences_filtered", 0) for r in b_successes),
-            exp_run_ids=[r["exp_run_id"] for r in b_successes if r.get("exp_run_id")],
-            error=str(b_failures[0]) if b_failures else None,
-        )
-
-    both_succeeded = run_a_response.success and (
-        not raw_transcript_ids
-        or (
-            not isinstance(run_b_raw, Exception)
-            and all(isinstance(r, dict) and r.get("success") for r in run_b_raw)
-        )
-    )
-
-    return RunPhoneResponse(
-        success=run_a_response.success,
-        brand=brand,
-        model_name=model_name,
-        canonical_url_id=body.canonical_url_id,
-        raw_source_ids_used=raw_source_ids,
-        raw_transcript_ids_used=raw_transcript_ids,
-        best_transcript_id=best_transcript_id,
-        run_a=run_a_response,
-        run_b=run_b_summary,
-        both_succeeded=both_succeeded,
-        message=(
-            f"run-phone complete for {brand} {model_name}. "
-            f"Run A: {'ok' if run_a_response.success else 'FAILED'}. "
-            f"Run B: {run_b_summary.transcripts_processed}/{len(raw_transcript_ids)} "
-            f"transcripts OK."
-        ),
-    )
+    return {"url_registry_id": url_registry_id, "runs": rows}
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +1062,8 @@ class NormaliseResponse(BaseModel):
 
 
 @router.post("/normalise", response_model=NormaliseResponse)
-async def trigger_normalise(body: NormaliseRequest):
+@limiter.limit("20/minute")
+async def trigger_normalise(request: Request, body: NormaliseRequest):
     """
     Triggers Phase 4 normalisation for a completed Run A output.
 
@@ -692,7 +1125,8 @@ class GapAnalysisResponse(BaseModel):
 
 
 @router.post("/gaps", response_model=GapAnalysisResponse)
-async def trigger_gap_analysis(body: GapAnalysisRequest):
+@limiter.limit("20/minute")
+async def trigger_gap_analysis(request: Request, body: GapAnalysisRequest):
     """
     Triggers Phase 5 gap analysis on a completed normalisation output.
 
@@ -764,7 +1198,8 @@ class EnrichResponse(BaseModel):
 
 
 @router.post("/enrich", response_model=EnrichResponse)
-async def trigger_enrichment(body: EnrichRequest) -> EnrichResponse:
+@limiter.limit("20/minute")
+async def trigger_enrichment(request: Request, body: EnrichRequest) -> EnrichResponse:
     """
     Phase 6 — Enrichment.
 
@@ -833,7 +1268,8 @@ class ResolveConflictsResponse(BaseModel):
 
 
 @router.post("/resolve-conflicts", response_model=ResolveConflictsResponse)
-async def trigger_conflict_resolution(body: ResolveConflictsRequest):
+@limiter.limit("20/minute")
+async def trigger_conflict_resolution(request: Request, body: ResolveConflictsRequest):
     """
     Phase 7 — Conflict Resolution.
 
@@ -855,42 +1291,52 @@ async def trigger_conflict_resolution(body: ResolveConflictsRequest):
         body.normalized_id, body.enrichment_run_id,
     )
     try:
-        # Step 1 — Detect and resolve conflicts
-        conflict_result = await detect_and_resolve_conflicts(
-            normalized_id=body.normalized_id,
-            enrichment_run_id=body.enrichment_run_id,
+        conflict_result = await detect_and_resolve_conflicts(body.normalized_id)
+    except Exception as exc:
+        logger.exception(
+            "trigger_conflict_resolution: conflict detection failed normalized_id=%d",
+            body.normalized_id,
         )
+        raise HTTPException(status_code=500, detail=str(exc))
 
-        # Step 2 — Build final merged JSON
-        final_id = await build_final_merged_json(
-            normalized_id=body.normalized_id,
-            enrichment_run_id=body.enrichment_run_id,
-        )
-
-        return ResolveConflictsResponse(
-            success=True,
-            final_id=final_id,
-            flagged_count=conflict_result["flagged_count"],
-            auto_resolved_count=conflict_result["auto_resolved_count"],
-            fill_count=conflict_result["fill_count"],
-            concordant_count=conflict_result["concordant_count"],
-            message=(
-                f"Conflict resolution complete. "
-                f"auto_resolved={conflict_result['auto_resolved_count']} "
-                f"fills={conflict_result['fill_count']} "
-                f"flagged={conflict_result['flagged_count']} "
-                f"concordant={conflict_result['concordant_count']} "
-                f"(final_id={final_id})."
-            ),
-        )
+    try:
+        final_id = await build_final_merged_json(body.normalized_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
         logger.exception(
-            "trigger_conflict_resolution: unexpected error normalized_id=%d",
+            "trigger_conflict_resolution: build_final_merged_json failed after "
+            "successful conflict detection. normalized_id=%d",
             body.normalized_id,
         )
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "PARTIAL_FAILURE",
+                "message": (
+                    "Conflict detection succeeded but final merge failed. "
+                    "Re-run /resolve-conflicts — detection is idempotent. "
+                    f"Error: {exc}"
+                ),
+            },
+        )
+
+    return ResolveConflictsResponse(
+        success=True,
+        final_id=final_id,
+        flagged_count=conflict_result["flagged_count"],
+        auto_resolved_count=conflict_result["auto_resolved_count"],
+        fill_count=conflict_result["fill_count"],
+        concordant_count=conflict_result["concordant_count"],
+        message=(
+            f"Conflict resolution complete. "
+            f"auto_resolved={conflict_result['auto_resolved_count']} "
+            f"fills={conflict_result['fill_count']} "
+            f"flagged={conflict_result['flagged_count']} "
+            f"concordant={conflict_result['concordant_count']} "
+            f"(final_id={final_id})."
+        ),
+    )
 
 
 # ===========================================================================

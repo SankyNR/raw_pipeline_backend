@@ -88,3 +88,29 @@ async def get_raw_transcript_data(video_registry_id: int) -> dict | None:
         return None
 
     return result.data[0]
+
+
+async def delete_raw_transcript_data_by_execution(transcript_exec_id: int) -> None:
+    """
+    Deletes an orphan youtube_raw_transcript_data row by transcript_exec_id.
+
+    Called from youtube_transcript_orchestrator when insert_raw_transcript_data
+    succeeds but set_video_fetched_raw subsequently fails. The orphan row has
+    a valid srt_path but a deleted processed_transcript_path. If left in place,
+    fetch_sources_for_run_phone could select it and the extraction would fail
+    trying to read the missing processed file.
+
+    Content failures (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable)
+    are raised before insert_raw_transcript_data — this function is never called
+    for those cases (is_content_failure guard in the caller).
+
+    The DELETE is a no-op if the row does not exist (0 rows deleted is not an error).
+    """
+    (
+        get_client()
+        .schema("pipeline")
+        .table("youtube_raw_transcript_data")
+        .delete()
+        .eq("transcript_exec_id", transcript_exec_id)
+        .execute()
+    )

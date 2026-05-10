@@ -30,6 +30,12 @@ from google import genai
 from google.genai import types
 
 from app.core.config import GEMINI_API_KEY
+from app.services.gemini_client import (
+    GeminiRateLimitError,
+    GeminiTransientError,
+    GeminiNonRetryableError,
+    _classify_gemini_exception,
+)
 from app.services.video_relevance_filter import (
     extract_search_tokens,
     _normalize_text,
@@ -41,11 +47,19 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level singleton client (new google-genai SDK)
+# S4-P1-1: converted to lazy singleton to prevent import-time crash when
+# GEMINI_API_KEY is missing. Client is created on first LLM call, not at import.
 # ---------------------------------------------------------------------------
 
-_client: genai.Client = genai.Client(api_key=GEMINI_API_KEY)
+_client: genai.Client | None = None
 
-_GEMINI_MODEL_NAME = "gemini-2.5-flash-lite"
+
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        _client = genai.Client(api_key=GEMINI_API_KEY)
+    return _client
+
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -185,12 +199,36 @@ def stage1_prefilter(
             # _match_series_token used for single-char series like "g", "a" to avoid
             # matching the letter fragment from "5g" → "5 g" normalization
             series_found = any(_match_series_token(text, s) for s in series_tokens)
-            nonfree_found = any(_matches(text, t) for t in _NUMBER_FREE_IDENTIFIERS
-                                if _matches(text, t))
+            nonfree_found = any(_matches(text, t) for t in _NUMBER_FREE_IDENTIFIERS)
             noncrit_found = any(_matches(text, t) for t in noncrit_tokens)
             model_found = series_found or nonfree_found or noncrit_found
 
         if brand_found and model_found:
+            # --- Suffix enforcement gate ---
+            # If the target model has strong secondary tokens (e.g. "fusion", "pro",
+            # "ultra", "neo", "plus"), the video text MUST contain at least one of them.
+            # Without this gate, "Motorola Edge 50" passes for "Motorola Edge 50 Fusion"
+            # because Stage 1 only checks brand + number presence.
+            # This is a hard deterministic rule — the LLM should not be asked to
+            # adjudicate a mismatch that is structurally unambiguous.
+            #
+            # Uses tokens["strong_secondary_tokens"] — already computed above via
+            # extract_search_tokens(). Only fires when the MODEL has strong secondary tokens.
+            # Videos about "Motorola Edge 50" (no suffix) are correctly accepted when
+            # searching for "Motorola Edge 50" (no suffix in model either).
+            #
+            # _matches() used (word-boundary regex) — same as rest of Stage 1.
+            # STRONG_SECONDARY_TOKENS imported from video_relevance_filter — no new imports needed.
+            model_strong_tokens = tokens["strong_secondary_tokens"]
+            if model_strong_tokens:
+                suffix_found = any(_matches(text, t) for t in model_strong_tokens)
+                if not suffix_found:
+                    logger.debug(
+                        "Stage1 REJECT (suffix gate) yt_video_id=%r "
+                        "required_suffixes=%r not found in title=%r",
+                        vid_id, model_strong_tokens, title,
+                    )
+                    continue
             passed.append(video)
         else:
             logger.debug(
@@ -265,9 +303,18 @@ determine whether the video is PRIMARILY about that exact phone.
 RULES (apply in order):
 
 1. PRIMARY SUBJECT RULE
-   The video must be primarily about the target phone — a full review, hands-on,
-   unboxing, camera test, long-term review, or detailed feature coverage OF that phone.
-   Passing mentions, brief references, or predecessor comparisons do NOT qualify.
+   The video must be exclusively and primarily about the target phone — a full review,
+   hands-on, unboxing, camera test, long-term review, or detailed feature coverage OF
+   that phone and no other phone.
+   Reject if ANY of the following are true:
+     - The video covers two or more phones (comparison, versus, battle, fight, head-to-head)
+     - The video is a roundup or sales guide listing multiple phones
+       ("best phones under 25000", "top 5 phones", "which phone to buy in 2024")
+     - The video covers a phone lineup or series without focusing on this exact model
+     - The target phone appears alongside other phones as one of several options
+   Passing mentions of other phones as brief context are acceptable ONLY if the entire
+   video is clearly dedicated to the target phone (e.g. a reviewer says "unlike my old
+   phone, this one has..." while reviewing exclusively the target phone).
 
 2. DESCRIPTION POLLUTION RULE
    YouTube descriptions frequently mention other phones as context or backdrop:
@@ -292,12 +339,18 @@ RULES (apply in order):
    If the video is about a different variant, mark is_relevant=false.
    If ambiguous about which variant, mark confidence=low.
 
-4. COMPARISON RULE
-   A direct head-to-head comparison video counts as relevant for BOTH phones:
-     "Motorola G96 vs G85 — Which to Buy?" → relevant for G96 AND G85.
-     "Galaxy A55 5G vs A56 5G Camera Comparison" → relevant for BOTH.
-   If the target is one of exactly two phones compared, mark is_relevant=true.
-   Do NOT mark relevant if the target is mentioned among 3+ phones in a group test.
+4. SINGLE PHONE RULE
+   The video must cover exactly ONE phone — the target phone.
+   Any of the following patterns must result in is_relevant=false:
+     - Title contains: "vs", "versus", "compared to", "comparison", "battle",
+       "fight", "or", "which to buy", "should you buy"
+     - Title lists multiple phones: "Phone A and Phone B", "Phone A & Phone B"
+     - Description or title introduces a second phone as a co-subject
+     - The video tests, benchmarks, or reviews two phones side by side
+   These videos contain mixed statements about multiple phones. Experience extraction
+   cannot reliably attribute opinions, camera results, or performance claims to the
+   correct device. Even if the target phone is the "winner", reject the video.
+   There are no exceptions to this rule — if a second phone is a co-subject, reject.
 
 5. UNCERTAINTY RULE
    If the title and description are too brief or ambiguous to determine the primary
@@ -309,8 +362,28 @@ Respond ONLY with a JSON object. No preamble. No markdown fences. No explanation
   "is_relevant": true or false,
   "primary_subject": "the phone this video is primarily about, as you read it from the text",
   "confidence": "high" or "medium" or "low",
+  "signal_strength": "high" or "medium" or "low",
+  "video_type": "dedicated_review" or "comparison" or "group_review",
   "reason": "one sentence, plain English"
-}"""
+}
+
+SIGNAL STRENGTH RULES:
+  high   — dedicated in-depth review, hands-on, unboxing, camera test, or long-term
+            review of ONLY this phone. Reviewer spent significant time with the device.
+  medium — partial coverage: brief hands-on, first impressions, quick look, or
+            comparison where this phone is one of exactly two phones tested.
+  low    — passing mention, list video (\"top 5 phones\"), or group comparison with
+            3+ phones. Limited real-world data on this phone.
+
+VIDEO TYPE RULES:
+  dedicated_review — the video reviews ONLY this one phone
+                     (full review, unboxing, long-term review, camera test,
+                      hands-on of this phone exclusively)
+  comparison       — head-to-head or versus with exactly ONE other phone (always is_relevant=false)
+  group_review     — this phone appears alongside 3 or more other phones
+                     (e.g. \"top 5 phones under 25000\", \"best phones 2024\")
+
+Assign signal_strength and video_type even if is_relevant=false."""
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +447,7 @@ async def _classify_one(
     async with _llm_semaphore:
         for attempt in range(_LLM_MAX_RETRIES + 1):
             try:
-                response = await _client.aio.models.generate_content(
+                response = await _get_client().aio.models.generate_content(
                     model=_GEMINI_MODEL_NAME,
                     contents=prompt,
                     config=types.GenerateContentConfig(
@@ -391,11 +464,17 @@ async def _classify_one(
 
                 result = json.loads(raw)
 
+                video_type = str(result.get("video_type", "unknown")).lower().strip()
+                if video_type not in ("dedicated_review", "comparison", "group_review"):
+                    video_type = "unknown"
+
                 return {
-                    "is_relevant":     bool(result.get("is_relevant", True)),
-                    "primary_subject": str(result.get("primary_subject", "unknown")),
-                    "confidence":      str(result.get("confidence", "low")),
-                    "reason":          str(result.get("reason", "")),
+                    "is_relevant":       bool(result.get("is_relevant", True)),
+                    "primary_subject":   str(result.get("primary_subject", "unknown")),
+                    "confidence":        str(result.get("confidence", "low")),
+                    "signal_strength":   str(result.get("signal_strength", "medium")),
+                    "video_type":        video_type,
+                    "reason":            str(result.get("reason", "")),
                 }
 
             except json.JSONDecodeError as e:
@@ -405,30 +484,48 @@ async def _classify_one(
                 )
                 break  # JSON error is not retryable — bad response, not quota
 
-            except Exception as e:
-                err_str = str(e)
-                is_rate_limit = "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower()
-
-                if is_rate_limit and attempt < _LLM_MAX_RETRIES:
+            except (GeminiRateLimitError, GeminiTransientError) as e:
+                # S3-P1-2: typed exception path — replaces fragile "429" string matching
+                if attempt < _LLM_MAX_RETRIES:
                     delay = _LLM_RETRY_DELAYS[attempt]
                     logger.warning(
-                        "LLM 429 rate limit for brand=%r model=%r title=%r — "
+                        "LLM rate/transient limit for brand=%r model=%r title=%r — "
                         "retry %d/%d in %ds",
                         brand, model_name, title, attempt + 1, _LLM_MAX_RETRIES, delay,
                     )
                     await asyncio.sleep(delay)
-                    continue  # retry
+                    continue
+                logger.warning(
+                    "LLM rate/transient error exhausted retries for brand=%r model=%r title=%r: %s — failing open",
+                    brand, model_name, title, e,
+                )
+                break
+
+            except Exception as e:
+                # Classify using typed SDK exceptions (S3-P1-2: replaces "429" in err_str)
+                error_class = _classify_gemini_exception(e)
+                if error_class in (GeminiRateLimitError, GeminiTransientError) and attempt < _LLM_MAX_RETRIES:
+                    delay = _LLM_RETRY_DELAYS[attempt]
+                    logger.warning(
+                        "LLM rate/transient error (classified) for brand=%r model=%r title=%r — "
+                        "retry %d/%d in %ds: %s",
+                        brand, model_name, title, attempt + 1, _LLM_MAX_RETRIES, delay, e,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
 
                 logger.warning(
                     "LLM call failed for brand=%r model=%r title=%r: %s — failing open",
                     brand, model_name, title, e,
                 )
-                break  # non-retryable error
+                break
 
     return {
         "is_relevant":     True,
         "primary_subject": "unknown (llm error)",
         "confidence":      "low",
+        "signal_strength": "low",
+        "video_type":      "unknown",
         "reason":          "LLM call failed — passed through for manual review",
     }
 
@@ -476,10 +573,13 @@ async def llm_filter_videos(
         title  = video.get("video_title") or ""
 
         if llm_result["is_relevant"]:
+            video["_llm_signal_strength"] = llm_result["signal_strength"]
+            video["_llm_confidence"]      = llm_result["confidence"]
+            video["_llm_video_type"]      = llm_result["video_type"]
             final.append(video)
             logger.info(
-                "LLM PASS  yt_video_id=%r confidence=%s subject=%r title=%r",
-                vid_id, llm_result["confidence"],
+                "LLM PASS  yt_video_id=%r confidence=%s signal_strength=%s subject=%r title=%r",
+                vid_id, llm_result["confidence"], llm_result["signal_strength"],
                 llm_result["primary_subject"], title,
             )
         else:

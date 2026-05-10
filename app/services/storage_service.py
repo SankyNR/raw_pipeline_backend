@@ -1,8 +1,8 @@
-"""
-Storage Service — Supabase Storage Helpers
+﻿"""
+Storage Service â€” Supabase Storage Helpers
 
 Task 4.1 (original): Upload and delete helpers.
-Task 0.1 (extraction pipeline): fetch_file_content() — generates a signed URL,
+Task 0.1 (extraction pipeline): fetch_file_content() â€” generates a signed URL,
 fetches content via HTTP, and discards the URL. Never stores or logs signed URLs.
 
 Operates on the private 'raw_files' bucket using the service role client,
@@ -31,6 +31,16 @@ class StorageFetchError(Exception):
     """
 
 
+class StorageDuplicateError(Exception):
+    """
+    Raised when upload_file() receives a 409 / Duplicate error from Supabase Storage,
+    indicating the file already exists at that path.
+
+    Callers that want idempotent uploads (e.g. raw SRT re-runs) should catch this
+    and treat it as a success. All other callers should propagate it as a fatal error.
+    """
+
+
 async def upload_file(path: str, file_bytes: bytes, content_type: str) -> str:
     """
     Uploads file_bytes to the raw_files bucket at the given path.
@@ -45,7 +55,7 @@ async def upload_file(path: str, file_bytes: bytes, content_type: str) -> str:
         The storage path string (same as the input path).
 
     Raises:
-        Exception: On any upload failure — propagated to the orchestrator.
+        Exception: On any upload failure â€” propagated to the orchestrator.
     """
     try:
         await asyncio.to_thread(
@@ -56,6 +66,13 @@ async def upload_file(path: str, file_bytes: bytes, content_type: str) -> str:
             )
         )
     except Exception as e:
+        err_str = str(e).lower()
+        # Supabase Storage returns a 409 / Duplicate when the object already exists.
+        # Surface this as a typed exception so callers can handle it explicitly.
+        if 'duplicate' in err_str or '409' in err_str or 'already exists' in err_str:
+            raise StorageDuplicateError(
+                f"Storage upload: file already exists at path '{path}': {e}"
+            ) from e
         raise RuntimeError(f"Storage upload failed for path '{path}': {e}")
     logger.info("Uploaded to raw_files: %s (%d bytes)", path, len(file_bytes))
     return path
@@ -68,23 +85,25 @@ async def delete_file(path: str) -> None:
     Used by the orchestrator to clean up orphaned files when a partial
     upload succeeds but a later step (DB insert, etc.) fails.
 
-    Does NOT raise if the file does not exist — silent no-op is correct here,
+    Does NOT raise if the file does not exist â€” silent no-op is correct here,
     because cleanup must be best-effort and must never shadow the original error.
 
     Args:
         path: Storage path relative to the bucket root.
     """
     try:
-        get_client().storage.from_(BUCKET).remove([path])
+        await asyncio.to_thread(
+            lambda: get_client().storage.from_(BUCKET).remove([path])
+        )
         logger.info("Deleted from raw_files: %s", path)
     except Exception as e:
-        # Log but swallow — a missing file during cleanup must not crash
+        # Log but swallow - a missing file during cleanup must not crash
         # the failure path that is already handling a real error.
         logger.warning("delete_file silent error (path=%s): %s", path, e)
 
 
 # ---------------------------------------------------------------------------
-# Task 0.1 (Extraction Pipeline) — fetch_file_content
+# Task 0.1 (Extraction Pipeline) â€” fetch_file_content
 # ---------------------------------------------------------------------------
 
 async def fetch_file_content(storage_path: str, ttl_seconds: int = 60) -> str:
@@ -95,13 +114,13 @@ async def fetch_file_content(storage_path: str, ttl_seconds: int = 60) -> str:
     single HTTP GET to retrieve the file bytes, then discards the URL immediately.
 
     The signed URL is NEVER stored, cached, logged, or passed to the frontend.
-    Every call generates a fresh URL — do not call this more than once per need.
+    Every call generates a fresh URL â€” do not call this more than once per need.
 
     Args:
         storage_path: Path within the raw_files bucket, e.g.
                       "samsung/galaxy-s25-ultra/GSMarena/samsung-...-gsm-....md"
         ttl_seconds:  Signed URL TTL in seconds. Default 60.
-                      Keep short — unused URLs still count against rate limits.
+                      Keep short â€” unused URLs still count against rate limits.
 
     Returns:
         The file content decoded as UTF-8 string.
@@ -155,8 +174,8 @@ async def fetch_file_content(storage_path: str, ttl_seconds: int = 60) -> str:
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status >= 500 and attempt < _FETCH_MAX_RETRIES - 1:
-                # m2: transient server error — retry
-                import asyncio
+                # m2: transient server error â€” retry
+                # asyncio already imported at module level — inline import removed (scoping bug fix)
                 wait = 2 ** (attempt + 1)  # 2s, 4s
                 logger.warning(
                     "fetch_file_content: HTTP %d on attempt %d/%d, retrying in %ds "
@@ -181,7 +200,7 @@ async def fetch_file_content(storage_path: str, ttl_seconds: int = 60) -> str:
             f"(path prefix={storage_path[:40]!r})"
         ) from last_exc
 
-    # m1 fix: log only char count and redacted path prefix — never the full path
+    # m1 fix: log only char count and redacted path prefix â€” never the full path
     logger.info(
         "fetch_file_content: retrieved %d chars (path prefix=%r)",
         len(content),
@@ -191,7 +210,7 @@ async def fetch_file_content(storage_path: str, ttl_seconds: int = 60) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Phase L0 (LangExtract Migration) — store_jsonl_content
+# Phase L0 (LangExtract Migration) â€” store_jsonl_content
 # ---------------------------------------------------------------------------
 
 async def store_jsonl_content(storage_path: str, jsonl_text: str) -> str:
@@ -205,7 +224,7 @@ async def store_jsonl_content(storage_path: str, jsonl_text: str) -> str:
       Run A: {brand_slug}/{model_slug}/extractions/spec_{extraction_run_id}.jsonl
       Run B: {brand_slug}/{model_slug}/extractions/exp_{exp_run_id}.jsonl
 
-    The HTML visualization is NEVER stored — generated on demand at serve time by
+    The HTML visualization is NEVER stored â€” generated on demand at serve time by
     GET /approval/visualization/{run_type}/{run_id} via lx.visualize(jsonl_path).
     See langextract_migration_v4.md Section 10.
 
@@ -217,7 +236,7 @@ async def store_jsonl_content(storage_path: str, jsonl_text: str) -> str:
         The storage path string (same as the input path).
 
     Raises:
-        RuntimeError: On any upload failure — propagated to the orchestrator.
+        RuntimeError: On any upload failure â€” propagated to the orchestrator.
     """
     file_bytes = jsonl_text.encode("utf-8")
     return await upload_file(
@@ -225,3 +244,4 @@ async def store_jsonl_content(storage_path: str, jsonl_text: str) -> str:
         file_bytes=file_bytes,
         content_type="application/jsonl",
     )
+

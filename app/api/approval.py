@@ -54,6 +54,7 @@ from app.repositories.extraction_repository import (
     close_admin_review_session,
     fetch_approval_package,
     fetch_evidence_for_field,
+    fetch_evidence_json_for_final,
     fetch_experiences_for_phone,
     fetch_experience_by_id,
     fetch_flagged_conflicts_for_phone,
@@ -552,6 +553,39 @@ async def resolve_conflict(
     """
     admin = _admin_user(x_admin_user)
 
+    # Step 0 — fetch package (needed for path validation when not kept_run_a,
+    # and reused below to patch final_json — eliminates the second DB fetch).
+    # S2-P1-7: previously the row was fetched TWICE: once here for path validation,
+    # and again below after update_conflict_resolution. The second fetch is removed
+    # because update_conflict_resolution only touches merge_conflict_log, not
+    # final_merged_json, so final_json read here is still current after the write.
+    row = await asyncio.to_thread(fetch_approval_package, req.final_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Approval package not found")
+
+    if req.resolution != "kept_run_a":
+        final_json = row.get("final_json") or {}
+        path_parts = _parse_path(req.field_path)
+
+        if len(path_parts) > 1:
+            parent_obj = final_json
+            for part in path_parts[:-1]:
+                if isinstance(parent_obj, dict):
+                    parent_obj = parent_obj.get(part)
+                elif isinstance(parent_obj, list) and isinstance(part, int):
+                    parent_obj = parent_obj[part] if part < len(parent_obj) else None
+                else:
+                    parent_obj = None
+                if parent_obj is None:
+                    break
+
+            if parent_obj is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="field_path unreachable — no DB writes occurred"
+                )
+
+    # Step 1 — NOW safe to write
     await asyncio.to_thread(
         update_conflict_resolution,
         req.conflict_id,
@@ -560,73 +594,48 @@ async def resolve_conflict(
         admin,
     )
 
-    # Fetch the package to patch final_json and log the override
-    row = await asyncio.to_thread(fetch_approval_package, req.final_id)
+    # Step 2 — patch final_json and update gate conditions (reuse row from Step 0)
     still_has_conflicts: bool = False
     updated_null_count: int | None = None
 
-    if row:
-        final_json       = row.get("final_json") or {}
-        normalized_id: int = row["normalized_id"]
-        url_registry_id: int = row["url_registry_id"]
+    final_json       = row.get("final_json") or {}
+    normalized_id: int = row["normalized_id"]
+    url_registry_id: int = row["url_registry_id"]
 
-        if req.resolution != "kept_run_a":
-            previous_value = _get_at_path(final_json, req.field_path)
-            coerced_value  = _coerce_to_match(previous_value, req.resolved_value)
+    if req.resolution != "kept_run_a":
+        previous_value = _get_at_path(final_json, req.field_path)
+        coerced_value  = _coerce_to_match(previous_value, req.resolved_value)
 
-            # P9-Missing: validate field_path before writing, same as override_spec_field
-            path_parts = _parse_path(req.field_path)
-            if len(path_parts) > 1:
-                parent_obj: Any = final_json
-                for part in path_parts[:-1]:
-                    if isinstance(part, int):
-                        parent_obj = parent_obj[part] if isinstance(parent_obj, list) and len(parent_obj) > part else None
-                    elif isinstance(parent_obj, dict):
-                        parent_obj = parent_obj.get(part)
-                    else:
-                        parent_obj = None
-                    if parent_obj is None:
-                        break
-                if parent_obj is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"field_path={req.field_path!r} is unreachable in final_json "
-                            f"— conflict marked resolved in DB but final_json was NOT patched. "
-                            f"Check path notation."
-                        ),
-                    )
+        updated = copy.deepcopy(final_json)
+        _set_at_path(updated, req.field_path, coerced_value)
 
-            updated = copy.deepcopy(final_json)
-            _set_at_path(updated, req.field_path, coerced_value)
+        # P8-2: log to admin_field_overrides so amber indicator appears in UI
+        override_payload = {
+            "session_id":           req.session_id,
+            "final_id":             req.final_id,
+            "url_registry_id":      url_registry_id,
+            "field_path":           req.field_path,
+            "previous_value":       previous_value,
+            "new_value":            coerced_value,
+            "override_reason":      f"Conflict resolved: {req.resolution}",
+            "resolves_conflict_id": req.conflict_id,
+        }
+        await asyncio.to_thread(insert_admin_field_override, override_payload)
+        await asyncio.to_thread(update_final_json_direct, req.final_id, updated)
 
-            # P8-2: log to admin_field_overrides so amber indicator appears in UI
-            override_payload = {
-                "session_id":           req.session_id,
-                "final_id":             req.final_id,
-                "url_registry_id":      url_registry_id,
-                "field_path":           req.field_path,
-                "previous_value":       previous_value,
-                "new_value":            coerced_value,
-                "override_reason":      f"Conflict resolved: {req.resolution}",
-                "resolves_conflict_id": req.conflict_id,
-            }
-            await asyncio.to_thread(insert_admin_field_override, override_payload)
-            await asyncio.to_thread(update_final_json_direct, req.final_id, updated)
+        # P8-4: recount nulls after the patch
+        updated_null_count = _count_nulls(updated)
 
-            # P8-4: recount nulls after the patch
-            updated_null_count = _count_nulls(updated)
+    # Re-check remaining flagged conflicts
+    remaining = await asyncio.to_thread(
+        fetch_flagged_conflicts_for_phone, normalized_id
+    )
+    still_has_conflicts = len(remaining) > 0
 
-        # Re-check remaining flagged conflicts
-        remaining = await asyncio.to_thread(
-            fetch_flagged_conflicts_for_phone, normalized_id
-        )
-        still_has_conflicts = len(remaining) > 0
-
-        gate_patch: dict = {"has_unresolved_conflicts": still_has_conflicts}
-        if updated_null_count is not None:
-            gate_patch["fields_remaining_null"] = updated_null_count
-        await asyncio.to_thread(update_gate_conditions, req.final_id, gate_patch)
+    gate_patch: dict = {"has_unresolved_conflicts": still_has_conflicts}
+    if updated_null_count is not None:
+        gate_patch["fields_remaining_null"] = updated_null_count
+    await asyncio.to_thread(update_gate_conditions, req.final_id, gate_patch)
 
     logger.info(
         "resolve-conflict: conflict_id=%d resolution=%s admin=%s has_conflicts=%s",
@@ -960,6 +969,22 @@ async def resolve_staging(
             detail=f"resolved_lookup_id is required for resolution='{req.resolution}'.",
         )
 
+    # Fix 7: Capture field_path BEFORE marking the entry resolved.
+    # fetch_pending_staging_entries only returns rows with status='pending_review'.
+    # Once resolve_staging_entry changes the status, the row disappears from that
+    # query — so we must read field_path first.
+    field_path_to_patch: str | None = None
+    if req.resolved_lookup_id is not None and req.resolution in ("inserted_new", "mapped_to_existing"):
+        pending_before = await asyncio.to_thread(
+            fetch_pending_staging_entries, req.url_registry_id
+        )
+        entry_before = next(
+            (e for e in pending_before if e.get("staging_id") == req.staging_id),
+            None,
+        )
+        if entry_before:
+            field_path_to_patch = entry_before.get("field_path")
+
     # Mark the staging entry resolved
     await asyncio.to_thread(
         resolve_staging_entry,
@@ -967,6 +992,31 @@ async def resolve_staging(
         req.resolution,
         req.resolved_lookup_id,
     )
+
+    # Back-propagate resolved FK into final_json (if we captured a field_path above)
+    if field_path_to_patch and req.resolved_lookup_id is not None:
+        pkg = await asyncio.to_thread(fetch_approval_package, req.final_id)
+        if pkg:
+            final_json = copy.deepcopy(pkg.get("final_json") or {})
+            _set_at_path(final_json, field_path_to_patch, req.resolved_lookup_id)
+            await asyncio.to_thread(update_final_json_direct, req.final_id, final_json)
+            logger.info(
+                "staging/resolve: back-propagated resolved_lookup_id=%d "
+                "into final_json field_path=%r for final_id=%d",
+                req.resolved_lookup_id, field_path_to_patch, req.final_id,
+            )
+        else:
+            logger.warning(
+                "staging/resolve: staging_id=%d resolved but fetch_approval_package "
+                "returned None for final_id=%d — final_json NOT patched.",
+                req.staging_id, req.final_id,
+            )
+    elif req.resolved_lookup_id is not None and not field_path_to_patch:
+        logger.warning(
+            "staging/resolve: staging_id=%d resolved but field_path was not found in "
+            "pending entries — final_json NOT patched.",
+            req.staging_id,
+        )
 
     # Recount pending staging entries to recalculate the gate counter
     remaining = await asyncio.to_thread(
@@ -1170,110 +1220,106 @@ async def commit_to_db(
 
 
 # ===========================================================================
-# Phase L6 — LangExtract Visualization Endpoint
-# GET /approval/visualization/{run_type}/{run_id}
+# Phase 8 — Evidence Table Endpoint
+# GET /approval/evidence-table/{final_id}
 # ===========================================================================
 
 
-@router.get("/visualization/{run_type}/{run_id}")
-async def get_lx_visualization(run_type: str, run_id: int):
+@router.get("/evidence-table/{final_id}")
+async def get_evidence_table(final_id: int):
     """
-    GET /approval/visualization/{run_type}/{run_id}
+    GET /approval/evidence-table/{final_id}
 
-    Fetches the stored JSONL for a LangExtract run and returns an HTML page
-    that visualises the annotated document (evidence highlights per extraction).
+    Returns all evidence_json entries for a phone as a structured table.
+    Each entry includes field_path, source_label, evidence_text, char_start,
+    char_end, raw_id, raw_transcript_id, and grounded flag.
 
-    run_type:  "spec"  → spec_extraction_runs.jsonl_path
-               "exp"   → experience_extraction_runs.jsonl_path
-
-    run_id:    PK of the run row (extraction_run_id or exp_run_id)
-
-    Design — generate on demand, not at storage time:
-      - JSONL is stored post-extraction by langextract_run_a / langextract_run_b.
-      - This endpoint fetches the JSONL and renders HTML via lx.io.create_html_from_jsonl.
-      - The HTML is returned as text/html, suitable for display in an <iframe>.
-      - If jsonl_path is NULL (JSONL upload failed), returns 404 with a diagnostic message.
-
-    Returns:
-        text/html — rendered annotated document
-
-    Raises:
-        HTTP 400: If run_type is not "spec" or "exp".
-        HTTP 404: If run_id not found or jsonl_path is NULL.
-        HTTP 500: On storage fetch or HTML generation failure.
+    char_start and char_end enable the admin UI click-to-highlight feature:
+    clicking a field in the left pane scrolls the right pane to char_start
+    and highlights characters char_start–char_end in the source document.
     """
-    import langextract as lx
-    import tempfile
-    import os
-    from fastapi.responses import HTMLResponse
-    from app.repositories.extraction_repository import fetch_run_jsonl_path
-    from app.services.storage_service import fetch_file_content
+    row = await asyncio.to_thread(fetch_approval_package, final_id)
+    if not row:
+        raise HTTPException(status_code=404, detail={"error": "NOT_FOUND"})
 
-    if run_type not in ("spec", "exp"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"run_type must be 'spec' or 'exp', got {run_type!r}.",
-        )
+    evidence_json = await asyncio.to_thread(fetch_evidence_json_for_final, final_id)
 
-    # Fetch jsonl_path from DB
-    try:
-        jsonl_path = await asyncio.to_thread(fetch_run_jsonl_path, run_type, run_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except Exception as exc:
-        logger.exception(
-            "get_lx_visualization: DB error for run_type=%s run_id=%d: %s",
-            run_type, run_id, exc,
-        )
-        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+    entries, ungrounded = [], []
+    for field_path, ev in (evidence_json or {}).items():
+        if ev.get("grounded"):
+            label = (
+                f"scraped (raw_id={ev['raw_id']})"
+                if ev.get("raw_id")
+                else f"transcript (raw_transcript_id={ev.get('raw_transcript_id')})"
+            )
+            entries.append({
+                "field_path":        field_path,
+                "source_type":       ev.get("source_type"),
+                "source_label":      label,
+                "evidence_text":     ev.get("evidence_text", ""),
+                "char_start":        ev.get("char_start"),
+                "char_end":          ev.get("char_end"),
+                "raw_id":            ev.get("raw_id"),
+                "raw_transcript_id": ev.get("raw_transcript_id"),
+                "grounded":          True,
+            })
+        else:
+            ungrounded.append(field_path)
 
-    if jsonl_path is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No JSONL visualization available for {run_type}_run_id={run_id}. "
-                "The JSONL upload failed at extraction time, or this run predates "
-                "the LangExtract migration. Re-run extraction to generate visualization."
-            ),
-        )
+    return {
+        "final_id":          final_id,
+        "url_registry_id":   row["url_registry_id"],
+        "entries":           entries,
+        "ungrounded_fields": ungrounded,
+        "total_fields":      len(entries) + len(ungrounded),
+        "grounded_count":    len(entries),
+        "ungrounded_count":  len(ungrounded),
+    }
 
-    # Fetch JSONL content from Supabase Storage
-    try:
-        jsonl_content: str = await fetch_file_content(jsonl_path)
-    except Exception as exc:
-        logger.exception(
-            "get_lx_visualization: storage fetch failed for path=%s: %s",
-            jsonl_path, exc,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch JSONL from storage ({jsonl_path!r}): {exc}",
-        )
 
-    # Generate HTML on demand — write JSONL to tmpfile, call lx.io.create_html_from_jsonl
-    def _render_html() -> str:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            jsonl_file = os.path.join(tmpdir, f"{run_type}_{run_id}.jsonl")
-            with open(jsonl_file, "w", encoding="utf-8") as fh:
-                fh.write(jsonl_content)
-            html_str = lx.io.create_html_from_jsonl(jsonl_file)
-            return html_str
+# ===========================================================================
+# Phase 8 — ECD Admin Endpoints
+# ===========================================================================
 
-    try:
-        html = await asyncio.to_thread(_render_html)
-    except Exception as exc:
-        logger.exception(
-            "get_lx_visualization: HTML generation failed for "
-            "run_type=%s run_id=%d jsonl_path=%s: %s",
-            run_type, run_id, jsonl_path, exc,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"HTML generation failed: {exc}",
-        )
+
+@router.post("/admin/ecd/refresh")
+async def refresh_ecd_endpoint():
+    """
+    POST /approval/admin/ecd/refresh
+
+    Forces ECD regeneration from live YAML config files.
+    Invalidates the in-process ECD string cache so the next extraction run
+    will reassemble and re-cache the ECD from the updated files.
+    Use after updating spec_template.yaml or ecd_disambiguation.yaml.
+    Does not require a server restart.
+    """
+    from app.services.ecd_generator import pre_warm_ecd, invalidate_ecd_cache, build_ecd, PHONE_TYPE_STANDARD
+
+    # Invalidate cache and reload YAML files
+    await asyncio.to_thread(invalidate_ecd_cache)
+    await asyncio.to_thread(pre_warm_ecd)
+
+    # Build a representative ECD to estimate token count
+    new_ecd = await asyncio.to_thread(build_ecd, PHONE_TYPE_STANDARD)
+    token_estimate = int(len(new_ecd.split()) * 1.33)
 
     logger.info(
-        "get_lx_visualization: served run_type=%s run_id=%d (%d chars JSONL, %d chars HTML)",
-        run_type, run_id, len(jsonl_content), len(html),
+        "admin/ecd/refresh: ECD cache rebuilt. estimated_tokens=%d chars=%d",
+        token_estimate, len(new_ecd),
     )
-    return HTMLResponse(content=html, status_code=200)
+    return {"status": "refreshed", "estimated_tokens": token_estimate}
+
+
+@router.get("/admin/ecd/preview")
+async def preview_ecd_endpoint():
+    """
+    GET /approval/admin/ecd/preview
+
+    Returns the full current ECD as plain text for a standard phone.
+    Use to debug extraction behaviour — see exactly what the model receives
+    as its extraction context guide.
+    """
+    from app.services.ecd_generator import build_ecd, PHONE_TYPE_STANDARD
+
+    ecd = await asyncio.to_thread(build_ecd, PHONE_TYPE_STANDARD)
+    return {"ecd": ecd, "char_count": len(ecd)}

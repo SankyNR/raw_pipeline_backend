@@ -105,7 +105,10 @@ ARRAY_FK_MAP: dict[str, str] = {
 
     # Camera lenses  (C4 fix: was "cameras.lenses[*].*" / "cameras.camera_features")
     "camera_lenses[*].stabilization":          "mobile_specs.lookup_stabilization_types.stabilization_type",
-    "camera_lenses[*].camera_features":        "mobile_specs.lookup_camera_features.feature_name",
+    # camera_lenses[*].camera_features removed — Change 2e: moved to top-level camera_features
+
+    # Phone-level camera features  (Change 2e: now a single shared junction, not per-lens)
+    "camera_features":                         "mobile_specs.lookup_camera_features.feature_name",
 
     # Connectivity
     "connectivity.wifi_technologies":          "mobile_specs.lookup_wifi_technologies.technology_name",
@@ -178,9 +181,9 @@ NUMERIC_PRECISION_FIELDS: set[str] = {
     "displays[*].resolution_width_px",     # C4 fix: was resolution_px_vertical
     "charging.battery_capacity",           # C4 fix: was battery_capacity_mah
     "camera_lenses[*].megapixels",         # C4 fix: was cameras.lenses[*].megapixels
-    "body.length",                         # C4 fix: was body.length_mm
-    "body.breadth",                        # C4 fix: was body.breadth_mm
-    "body.height",                         # C4 fix: was body.height_mm
+    "body.height",                         # C4 fix: was body.length_mm
+    "body.width",                          # C4 fix: was body.breadth_mm
+    "body.thickness",                      # C4 fix: was body.height_mm
     "body.weight",                         # C4 fix: was body.weight_grams
     "network.bands_5g",
     "network.bands_4g",
@@ -198,7 +201,6 @@ FIELD_SITE_HINTS: dict[str, str] = {
     "certifications.sar_head":       "tec.fptc.gov.in",
     "certifications.sar_body":       "tec.fptc.gov.in",
     "certifications.widevine_level": "gsmarena.com",
-    "charging.pd_support":           "gsmarena.com",
     "charging.charger_in_box":       "gsmarena.com",
     # chipset.npu_tops: resolved dynamically based on chipset vendor
 }
@@ -215,9 +217,120 @@ FIELD_PRIORITY_MAP: dict[str, str] = {
     "certifications.sar_body":       "high",
     "certifications.widevine_level": "high",
     "network.vo5g":                  "high",
-    "charging.pd_support":           "high",
     "charging.charger_in_box":       "high",
     "chipset.npu_tops":              "medium",
+
+    # ------------------------------------------------------------------
+    # Camera — sensor name is the only P0 camera field.
+    # All other camera sub-fields are medium or skip.
+    # [*] wildcard is required — gap_analyzer uses _generic_path() which
+    # converts concrete indices back to [*] before looking up here.
+    # ------------------------------------------------------------------
+    "camera_lenses[*].sensor_model":          "high",
+    "camera_lenses[*].aperture":              "medium",
+    "camera_lenses[*].focal_length":          "medium",
+    "camera_lenses[*].autofocus_type":        "medium",
+
+    # Camera micro-fields — unreliably sourced, low comparison value
+    "camera_lenses[*].fov":                   "skip",
+    "camera_lenses[*].sensor_type":           "skip",
+    "camera_lenses[*].is_macro_capable":      "skip",
+    "camera_lenses[*].digital_zoom_capacity": "skip",
+    "camera_lenses[*].optical_zoom_capacity": "skip",
+    "camera_lenses[*].lens_features":         "skip",
+    # camera_lenses[*].camera_features removed — Change 2e: path moved to top-level
+    "camera_features":                        "skip",  # Change 2e: phone-level, not per-lens
+
+    # Camera overview — cosmetic visual metadata, not sourced by text enrichment
+    "camera_overview.flash":                          "skip",
+    "camera_overview.front_camera_position":          "skip",
+    "camera_overview.front_camera_shape":             "skip",
+    "camera_overview.rear_camera_island_position":    "skip",
+    "camera_overview.rear_camera_island_shape":       "skip",
+
+    # ------------------------------------------------------------------
+    # Display
+    # ------------------------------------------------------------------
+    "displays[*].brightness_hbm":   "high",
+    "displays[*].brightness_peak":  "high",
+
+    # ------------------------------------------------------------------
+    # Certifications
+    # ------------------------------------------------------------------
+    "certifications.video_certifications": "high",
+    "certifications.bis_certification":    "skip",
+    "certifications.other_certifications": "skip",
+
+    # ------------------------------------------------------------------
+    # Charging
+    # ------------------------------------------------------------------
+    "charging.wireless_charging":               "high",
+    "charging.wireless_charging_power":         "high",
+    "charging.charger_technologies":            "high",
+    "charging.proprietary_charging":            "high",
+    "charging.reverse_wireless_charging":       "medium",
+    "charging.reverse_wireless_charging_power": "medium",
+    "charging.reverse_charging":                "medium",
+
+    # ------------------------------------------------------------------
+    # Network
+    # ------------------------------------------------------------------
+    "network.volte":             "high",
+    "network.sim_configuration": "high",
+    "network.vowifi":            "medium",
+
+    # Bands are always in spec sheets and extracted by Run A.
+    # If they appear as gaps (extraction failure) re-run extraction — not enrichment.
+    "network.bands_4g": "skip",
+    "network.bands_5g": "skip",
+
+    # ------------------------------------------------------------------
+    # Connectivity
+    # ------------------------------------------------------------------
+    "connectivity.usb_standard":      "high",
+    "connectivity.wifi_technologies": "medium",
+
+    # ------------------------------------------------------------------
+    # Body — form-factor-specific fields: skip at priority level.
+    # (N/A prompt labels in enrichment_orchestrator.py are the secondary guard)
+    # ------------------------------------------------------------------
+    "body.height_folded":    "skip",
+    "body.width_folded":     "skip",
+    "body.thickness_folded": "skip",
+    "body.stylus_features": "skip",  # managed by admin for known stylus phones
+    "body.has_stylus":      "high",
+
+    # ------------------------------------------------------------------
+    # AI capabilities — low comparison value for current UI scope
+    # ------------------------------------------------------------------
+    "ai_capabilities.ai_system":       "skip",
+    "ai_capabilities.processing_type": "skip",
+
+    # ------------------------------------------------------------------
+    # Extra features — too broad for reliable enrichment
+    # ------------------------------------------------------------------
+    "extra_features": "skip",
+
+    # ------------------------------------------------------------------
+    # Video capabilities — scalar free-text fields, skip enrichment
+    # (Change 2c: new group)
+    # ------------------------------------------------------------------
+    "video_capabilities.rear_video_resolutions":  "skip",
+    "video_capabilities.front_video_resolutions": "skip",
+    "video_capabilities.slow_motion":             "skip",
+
+    # ------------------------------------------------------------------
+    # Performance benchmarks — skip gap enrichment; sourced during extraction only
+    # (Change 2d: new group)
+    # ------------------------------------------------------------------
+    "performance_benchmarks.antutu_version":       "skip",
+    "performance_benchmarks.antutu_score":         "skip",
+    "performance_benchmarks.geekbench_version":    "skip",
+    "performance_benchmarks.geekbench_single_core": "skip",
+    "performance_benchmarks.geekbench_multi_core": "skip",
+    "performance_benchmarks.three_d_mark_test":    "skip",
+    "performance_benchmarks.three_d_mark_score":   "skip",
+    "performance_benchmarks.cooling_system":       "skip",
 }
 
 DEFAULT_FIELD_PRIORITY = "medium"

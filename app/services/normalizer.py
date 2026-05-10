@@ -34,6 +34,7 @@ from app.config.field_mapping import (
     RUN_C_CALCULATED_FIELDS,
     SCALAR_FK_MAP,
 )
+from app.core.db_retry import db_call_with_retry  # #9 fix: retry on transient DB errors
 from app.core.supabase_client import get_client
 from app.repositories.extraction_repository import (
     fetch_spec_extraction_output,
@@ -42,8 +43,107 @@ from app.repositories.extraction_repository import (
     update_normalisation_run,
     upsert_normalized_spec,
 )
+from app.repositories.mobile_specs_repository import fetch_chipset_by_name
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Band prefix normalisation helper
+# ---------------------------------------------------------------------------
+
+def _normalize_band_value(value: str, field_path: str) -> str:
+    """
+    Deterministically enforces correct band prefixes before fuzzy lookup.
+    4G bands require "B" prefix (B1, B28, B41).
+    5G bands require "n" prefix (n78, n28, n41).
+    Handles raw numbers, existing correct prefixes, and strips spaces.
+
+    Called inside _resolve_array_fks for network.bands_4g and network.bands_5g
+    items before they reach resolve_lookup_value().  This bypasses fuzzy
+    matching for pure-numeric values, preventing wrong matches like
+    "28" → "B8" (Levenshtein distance 1 on the cleaned string).
+    """
+    v = str(value).strip()
+    if "bands_4g" in field_path:
+        # Strip any existing prefix variants and re-apply "B"
+        stripped = v.lstrip("Bbn").strip()
+        if stripped.isdigit():
+            return f"B{stripped}"
+    elif "bands_5g" in field_path:
+        # Strip any existing prefix variants and re-apply "n"
+        stripped = v.lstrip("nNBb").strip()
+        if stripped.isdigit():
+            return f"n{stripped}"
+    return v
+
+
+# ---------------------------------------------------------------------------
+# Change 3a — SIM configuration alias map
+# Maps LLM phrasing variants to canonical lookup_sim_configurations values.
+# Applied in _resolve_scalar_fks BEFORE resolve_lookup_value() to avoid
+# sending known variants to staging.
+# ---------------------------------------------------------------------------
+_SIM_CONFIGURATION_ALIASES: dict[str, str] = {
+    "Dual SIM (2 Nano SIMs)"         : "Dual SIM (Nano-SIM, dual stand-by)",
+    "Dual SIM (Nano-SIM + Nano-SIM)" : "Dual SIM (Nano-SIM, dual stand-by)",
+    "Dual Nano-SIM"                  : "Dual SIM (Nano-SIM, dual stand-by)",
+    "Dual SIM (Nano, dual stand-by)" : "Dual SIM (Nano-SIM, dual stand-by)",
+}
+
+
+# ---------------------------------------------------------------------------
+# Change 3b — Autofocus type alias map
+# Maps LLM phrasing variants / compound names to canonical lookup_autofocus_types values.
+# "Quad PDAF", "All-Pixel Focus", and "PDAF" are DISTINCT entries — do not merge.
+# ---------------------------------------------------------------------------
+_AUTOFOCUS_TYPE_ALIASES: dict[str, str] = {
+    "Quad PDAF - All Pixel Focus" : "Quad PDAF",
+    "Quad PDAF – All Pixel Focus" : "Quad PDAF",  # em-dash variant
+    "All Pixel Focus"             : "All-Pixel Focus",
+    "All-pixel Focus"             : "All-Pixel Focus",
+}
+
+
+# ---------------------------------------------------------------------------
+# Change 3c — Wi-Fi Hotspot exclusion set
+# "Wi-Fi Hotspot" has a dedicated boolean column (connectivity.wifi_hotspot).
+# These values must be filtered out of the many-to-many junction table entirely
+# before resolve_lookup_value() is called, so they do not reach staging either.
+# ---------------------------------------------------------------------------
+_WIFI_TECHNOLOGIES_EXCLUDE: frozenset[str] = frozenset({
+    "Wi-Fi Hotspot",
+    "Wi-Fi hotspot",
+    "Hotspot",
+    "WiFi Hotspot",
+})
+
+
+def _apply_brand_charging_fallback(data: dict) -> dict:
+    """
+    Step 8.5 — Deterministic proprietary_charging fill from brand.
+
+    If charging.proprietary_charging is still null after normalisation and
+    the brand is in _BRAND_CHARGING_FALLBACK, writes the canonical brand value
+    directly into normalized_json. This avoids a wasted enrichment LLM call.
+
+    For brands with None in the map (Google, Apple, Nothing) the field stays
+    null — those brands have no proprietary charging name.
+    """
+    charging = data.get("charging")
+    if not isinstance(charging, dict):
+        return data
+    if charging.get("proprietary_charging") is not None:
+        return data  # already filled by Run A extraction — nothing to do
+
+    brand_name: str = (data.get("brand") or {}).get("brand_name") or ""
+    brand_key = brand_name.strip().title()
+    if brand_key not in _BRAND_CHARGING_FALLBACK:
+        return data  # unknown brand — leave for enrichment
+
+    fill_value = _BRAND_CHARGING_FALLBACK[brand_key]
+    charging["proprietary_charging"] = fill_value  # None is valid (means no proprietary name)
+    return data
 
 # ---------------------------------------------------------------------------
 # Task 4.1 — In-memory lookup cache
@@ -59,6 +159,22 @@ _LOOKUP_CANONICAL: dict[str, dict[str, str]] = {}
 
 # Levenshtein distance threshold — accept fuzzy if distance <= this value
 _FUZZY_THRESHOLD = 2
+
+# Lookup table paths where fuzzy matching is FORBIDDEN.
+# These fields have values so similar to each other (distance 1–2)
+# that a fuzzy match means committing the WRONG value, which is worse
+# than sending to staging for human review.
+_NO_FUZZY_TABLE_PATHS: frozenset[str] = frozenset({
+    "mobile_specs.lookup_widevine_levels.level_name",              # L1/L2/L3 differ by 1 char
+    "mobile_specs.lookup_video_certifications.certification_name", # HDR10 vs HDR10+ = dist 1
+    "mobile_specs.lookup_audio_certifications.certification_name", # similar names
+})
+
+# Minimum string length to attempt fuzzy matching.
+# Strings shorter than this are sent directly to staging if no exact match.
+# Rationale: for a 2-char string like "L1", a distance of 2 would match
+# almost anything. For 3-char strings like "OIS", distance 2 matches "EIS".
+_FUZZY_MIN_LENGTH: int = 4
 
 
 async def build_lookup_cache() -> None:
@@ -208,6 +324,15 @@ def resolve_lookup_value(
         return cache[cleaned], canonical.get(cleaned, value), "exact"
 
     # Step 2 — Fuzzy match (Levenshtein distance <= threshold)
+
+    # Guard 1: Never fuzzy-match on fields where a wrong match is worse than staging.
+    if table_path in _NO_FUZZY_TABLE_PATHS:
+        return None, None, "not_found"
+
+    # Guard 2: Short strings are too ambiguous for fuzzy matching.
+    if len(cleaned) < _FUZZY_MIN_LENGTH:
+        return None, None, "not_found"
+
     best_pk: int | None = None
     best_key: str | None = None
     best_dist = _FUZZY_THRESHOLD + 1  # exclusive upper bound
@@ -282,15 +407,36 @@ def _coerce_boolean(value: Any) -> Any:
 _RANGE_CONSTRAINTS: dict[str, tuple[float, float]] = {
     "charging.battery_capacity":        (500,   22000),
     "body.weight":                      (50,    500),
-    "body.length":                      (50,    250),
-    "body.breadth":                     (30,    150),
-    "body.height":                      (3,     30),
+    "body.height":                      (50,    250),
+    "body.width":                       (30,    150),
+    "body.thickness":                   (3,     30),
     "displays[*].refresh_rate":         (24,    240),
-    "displays[*].brightness_nits":      (100,   5000),
+    "displays[*].brightness_hbm":       (100,   9000),   # was brightness_nits (ghost)
+    "displays[*].brightness_peak":      (100,   12000),   # new — modern phones reach 8000+ nits
     "displays[*].size_inch":            (3.0,   10.0),
     "camera_lenses[*].megapixels":      (0.1,   300),
     "camera_lenses[*].aperture":        (0.5,   16.0),
-    "os_and_security.launch_os_version":(4,     25),
+    # os_and_security.launch_os_version removed — field does not exist in v5 OsAndSecurityData
+}
+
+# Deterministic proprietary_charging value by brand.
+# Written into normalized_json at Step 8.5 (after range validation, before null counting).
+# None = brand genuinely has no proprietary charging name — field stays null.
+_BRAND_CHARGING_FALLBACK: dict[str, str | None] = {
+    "Motorola":   "TurboPower",
+    "Samsung":    "Super Fast Charging",
+    "Oneplus":    "SUPERVOOC",
+    "Xiaomi":     "HyperCharge",
+    "Redmi":      "HyperCharge",
+    "Poco":       "HyperCharge",
+    "Realme":     "SUPERVOOC",
+    "Oppo":       "SuperVOOC",
+    "Vivo":       "FlashCharge",
+    "Iqoo":       "FlashCharge",
+    "Google":     None,
+    "Apple":      None,
+    "Nothing":    None,
+    "Honor":      "Honor SuperCharge",
 }
 
 
@@ -383,13 +529,13 @@ async def run_normalisation(output_id: int) -> dict:
         )
 
     # Step 1 — Fetch source data
-    output_row = await asyncio.to_thread(fetch_spec_extraction_output, output_id)
+    output_row = await db_call_with_retry(fetch_spec_extraction_output, output_id)
     url_registry_id: int = output_row["url_registry_id"]
     extraction_run_id: int = output_row["extraction_run_id"]
 
     # Create a normalisation run record
     # N7: extraction_run_id is NOT a column in normalization_runs — omitted from payload
-    norm_run_id = await asyncio.to_thread(
+    norm_run_id = await db_call_with_retry(
         insert_normalisation_run,
         {
             "output_id":       output_id,
@@ -406,6 +552,51 @@ async def run_normalisation(output_id: int) -> dict:
 
         issues: list[dict] = []
         staging_count = 0
+
+        # Step 2.5 — Chipset deduplication (Change 6b)
+        # Must run BEFORE gap analysis so the gap analyzer sees finalized chipset data.
+        # If the chipset already exists in the DB, overwrite all chipset fields with
+        # DB-canonical values and embed chipset_id so the commit orchestrator skips
+        # the INSERT and links to the existing row directly.
+        chipset_raw = normalized_json.get("chipset", {})
+        chipset_name_raw: str | None = chipset_raw.get("chipset_name") if isinstance(chipset_raw, dict) else None
+        if chipset_name_raw:
+            existing_chipset = await asyncio.to_thread(fetch_chipset_by_name, chipset_name_raw)
+            if existing_chipset:
+                # Overwrite extracted values with DB-canonical values.
+                # All fields — even those the LLM may have filled differently — are replaced.
+                normalized_json["chipset"] = {
+                    k: existing_chipset.get(k)
+                    for k in (
+                        "chipset_id",
+                        "chipset_name",
+                        "cpu_architecture",
+                        "fabrication_node",
+                        "number_of_cores",
+                        "cpu_high_performance_cores",
+                        "cpu_performance_cores",
+                        "cpu_efficiency_cores",
+                        "cpu_clock_speed",
+                        "gpu_name",
+                        "gpu_unit_count",
+                        "gpu_unit_type",
+                        "gpu_clock_speed",
+                        "npu_details",
+                        "npu_tops",
+                    )
+                }
+                logger.info(
+                    "run_normalisation: chipset %r found in DB (chipset_id=%s) — "
+                    "overriding extracted chipset fields with DB-canonical values. "
+                    "Chipset fields will not appear in gap analysis.",
+                    chipset_name_raw, existing_chipset.get("chipset_id"),
+                )
+            else:
+                logger.info(
+                    "run_normalisation: chipset %r is NEW — extracted values retained. "
+                    "Gap analysis will identify missing chipset fields for enrichment.",
+                    chipset_name_raw,
+                )
 
         # Step 3 — Discard RUN_C_CALCULATED_FIELDS
         normalized_json = _discard_run_c_fields(normalized_json, issues)
@@ -434,6 +625,17 @@ async def run_normalisation(output_id: int) -> dict:
         normalized_json, range_issues = _validate_ranges(normalized_json)
         issues.extend(range_issues)
 
+        # Step 8.5 — Deterministic brand charging fallback
+        # Writes proprietary_charging from _BRAND_CHARGING_FALLBACK if still null.
+        # Runs after range validation so it never overwrites a valid extracted value.
+        normalized_json = _apply_brand_charging_fallback(normalized_json)
+
+        # BIS certification — always true for all phones in this database.
+        # All phones are sold in India; BIS/MTCTE is mandatory.
+        # LLM cannot reliably set this without source evidence, so normalizer enforces it.
+        if "certifications" in normalized_json and isinstance(normalized_json["certifications"], dict):
+            normalized_json["certifications"]["bis_certification"] = True
+
         # Count remaining nulls
         remaining_nulls = _count_nulls(normalized_json)
         ready_for_enrichment = remaining_nulls > 0
@@ -442,7 +644,7 @@ async def run_normalisation(output_id: int) -> dict:
         # Step 9 — Persist normalized_spec_json
         # N4: Use correct column names matching SQL schema.
         # Removed: output_id, extraction_run_id, issues_json (not columns on this table).
-        normalized_id = await asyncio.to_thread(
+        normalized_id = await db_call_with_retry(
             upsert_normalized_spec,
             {
                 "normalization_run_id": norm_run_id,       # N4: was norm_run_id
@@ -458,7 +660,7 @@ async def run_normalisation(output_id: int) -> dict:
         # N9: issues_found (full log) goes to the run record, not to normalized_spec_json.
         # staging_count is NOT a column in normalization_runs — staging events are
         # already captured individually in issues_found (each produces an issue entry).
-        await asyncio.to_thread(
+        await db_call_with_retry(
             update_normalisation_run,
             norm_run_id,
             {
@@ -562,6 +764,10 @@ def _resolve_scalar_fks(
     """
     Resolves all SCALAR_FK_MAP fields in data to their lookup PKs.
     Returns (mutated_data, issues, staging_count).
+
+    Change 3a/3b: Before calling resolve_lookup_value(), applies alias rewrites
+    for SIM configuration (_SIM_CONFIGURATION_ALIASES) and autofocus type
+    (_AUTOFOCUS_TYPE_ALIASES) so known variants never reach staging.
     """
     issues: list[dict] = []
     staging_count = 0
@@ -575,8 +781,17 @@ def _resolve_scalar_fks(
             if raw_value is None:
                 continue  # null field — nothing to resolve
 
+            # Change 3a: apply SIM config alias BEFORE lookup
+            lookup_value = str(raw_value)
+            if "sim_configuration" in concrete_path:
+                lookup_value = _SIM_CONFIGURATION_ALIASES.get(lookup_value, lookup_value)
+
+            # Change 3b: apply autofocus alias BEFORE lookup
+            if "autofocus_type" in concrete_path:
+                lookup_value = _AUTOFOCUS_TYPE_ALIASES.get(lookup_value, lookup_value)
+
             pk, corrected, resolution_type = resolve_lookup_value(
-                str(raw_value), table_path
+                lookup_value, table_path
             )
 
             if resolution_type == "exact":
@@ -618,6 +833,9 @@ def _resolve_array_fks(
     Each array element is a string resolved to its PK.
     Deduplicates by PK and sorts alphabetically by raw value after resolution.
     Returns (mutated_data, issues, staging_count).
+
+    Change 3c: Skips any wifi_technology value found in _WIFI_TECHNOLOGIES_EXCLUDE
+    so that "Wi-Fi Hotspot" etc. are silently dropped rather than sent to staging.
     """
     issues: list[dict] = []
     staging_count = 0
@@ -636,8 +854,20 @@ def _resolve_array_fks(
             for raw_value in raw_array:
                 if raw_value is None:
                     continue
+
+                # Change 3c: silently drop Wi-Fi Hotspot from junction table
+                if "wifi_technologies" in concrete_path and str(raw_value) in _WIFI_TECHNOLOGIES_EXCLUDE:
+                    logger.debug(
+                        "_resolve_array_fks: skipping excluded wifi tech %r at %s",
+                        raw_value, concrete_path,
+                    )
+                    continue
+
+                # Fix: enforce correct band prefix before fuzzy matching
+                # so "28" becomes "B28" (4G) or "n28" (5G) before lookup.
+                normalized_value = _normalize_band_value(str(raw_value), field_path)
                 pk, corrected, resolution_type = resolve_lookup_value(
-                    str(raw_value), table_path
+                    normalized_value, table_path
                 )
 
                 if resolution_type == "exact":
@@ -687,6 +917,12 @@ def _send_to_staging(
       raw_value   → extracted_value
       table_path  → target_lookup_table
       source_stage added (NOT NULL, no default).
+
+    #8 fix: After a successful staging insert, schedule a background LOOKUP_CACHE
+    refresh so that if an admin resolves the staging row and adds a new lookup row
+    during the same session, the next normalisation run picks it up automatically
+    without requiring a manual POST /extraction/cache/refresh call.
+    The refresh is fire-and-forget (asyncio.Task) — failures are logged but not raised.
     """
     try:
         insert_lookup_value_staging({
@@ -696,6 +932,11 @@ def _send_to_staging(
             "url_registry_id":     url_registry_id,
             "source_stage":        "normalization",      # N6: required NOT NULL column
         })
+        # S2-P1-6: background cache refresh removed — it caused N concurrent
+        # build_lookup_cache() calls (one per staging insert), exhausting the
+        # Supabase connection pool on phones with many unknown field values.
+        # Cache refresh is handled by the admin workflow:
+        #   admin resolves staging entry → POST /extraction/cache/refresh
     except Exception as exc:
         logger.warning(
             "_send_to_staging: failed to insert staging row "

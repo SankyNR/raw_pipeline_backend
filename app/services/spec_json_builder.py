@@ -1,49 +1,53 @@
 """
-Phase L3 â€” spec_json_builder.py
+Phase 3 — spec_json_builder.py (v5 Rewrite)
 
-Converts LangExtract's flat Extraction list into the nested partial_json
-and evidence_json structures expected by the extraction pipeline.
+Converts the v5 Gemini JSON output dict into the nested partial_json and
+evidence_json structures expected by the extraction pipeline.
 
-This module replaces the role of evidence_utils.split_extraction_response()
-for LangExtract-sourced data. It does NOT replace evidence_utils.py itself â€”
-that file remains until Phase L7 for the legacy orchestrator path.
+REWRITE NOTES (v4 → v5)
+------------------------
+v4 operated on list[lx.data.Extraction] objects produced by LangExtract. Each
+object carried .char_interval, .extraction_class, .attributes, and .extraction_text.
+Source attribution was computed by mapping char_interval.start_pos against
+pre-built source_section_offsets ranges (_get_source_for_char_position).
 
-DESIGN (Section 9 of langextract_migration_v4.md)
---------------------------------------------------
+v5 operates on the raw dict output from call_gemini_json(), which already matches
+RunAExtractionSchema. Each non-null scalar field is wrapped:
+    {"value": X, "_source": {"raw_id": N, "evidence_text": "..."}}
+    {"value": X, "_source": {"raw_transcript_id": N, "evidence_text": "..."}}
 
-Input:
-  extractions          : list[lx.data.Extraction]  â€” flat list from lx.extract()
-  source_text          : str                       â€” the full merged input text
-  raw_source_ids       : list[int]                 â€” all raw_scraped_data.raw_id values
-  raw_transcript_id    : int | None
-  source_section_offsets: dict[str, tuple[int,int]] â€” {"site_name": (start, end), ...}
-                           Maps each source's char range in the merged string.
-                           Used to attribute char_interval positions to a raw_id or transcript.
+Junction table arrays (display_features, bands_5g, etc.) and structural fields
+(display_type, display_position, lens_type, is_base_variant) are plain values
+with no _source wrapper.
 
-Output:
-  partial_json   : dict  â€” nested spec JSON matching spec_template.yaml structure
-  evidence_json  : dict  â€” {field_path: {evidence_text, source_type, raw_id, grounded}, ...}
+Two-layer evidence construction:
+  Layer 1 — parse raw_id/raw_transcript_id + evidence_text from inline _source tags
+  Layer 2 — locate evidence_text in assembled_source_string via str.find() to
+             compute char_start/char_end for admin UI click-to-highlight
 
-Merge algorithm (Section 9.4):
-  1. Sort extractions by char_interval.start_pos ascending (None â†’ last).
-     This ensures OEM content (chars 0â€“12k) always wins over GSMArena on conflicts.
-  2. Single-entity sections: first-seen-wins per attribute key.
-  3. Indexed array sections (variant, display, camera_lens): group by index attribute,
-     first-seen-wins per (index, attribute key).
-  4. extra_feature: append-all, deduplicate by feature_name value.
-  5. in_the_box_item: append-all structured objects, deduplicate by item_name.
+Removed from v4:
+  - All lx.data.Extraction references
+  - .char_interval, .extraction_class, .attributes, .extraction_text
+  - _get_source_for_char_position()
+  - source_section_offsets parameter
+  - raw_source_ids_by_site parameter
+  - _build_source_section_offsets() (belonged to langextract_run_a.py)
 
-char_interval safety (Section 9.3):
-  If char_interval is None (extraction ungrounded), the field is still included in
-  partial_json but receives no evidence_json entry. A warning is logged.
-  Caller sees "grounded": false for these fields in the admin UI (greyed-out hover).
-
-Array completeness monitor (Section 9.5):
-  Heuristic minimums logged as warnings after build, never blocking.
+Retained from v4 (logic only, reimplemented):
+  - Direct assignment for single-entity sections (Gemini guarantees a single JSON object per run)
+  - Index-grouped assembly for variants[], displays[], camera_lenses[]
+  - Append-all + dedup for extra_features[] and in_the_box[]
+  - _strip_run_c_fields_from_partial()
+  - _check_array_completeness()
+  - _get_at_path()
+  - _ARRAY_MINIMUMS
 """
 
+from __future__ import annotations
+
 import logging
-from collections import defaultdict
+import re
+from typing import Any
 
 from app.config.field_mapping import RUN_C_CALCULATED_FIELDS
 
@@ -51,58 +55,50 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Section 9.1 â€” extraction_class â†’ schema section mapping
+# Structural fields — plain values, no _source tag, no evidence entry
 # ---------------------------------------------------------------------------
 
-# Single-entity sections: one dict merged from all extractions of this class.
-SINGLE_ENTITY_CLASSES: dict[str, str] = {
-    "brand":             "brand",
-    "phone_identity":    "phone_identity",
-    "chipset":           "chipset",
-    "body":              "body",
-    "charging":          "charging",
-    "audio":             "audio",
-    "sensors":           "sensors",
-    "connectivity":      "connectivity",
-    "network":           "network",
-    "camera_overview":   "camera_overview",
-    "os_and_security":   "os_and_security",
-    "certifications":    "certifications",
-    "ai_capabilities":   "ai_capabilities",
-    "video_capabilities": "video_capabilities",
-}
-
-# Indexed array sections: group by numeric index attribute, produce a sorted list.
-INDEXED_ARRAY_CLASSES: dict[str, tuple[str, str]] = {
-    # extraction_class -> (schema_key, index_attribute_name)
-    "variant":     ("variants",      "variant_index"),
-    "display":     ("displays",      "display_index"),
-    "camera_lens": ("camera_lenses", "lens_index"),
-}
-
+_STRUCTURAL_FIELDS: frozenset[str] = frozenset({
+    "display_type",
+    "display_position",
+    "lens_type",
+    "is_base_variant",
+})
 
 # ---------------------------------------------------------------------------
-# Section 9.5 â€” Array completeness monitor thresholds
+# Section 9.5 — Array completeness monitor thresholds (unchanged from v4)
 # ---------------------------------------------------------------------------
 
 _ARRAY_MINIMUMS: dict[str, int] = {
-    "network.bands_4g":             6,   # typical flagship: 18â€“22
-    "network.bands_5g":             4,   # typical flagship: 10â€“17
-    "displays[0].display_features": 2,   # flagship: usually â‰¥ 6
-    "camera_lenses":                1,   # flag total absence only (single-lens phones are valid)
-    "audio.audio_codecs":           3,   # basic flag for total absence
+    "network.bands_4g":             6,   # typical flagship: 18–22
+    "network.bands_5g":             4,   # typical flagship: 10–17
+    "displays[0].display_features": 2,   # flagship: usually >= 6
+    "camera_lenses":                1,   # flag total absence only
 }
 
 
-def _get_at_path(obj: dict, path: str):
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_text(text: str) -> str:
+    """
+    Collapses all whitespace sequences to a single space and strips ends.
+    Applied to both the assembled_source_string search target and the
+    evidence_text before str.find() to handle multi-line content.
+    """
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _get_at_path(obj: dict, path: str) -> Any:
     """
     Reads a simple dotted or bracket path from a nested dict.
     Supports: "network.bands_4g", "displays[0].display_features", "camera_lenses".
     Returns None if the path does not exist.
+    (Unchanged from v4.)
     """
     try:
         if "[" in path:
-            # e.g. "displays[0].display_features"
             bracket_start = path.index("[")
             bracket_end = path.index("]")
             parent_key = path[:bracket_start]
@@ -128,6 +124,7 @@ def _check_array_completeness(partial_json: dict, url_registry_id: int | None) -
     """
     Logs warnings if extracted arrays fall below heuristic minimums.
     Does NOT modify partial_json. Never blocks the pipeline.
+    (Unchanged from v4.)
     """
     for path, min_len in _ARRAY_MINIMUMS.items():
         value = _get_at_path(partial_json, path)
@@ -140,93 +137,70 @@ def _check_array_completeness(partial_json: dict, url_registry_id: int | None) -
             )
 
 
-# ---------------------------------------------------------------------------
-# Section 9.3 â€” char_interval â†’ evidence attribution
-# ---------------------------------------------------------------------------
+# Junction arrays that are high-risk for hallucination from training data.
+# For these fields, at least one value should appear in the source text.
+_HIGH_RISK_JUNCTION_ARRAYS: dict[str, str] = {
+    "audio.audio_codecs":               "audio",
+    "connectivity.wifi_technologies":   "connectivity",
+    "sensors.other_sensors":            "sensors",
+}
 
-def _get_source_for_char_position(
-    start_pos: int,
-    source_section_offsets: dict[str, tuple[int, int]],
-    raw_source_ids_by_site: dict[str, int],
-    raw_transcript_id: int | None,
-) -> tuple[str, int | None]:
+
+def _check_junction_array_grounding(
+    partial_json: dict,
+    assembled_source_string: str,
+    url_registry_id: int | None,
+) -> None:
     """
-    Resolves a char_interval.start_pos to (source_type, source_id).
+    For high-risk junction arrays, warns if none of the extracted values
+    appear anywhere in the assembled source string.
 
-    source_type: "scraped" | "transcript"
-    source_id:   raw_id (int) for scraped, raw_transcript_id for transcript, None if unknown.
-
-    Falls back to the first raw_source_id if no offset range matches.
+    A junction array where zero values appear in the source is a strong
+    signal that the model hallucinated the list from training knowledge.
+    This does not block the pipeline — it surfaces the problem for review.
     """
-    for site_name, (start, end) in source_section_offsets.items():
-        if start <= start_pos <= end:
-            if site_name == "transcript":
-                return "transcript", raw_transcript_id
-            raw_id = raw_source_ids_by_site.get(site_name)
-            return "scraped", raw_id
+    if not assembled_source_string:
+        return
 
-    # Fallback â€” position not in any known range (shouldn't happen in normal operation)
-    logger.warning(
-        "_get_source_for_char_position: start_pos=%d not in any offset range %s. "
-        "Falling back to first available raw source.",
-        start_pos, list(source_section_offsets.keys()),
-    )
-    if raw_source_ids_by_site:
-        first_id = next(iter(raw_source_ids_by_site.values()))
-        return "scraped", first_id
-    return "scraped", None
+    source_lower = assembled_source_string.lower()
 
+    for field_path, _section_key in _HIGH_RISK_JUNCTION_ARRAYS.items():
+        # Navigate to the value
+        parts = field_path.split(".")
+        obj = partial_json
+        for part in parts:
+            if not isinstance(obj, dict):
+                obj = None
+                break
+            obj = obj.get(part)
 
-def _build_evidence_entry(
-    extraction,
-    source_section_offsets: dict[str, tuple[int, int]],
-    raw_source_ids_by_site: dict[str, int],
-    raw_transcript_id: int | None,
-) -> dict | None:
-    """
-    Builds one evidence dict for a single extraction, or returns None if ungrounded.
+        if not isinstance(obj, list) or not obj:
+            continue  # empty or missing — nothing to check
 
-    Ungrounded (char_interval=None) â†’ field is in partial_json but NOT in evidence_json.
-    The admin UI renders these as greyed-out hover entries (existing behaviour, no crash).
-    """
-    if extraction.char_interval is None:
-        logger.warning(
-            "Ungrounded extraction: class=%r text=%r â€” char_interval is None. "
-            "Field included in partial_json but excluded from evidence_json.",
-            extraction.extraction_class,
-            extraction.extraction_text[:60],
+        # Check if at least one value appears in the source
+        found_any = any(
+            isinstance(v, str) and v.lower() in source_lower
+            for v in obj
         )
-        return None
 
-    start_pos = extraction.char_interval.start_pos
-    source_type, source_id = _get_source_for_char_position(
-        start_pos,
-        source_section_offsets,
-        raw_source_ids_by_site,
-        raw_transcript_id,
-    )
+        if not found_any:
+            logger.warning(
+                "Junction array grounding check: NONE of the %d values in "
+                "'%s' were found in the assembled source string. "
+                "This strongly suggests hallucination from training data. "
+                "url_registry_id=%s. Values: %s",
+                len(obj), field_path, url_registry_id,
+                obj[:5],  # show first 5 items only
+            )
 
-    return {
-        "evidence_text":       extraction.extraction_text,
-        "source_type":         source_type,
-        "raw_id":              source_id if source_type == "scraped" else None,
-        "raw_transcript_id":   source_id if source_type == "transcript" else None,
-        "grounded":            True,
-    }
-
-
-# ---------------------------------------------------------------------------
-# RUN_C field path stripper (preserves path-awareness from extraction_orchestrator.py)
-# ---------------------------------------------------------------------------
 
 def _strip_run_c_fields_from_partial(partial_json: dict) -> dict:
     """
-    Removes any RUN_C_CALCULATED_FIELDS that the model may have sneaked into
-    the output. Uses path-aware traversal matching extraction_orchestrator.py A9 fix.
-
-    RUN_C_CALCULATED_FIELDS paths:
-        "displays[*].ppi"                      â†’ remove "ppi" from each item in displays[]
-        "camera_lenses[*].sensor_size_decimal" â†’ remove from each item in camera_lenses[]
+    Removes any RUN_C_CALCULATED_FIELDS the model may have included.
+    Paths:
+        "displays[*].ppi"                      → remove from each displays item
+        "camera_lenses[*].sensor_size_decimal" → remove from each camera_lenses item
+    (Unchanged from v4.)
     """
     for path in RUN_C_CALCULATED_FIELDS:
         if "[*]" in path:
@@ -240,210 +214,515 @@ def _strip_run_c_fields_from_partial(partial_json: dict) -> dict:
         else:
             leaf_key = path.rsplit(".", 1)[-1]
             partial_json.pop(leaf_key, None)
-
     return partial_json
+
+
+# ---------------------------------------------------------------------------
+# v5 core helpers — two-layer evidence extraction
+# ---------------------------------------------------------------------------
+
+def _extract_value_and_source(field_value: Any) -> tuple[Any, dict | None]:
+    """
+    If field_value is {"value": X, "_source": {...}}, extract both.
+    Otherwise treat the whole value as the plain value (list, scalar, None).
+
+    Returns:
+        (actual_value, source_dict | None)
+
+    source_dict examples:
+        {"raw_id": 15, "evidence_text": "..."}
+        {"raw_transcript_id": 7, "evidence_text": "..."}
+    """
+    if isinstance(field_value, dict) and "value" in field_value:
+        return field_value["value"], field_value.get("_source")
+    return field_value, None
+
+
+def _build_evidence_entry(
+    source_dict: dict | None,
+    assembled_source_string: str,
+) -> dict | None:
+    """
+    Builds the final evidence_json entry including char offsets.
+
+    Layer 1: parse raw_id/raw_transcript_id + evidence_text from source_dict.
+    Layer 2: locate evidence_text in assembled_source_string via str.find().
+
+    Normalization: before matching, both strings are normalized via
+    _normalize_text() to handle multi-line source content. If normalized match 
+    succeeds, offsets are NOT set — they cannot be reliably mapped back to 
+    original string positions. Tooltip works; click-to-highlight disabled gracefully.
+    If str.find() returns -1 (model paraphrased), char_start and char_end are
+    None. Hover tooltip still works; click-to-highlight disabled gracefully.
+
+    Returns None if source_dict is None (ungrounded field).
+    """
+    if source_dict is None:
+        return None
+
+    evidence_text: str | None = source_dict.get("evidence_text")
+    char_start: int | None = None
+    char_end: int | None = None
+
+    if evidence_text and assembled_source_string:
+        # Attempt 1: exact match
+        idx = assembled_source_string.find(evidence_text)
+        if idx != -1:
+            char_start = idx
+            char_end = idx + len(evidence_text)
+        else:
+            # Attempt 2: normalized match
+            norm_source = _normalize_text(assembled_source_string)
+            norm_evidence = _normalize_text(evidence_text)
+            idx_norm = norm_source.find(norm_evidence)
+
+            if idx_norm != -1:
+                # Normalized match confirms extraction is correct but offsets
+                # cannot be reliably mapped back to original string positions.
+                # Do NOT assign char_start / char_end.
+                logger.debug(
+                    "_build_evidence_entry: normalized match succeeded for "
+                    "evidence_text=%r. Offsets not set to avoid incorrect highlighting.",
+                    evidence_text[:80],
+                )
+            else:
+                logger.warning(
+                    "_build_evidence_entry: str.find() returned -1 for "
+                    "evidence_text=%r (both exact and normalized). "
+                    "Model may have paraphrased. char_start/char_end set to None.",
+                    evidence_text[:80] if evidence_text else "",
+                )
+
+    raw_id = source_dict.get("raw_id")
+    raw_transcript_id = source_dict.get("raw_transcript_id")
+
+    # Guard: both null means the model emitted _source without a valid source reference
+    if raw_id is None and raw_transcript_id is None:
+        logger.warning(
+            "_build_evidence_entry: _source has both raw_id=null and "
+            "raw_transcript_id=null for evidence_text=%r. Skipping evidence entry.",
+            (source_dict.get("evidence_text") or "")[:80],
+        )
+        return None
+
+    if raw_id is not None:
+        return {
+            "evidence_text":     evidence_text,
+            "char_start":        char_start,
+            "char_end":          char_end,
+            "source_type":       "scraped",
+            "raw_id":            raw_id,
+            "raw_transcript_id": None,
+            "grounded":          True,
+        }
+    if raw_transcript_id is not None:
+        return {
+            "evidence_text":     evidence_text,
+            "char_start":        char_start,
+            "char_end":          char_end,
+            "source_type":       "transcript",
+            "raw_id":            None,
+            "raw_transcript_id": raw_transcript_id,
+            "grounded":          True,
+        }
+
+    # source_dict exists but has neither key — treat as ungrounded
+    logger.warning(
+        "_build_evidence_entry: source_dict has neither 'raw_id' nor "
+        "'raw_transcript_id': %r. Treating as ungrounded.",
+        source_dict,
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Section walkers
+# ---------------------------------------------------------------------------
+
+def _walk_section(
+    section_dict: dict | None,
+    section_key: str,
+    assembled_source_string: str,
+    partial_json: dict,
+    evidence_json: dict,
+) -> None:
+    """
+    Walks a single-entity section dict (e.g. chipset, body, charging).
+
+    For each leaf field:
+      - Calls _extract_value_and_source() to split value from _source.
+      - Plain list values (junction arrays) are written directly; no evidence entry.
+      - Attributed scalar values produce an evidence entry at "section_key.field_key".
+      - Structural fields (display_type etc.) are written as plain values; no evidence.
+
+    Writes results into partial_json[section_key] and evidence_json.
+    """
+    if section_dict is None or not isinstance(section_dict, dict):
+        partial_json[section_key] = {}
+        return
+
+    section_out: dict = {}
+
+    for field_key, field_value in section_dict.items():
+        # Structural fields — plain value, no evidence
+        if field_key in _STRUCTURAL_FIELDS:
+            section_out[field_key] = field_value
+            continue
+
+        value, source_dict = _extract_value_and_source(field_value)
+
+        # Junction arrays are plain lists — write directly, no evidence
+        if isinstance(value, list):
+            section_out[field_key] = value
+            continue
+
+        section_out[field_key] = value
+
+        if value is not None and source_dict is not None:
+            ev = _build_evidence_entry(source_dict, assembled_source_string)
+            if ev is not None:
+                field_path = f"{section_key}.{field_key}"
+                evidence_json[field_path] = ev
+
+    partial_json[section_key] = section_out
+
+
+def _walk_array_section(
+    array_list: list | None,
+    schema_key: str,
+    assembled_source_string: str,
+    partial_json: dict,
+    evidence_json: dict,
+) -> None:
+    """
+    Walks an indexed array section (variants[], displays[], camera_lenses[]).
+
+    For each item at index idx:
+      - Structural fields → plain value, no evidence.
+      - Junction array fields → plain list, no evidence.
+      - Attributed scalar fields → evidence entry at "schema_key[idx].field_key".
+
+    Writes results into partial_json[schema_key] and evidence_json.
+    """
+    if not array_list or not isinstance(array_list, list):
+        partial_json[schema_key] = []
+        return
+
+    items_out: list[dict] = []
+
+    for idx, item in enumerate(array_list):
+        if not isinstance(item, dict):
+            continue
+
+        item_out: dict = {}
+
+        for field_key, field_value in item.items():
+            # Structural fields — plain value, no evidence
+            if field_key in _STRUCTURAL_FIELDS:
+                item_out[field_key] = field_value
+                continue
+
+            value, source_dict = _extract_value_and_source(field_value)
+
+            # Junction arrays are plain lists — write directly, no evidence
+            if isinstance(value, list):
+                item_out[field_key] = value
+                continue
+
+            item_out[field_key] = value
+
+            if value is not None and source_dict is not None:
+                ev = _build_evidence_entry(source_dict, assembled_source_string)
+                if ev is not None:
+                    field_path = f"{schema_key}[{idx}].{field_key}"
+                    evidence_json[field_path] = ev
+
+        items_out.append(item_out)
+
+    partial_json[schema_key] = items_out
 
 
 # ---------------------------------------------------------------------------
 # Main builder
 # ---------------------------------------------------------------------------
 
+#: Single-entity top-level section keys in the Gemini output dict.
+_SINGLE_ENTITY_SECTIONS: tuple[str, ...] = (
+    "brand",
+    "phone_identity",
+    "chipset",
+    "body",
+    "charging",
+    "audio",
+    "sensors",
+    "connectivity",
+    "network",
+    "camera_overview",
+    "os_and_security",
+    "certifications",
+    "ai_capabilities",
+    "video_capabilities",
+    "performance_benchmarks",
+)
+
+#: Indexed array section keys in the Gemini output dict.
+_INDEXED_ARRAY_SECTIONS: tuple[str, ...] = (
+    "variants",
+    "displays",
+    "camera_lenses",
+)
+
+
 def build_spec_json(
-    extractions: list,
-    source_text: str,
+    raw_output: dict,
     raw_source_ids: list[int],
-    raw_transcript_id: int | None,
-    source_section_offsets: dict[str, tuple[int, int]],
-    raw_source_ids_by_site: dict[str, int],
+    raw_transcript_ids: list[int],
+    assembled_source_string: str,
     url_registry_id: int | None = None,
 ) -> tuple[dict, dict]:
     """
-    Converts LangExtract's flat Extraction list â†’ nested partial_json + evidence_json.
+    Converts the v5 Gemini JSON output dict → nested partial_json + evidence_json.
 
     Args:
-        extractions:              List of lx.data.Extraction objects from lx.extract().
-        source_text:              The full merged input string passed to lx.extract().
-                                  Used for reference only (not re-parsed here).
-        raw_source_ids:           All raw_scraped_data.raw_id values that were included.
-        raw_transcript_id:        youtube_raw_transcript_data.raw_transcript_id, or None.
-        source_section_offsets:   Maps each site_name â†’ (start_char, end_char) range
-                                  in the merged source_text. Built by
-                                  _build_source_section_offsets() in langextract_run_a.
-                                  Example:
-                                    {
-                                      "vivo_official":  (0, 6500),
-                                      "gsmarena":       (6501, 13000),
-                                      "transcript":     (13001, 25000),
-                                    }
-        raw_source_ids_by_site:   Maps each site_name â†’ raw_id (from file_map returned
-                                  by assemble_run_a_input). Used for evidence attribution.
-                                  Example: {"vivo_official": 42, "gsmarena": 43,
-                                            "transcript": 7}
-        url_registry_id:          Optional â€” used only for array completeness warning logs.
+        raw_output:              Raw dict from call_gemini_json() matching
+                                 RunAExtractionSchema. Already Pydantic-validated
+                                 before this function is called.
+        raw_source_ids:          All raw_scraped_data.raw_id values included in
+                                 the assembled source. Used for audit/logging only;
+                                 attribution comes from inline _source tags.
+        raw_transcript_ids:      All raw_transcript_id values included in the run
+                                 (up to 3). Used for audit/logging only.
+        assembled_source_string: The full assembled source string passed to
+                                 call_gemini_json(). Required for str.find()
+                                 char offset computation.
+        url_registry_id:         Optional — used only for warning log messages.
 
     Returns:
-        partial_json : Nested spec JSON dict matching spec_template.yaml shape.
-                       Array fields (variants, displays, camera_lenses) are sorted
-                       by their index attribute. Run C calculated fields are stripped.
-        evidence_json: {field_path: evidence_entry} where evidence_entry contains
-                       evidence_text, source_type, raw_id, grounded.
-                       Ungrounded extractions (char_interval=None) are excluded.
+        partial_json:   Nested spec JSON dict matching spec_template.yaml shape.
+                        All _source tags are stripped. Run C calculated fields
+                        (ppi, sensor_size_decimal) are stripped.
+        evidence_json:  {field_path: evidence_entry} where evidence_entry contains:
+                        {evidence_text, char_start, char_end, source_type,
+                         raw_id, raw_transcript_id, grounded}.
+                        Ungrounded fields (no _source) are absent from this dict.
 
-    Notes:
-        - Merge is first-seen-wins (by char_interval.start_pos, ascending).
-          OEM chars 0â€“N always beat GSMArena chars N+1â€“M for the same field.
-        - Extractions with char_interval=None sort LAST (lowest priority).
-        - extra_feature and in_the_box_item use append-all with deduplication.
+    Raises:
+        Nothing — all errors are logged as warnings and the builder returns what
+        it can. The pipeline never crashes on extraction quality issues.
     """
     # -------------------------------------------------------------------------
-    # Step 1 â€” Sort extractions by char_interval.start_pos (None â†’ last)
-    # Section 9.2: OEM chars 0â€“N win over GSMArena N+1â€“M for the same field.
+    # Guard: empty output
     # -------------------------------------------------------------------------
-    sorted_extractions = sorted(
-        extractions,
-        key=lambda e: (
-            e.char_interval.start_pos if e.char_interval is not None else float("inf")
-        ),
-    )
-
-    # Monitor ungrounded count
-    ungrounded_count = sum(1 for e in sorted_extractions if e.char_interval is None)
-    if ungrounded_count > 0:
-        ungrounded_pct = (ungrounded_count / max(len(sorted_extractions), 1)) * 100
+    if not raw_output:
         logger.warning(
-            "build_spec_json: %d/%d extractions ungrounded (char_interval=None, %.0f%%). "
-            "Review example quality if > 20%%.",
-            ungrounded_count, len(sorted_extractions), ungrounded_pct,
+            "build_spec_json: url_registry_id=%s — raw_output is empty. "
+            "This is likely a Gemini call failure or empty JSON response. "
+            "Returning empty dicts.",
+            url_registry_id,
         )
+        return {}, {}
 
-    # -------------------------------------------------------------------------
-    # Step 2 â€” Group by extraction_class
-    # -------------------------------------------------------------------------
-    grouped: dict[str, list] = defaultdict(list)
-    for e in sorted_extractions:
-        grouped[e.extraction_class].append(e)
-
-    # -------------------------------------------------------------------------
-    # Step 3a â€” Single-entity sections (first-seen-wins per attribute key)
-    # Section 9.4 Step 2
-    # -------------------------------------------------------------------------
     partial_json: dict = {}
     evidence_json: dict = {}
 
-    for cls, schema_key in SINGLE_ENTITY_CLASSES.items():
-        merged_attrs: dict = {}
-        first_evidence: dict[str, dict | None] = {}  # attr_key â†’ evidence entry
-
-        for e in grouped.get(cls, []):
-            ev = _build_evidence_entry(
-                e, source_section_offsets, raw_source_ids_by_site, raw_transcript_id
-            )
-            for attr_key, attr_val in e.attributes.items():
-                if attr_key not in merged_attrs:
-                    merged_attrs[attr_key] = attr_val
-                    first_evidence[attr_key] = ev
-
-        partial_json[schema_key] = merged_attrs if merged_attrs else {}
-
-        # Build evidence_json entries for this section
-        for attr_key, ev in first_evidence.items():
-            if ev is not None:
-                field_path = f"{schema_key}.{attr_key}"
-                evidence_json[field_path] = ev
+    # -------------------------------------------------------------------------
+    # Step 1 — Single-entity sections
+    # -------------------------------------------------------------------------
+    for section_key in _SINGLE_ENTITY_SECTIONS:
+        _walk_section(
+            section_dict=raw_output.get(section_key),
+            section_key=section_key,
+            assembled_source_string=assembled_source_string,
+            partial_json=partial_json,
+            evidence_json=evidence_json,
+        )
 
     # -------------------------------------------------------------------------
-    # Step 3b â€” Indexed array sections (group by index attribute, first-seen-wins)
-    # Section 9.4 Step 3
+    # Step 2 — Indexed array sections
     # -------------------------------------------------------------------------
-    for cls, (schema_key, index_attr) in INDEXED_ARRAY_CLASSES.items():
-        by_index: dict[int, dict] = defaultdict(dict)
-        by_index_evidence: dict[int, dict[str, dict | None]] = defaultdict(dict)
-
-        for e in grouped.get(cls, []):
-            idx = e.attributes.get(index_attr, 0)
-            ev = _build_evidence_entry(
-                e, source_section_offsets, raw_source_ids_by_site, raw_transcript_id
-            )
-            for attr_key, attr_val in e.attributes.items():
-                if attr_key == index_attr:
-                    continue  # Don't store the index key itself in the object
-                if attr_key not in by_index[idx]:
-                    by_index[idx][attr_key] = attr_val
-                    by_index_evidence[idx][attr_key] = ev
-
-        # Sort by index to produce ordered list
-        sorted_indices = sorted(by_index.keys())
-        partial_json[schema_key] = [by_index[i] for i in sorted_indices]
-
-        # Build evidence_json
-        for idx in sorted_indices:
-            for attr_key, ev in by_index_evidence[idx].items():
-                if ev is not None:
-                    field_path = f"{schema_key}[{idx}].{attr_key}"
-                    evidence_json[field_path] = ev
+    for schema_key in _INDEXED_ARRAY_SECTIONS:
+        _walk_array_section(
+            array_list=raw_output.get(schema_key),
+            schema_key=schema_key,
+            assembled_source_string=assembled_source_string,
+            partial_json=partial_json,
+            evidence_json=evidence_json,
+        )
 
     # -------------------------------------------------------------------------
-    # Step 3c â€” extra_feature: append-all, deduplicate by feature_name value
-    # Section 9.4 Step 3b (NEW v4)
+    # Step 3 — extra_features[] — plain list[str], no evidence entries
+    # Junction array — written directly with deduplication.
     # -------------------------------------------------------------------------
-    extra_features: list[str] = []
-    seen_features: set[str] = set()
-
-    for e in grouped.get("extra_feature", []):
-        val = e.attributes.get("feature_name") or e.attributes.get("value")
-        if val and val not in seen_features:
-            seen_features.add(val)
-            extra_features.append(val)
-            ev = _build_evidence_entry(
-                e, source_section_offsets, raw_source_ids_by_site, raw_transcript_id
-            )
-            if ev is not None:
-                field_path = f"extra_features[{len(extra_features) - 1}]"
-                evidence_json[field_path] = ev
-
-    partial_json["extra_features"] = extra_features
+    raw_extra = raw_output.get("extra_features")
+    if isinstance(raw_extra, list):
+        seen_features: set[str] = set()
+        deduped_features: list[str] = []
+        for item in raw_extra:
+            if isinstance(item, str) and item not in seen_features:
+                seen_features.add(item)
+                deduped_features.append(item)
+        partial_json["extra_features"] = deduped_features
+    else:
+        partial_json["extra_features"] = []
 
     # -------------------------------------------------------------------------
-    # Step 3d â€” in_the_box_item: append-all structured objects, dedupe by item_name
-    # Section 9.4 Step 3c (NEW v4)
-    # CRITICAL: structured objects {item_name, item_specification, quantity} NOT plain strings
+    # Step 3b — camera_features[] — top-level plain list[str], no evidence entries.
+    # Change 7: camera_features has moved from camera_lenses[*].camera_features
+    # to a single root-level junction array (same pattern as extra_features).
     # -------------------------------------------------------------------------
+    raw_cam_feats = raw_output.get("camera_features")
+    if isinstance(raw_cam_feats, list):
+        seen_cam: set[str] = set()
+        deduped_cam: list[str] = []
+        for item in raw_cam_feats:
+            if isinstance(item, str) and item not in seen_cam:
+                seen_cam.add(item)
+                deduped_cam.append(item)
+        partial_json["camera_features"] = deduped_cam
+    else:
+        partial_json["camera_features"] = []
+
+    # -------------------------------------------------------------------------
+    # Step 4 — in_the_box[] — structured objects with attribution
+    # Dedup by item_name. item_name and item_specification may be attributed;
+    # quantity is always a plain int.
+    # -------------------------------------------------------------------------
+    raw_itb = raw_output.get("in_the_box")
     in_the_box: list[dict] = []
     seen_item_names: set[str] = set()
 
-    for e in grouped.get("in_the_box_item", []):
-        item_name = e.attributes.get("item_name")
-        if item_name and item_name not in seen_item_names:
-            seen_item_names.add(item_name)
+    if isinstance(raw_itb, list):
+        for item in raw_itb:
+            if not isinstance(item, dict):
+                continue
+
+            # item_name
+            item_name_field = item.get("item_name")
+            item_name_value, item_name_source = _extract_value_and_source(item_name_field)
+
+            if not item_name_value or item_name_value in seen_item_names:
+                continue
+            seen_item_names.add(item_name_value)
+
+            # item_specification
+            item_spec_field = item.get("item_specification")
+            item_spec_value, item_spec_source = _extract_value_and_source(item_spec_field)
+
+            # quantity — plain int, no _source
+            quantity = item.get("quantity", 1)
+            if not isinstance(quantity, int):
+                quantity = 1
+
+            idx = len(in_the_box)
             in_the_box.append({
-                "item_name":          item_name,
-                "item_specification": e.attributes.get("item_specification"),
-                "quantity":           e.attributes.get("quantity", 1),
+                "item_name":          item_name_value,
+                "item_specification": item_spec_value,
+                "quantity":           quantity,
             })
-            ev = _build_evidence_entry(
-                e, source_section_offsets, raw_source_ids_by_site, raw_transcript_id
-            )
-            if ev is not None:
-                field_path = f"in_the_box[{len(in_the_box) - 1}].item_name"
-                evidence_json[field_path] = ev
+
+            # Evidence for item_name
+            if item_name_source is not None:
+                ev = _build_evidence_entry(item_name_source, assembled_source_string)
+                if ev is not None:
+                    evidence_json[f"in_the_box[{idx}].item_name"] = ev
+
+            # Evidence for item_specification
+            if item_spec_value is not None and item_spec_source is not None:
+                ev = _build_evidence_entry(item_spec_source, assembled_source_string)
+                if ev is not None:
+                    evidence_json[f"in_the_box[{idx}].item_specification"] = ev
 
     partial_json["in_the_box"] = in_the_box
 
     # -------------------------------------------------------------------------
-    # Step 4 â€” Strip any Run C calculated fields the model may have included
+    # Step 5 — Strip Run C calculated fields
     # -------------------------------------------------------------------------
     partial_json = _strip_run_c_fields_from_partial(partial_json)
 
     # -------------------------------------------------------------------------
-    # Step 5 â€” Array completeness monitor (Section 9.5) â€” warnings only
+    # Step 6 — Ungrounded rate check
+    # Count non-null scalar values across partial_json that have no evidence entry.
+    # If > 20%, log a warning recommending prompt/example quality review.
+    # -------------------------------------------------------------------------
+    _check_ungrounded_rate(partial_json, evidence_json, url_registry_id)
+
+    # -------------------------------------------------------------------------
+    # Step 7 — Array completeness monitor (log-only, never blocking)
     # -------------------------------------------------------------------------
     _check_array_completeness(partial_json, url_registry_id)
 
+    # -------------------------------------------------------------------------
+    # Step 8 — Junction array source sanity check (log-only, never blocking)
+    # For high-risk junction arrays that are prone to hallucination from training
+    # data, check whether ANY of the extracted values appear in the
+    # assembled_source_string. If none match, log a critical warning.
+    # This does not modify partial_json — it only surfaces problems for review.
+    # -------------------------------------------------------------------------
+    _check_junction_array_grounding(partial_json, assembled_source_string, url_registry_id)
+
     logger.info(
         "build_spec_json: built partial_json with %d top-level keys, "
-        "%d evidence entries. url_registry_id=%s",
+        "%d evidence entries. url_registry_id=%s raw_source_ids=%s raw_transcript_ids=%s",
         len(partial_json), len(evidence_json), url_registry_id,
+        raw_source_ids, raw_transcript_ids,
     )
 
     return partial_json, evidence_json
 
+
+# ---------------------------------------------------------------------------
+# Ungrounded rate check
+# ---------------------------------------------------------------------------
+
+def _collect_non_null_scalar_paths(obj: Any, prefix: str, paths: set[str]) -> None:
+    """
+    Recursively collects dotted field paths for all non-null, non-list, non-dict
+    leaf values in a nested structure. Used to count total attributed fields.
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            # Structural fields are intentionally ungrounded
+            if k in _STRUCTURAL_FIELDS:
+                continue
+            _collect_non_null_scalar_paths(v, f"{prefix}.{k}" if prefix else k, paths)
+
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            # Skip plain string items (junction arrays)
+            if isinstance(v, str):
+                continue
+            _collect_non_null_scalar_paths(v, f"{prefix}[{i}]", paths)
+
+    elif obj is not None:
+        paths.add(prefix)
+
+
+def _check_ungrounded_rate(
+    partial_json: dict,
+    evidence_json: dict,
+    url_registry_id: int | None,
+) -> None:
+    """
+    If more than 20% of non-null scalar values lack a evidence_json entry,
+    logs a warning recommending prompt and example quality review.
+    """
+    all_paths: set[str] = set()
+    _collect_non_null_scalar_paths(partial_json, "", all_paths)
+
+    total = len(all_paths)
+    if total == 0:
+        return
+
+    grounded = len(evidence_json)
+    ungrounded = total - grounded
+    if ungrounded < 0:
+        ungrounded = 0
+
+    pct = (ungrounded / total) * 100
+    if pct > 20.0:
+        logger.warning(
+            "build_spec_json: ungrounded rate %.0f%% (%d/%d fields lack _source). "
+            "url_registry_id=%s. "
+            "Recommend reviewing prompt instructions and few-shot example coverage.",
+            pct, ungrounded, total, url_registry_id,
+        )

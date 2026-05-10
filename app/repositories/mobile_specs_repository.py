@@ -99,6 +99,34 @@ def upsert_phone(data: dict[str, Any]) -> int:
     return model_id
 
 
+def fetch_chipset_by_name(chipset_name: str) -> dict | None:
+    """
+    Looks up a chipset row in mobile_specs.chipsets by exact chipset_name match.
+
+    Called by the normalizer's chipset deduplication step (Change 6b).
+    If found, returns the full row dict so the normalizer can overwrite the
+    extracted chipset block with DB-canonical values before gap analysis runs.
+
+    Returns None if the chipset is not yet in the database.
+    """
+    client = get_client()
+    result = (
+        client
+        .schema("mobile_specs")
+        .table("chipsets")
+        .select("*")
+        .eq("chipset_name", chipset_name.strip())
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        logger.debug("fetch_chipset_by_name: chipset_name=%r not found in DB", chipset_name)
+        return None
+    logger.debug("fetch_chipset_by_name: found chipset_id=%d for chipset_name=%r", rows[0].get("chipset_id"), chipset_name)
+    return rows[0]
+
+
 def fetch_brand_id(brand_name: str) -> int | None:
     """
     Resolve brand_name → brand_id from public.brands.
@@ -932,6 +960,45 @@ def insert_box_content(model_id: int, box_item_id: int, item_specification: str 
         .execute()
     )
     return bool(result.data)
+
+
+# ---------------------------------------------------------------------------
+# SECTION 16a — Video capabilities
+# ---------------------------------------------------------------------------
+
+def upsert_video_capabilities(data: dict[str, Any]) -> int:
+    """
+    Upsert a row in mobile_specs.video_capabilities.
+
+    Idempotency: model_id UNIQUE.
+    ON CONFLICT DO UPDATE: refresh all spec columns so a re-commit keeps the
+    best extracted values.
+
+    Args:
+        data: Dict with keys matching video_capabilities column names.
+              Must include 'model_id'.
+    Returns:
+        video_capabilities_id (int)
+    """
+    client = get_client()
+    result = (
+        client
+        .schema("mobile_specs")
+        .table("video_capabilities")
+        .upsert(data, on_conflict="model_id", ignore_duplicates=False)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        raise RuntimeError(
+            f"upsert_video_capabilities: no row returned. model_id={data.get('model_id')}"
+        )
+    vc_id = rows[0]["video_capabilities_id"]
+    logger.debug(
+        "upsert_video_capabilities: video_capabilities_id=%d model_id=%d",
+        vc_id, data.get("model_id", -1),
+    )
+    return vc_id
 
 
 # ---------------------------------------------------------------------------

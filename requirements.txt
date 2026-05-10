@@ -6,7 +6,7 @@ httpx
 Pillow
 youtube-transcript-api==1.2.4
 google-genai
-langextract
 pyyaml
 pydantic>=2.0
 python-Levenshtein
+slowapi>=0.1.9

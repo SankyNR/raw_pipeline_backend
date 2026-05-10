@@ -12,59 +12,52 @@ source_priority:
     - source: OEM official site
       priority: 1
       trust_reason: >
-        Direct manufacturer specification. Always authoritative on hardware specs.
-        If the OEM site states a value, use it regardless of what other sources say.
+        Direct manufacturer specification. Authoritative on all hardware specs.
+        Use regardless of what other sources say.
 
     - source: YouTube transcript
       priority: 2
       trust_reason: >
-        Indian market reviewer with physical device. Reliable for:
-        charger_in_box, in_the_box contents, India-specific colour availability,
-        India-specific variant configurations, real-world confirmations.
-        Reviewers from Indian channels (Tech Burner, Technical Guruji, Trakin Tech,
-        Beebom, etc.) physically test the India retail unit.
+        Indian market reviewer with physical device. Reliable for charger_in_box,
+        in_the_box contents, India-specific variants and colour availability.
       exceptions:
         fields_where_aggregator_wins:
           - "displays[*].resolution_height_px"
           - "displays[*].resolution_width_px"
           - "charging.battery_capacity"
           - "camera_lenses[*].megapixels"
-          - "body.length"
-          - "body.breadth"
           - "body.height"
+          - "body.width"
+          - "body.thickness"
           - "body.weight"
           - "network.bands_5g"
           - "network.bands_4g"
-        reason: >
-          Transcripts approximate or round numeric values in spoken language.
-          Aggregators have exact figures from spec sheets. For these fields,
-          prefer aggregator over transcript even though transcript has higher
-          general priority.
+        reason: Transcripts approximate spoken numbers. Aggregators have exact figures from spec sheets.
 
     - source: Aggregator site (GSMArena, Smartprix)
       priority: 3
       trust_reason: >
-        Comprehensive spec coverage but may reflect global or EU specifications
-        rather than the India retail unit. Use as fallback when OEM and
-        transcript are both silent on a field.
+        Comprehensive spec coverage but may reflect global/EU specs, not India retail unit.
+        Use as fallback when OEM and transcript are both silent.
 
 disambiguation_rules:
   - rule: "Dolby Atmos"
     note: >
-      Dolby Atmos can apply to THREE different contexts simultaneously.
-      Do NOT deduplicate — all three may be true for the same phone.
+      Dolby Atmos applies to three contexts simultaneously — do NOT deduplicate across them:
+      speaker output (audio.audio_codecs), display HDR (displays[*].display_features),
+      and video recording (camera_features).
     applies_to:
       - path: audio.audio_codecs
         context: "Speaker output / playback — the phone's speakers support Dolby Atmos"
       - path: "displays[*].display_features"
         context: "Display HDR — the screen can display Dolby Atmos HDR content"
-      - path: "camera_lenses[*].camera_features"
-        context: "Video recording — the camera records Dolby Atmos audio"
+      - path: camera_features
+        context: "Video recording — the camera records Dolby Atmos audio (Change 1a: moved from per-lens)"
 
   - rule: "LTPO"
     note: >
-      LTPO is both a panel technology AND a display capability flag.
-      Populate BOTH fields — they are not redundant.
+      LTPO is both a panel technology (displays[*].panel_type, e.g. "LTPO3 AMOLED")
+      and a display capability flag (displays[*].display_features, add "LTPO"). Populate both.
     applies_to:
       - path: "displays[*].panel_type"
         context: "The panel technology itself — e.g. LTPO3 AMOLED, LTPO4 AMOLED"
@@ -73,44 +66,111 @@ disambiguation_rules:
 
   - rule: "OIS (Optical Image Stabilisation)"
     note: >
-      OIS applies at two levels simultaneously. Populate BOTH.
+      OIS applies at two levels: per-lens (camera_lenses[*].stabilization)
+      and phone-level (camera_features). Populate both.
     applies_to:
       - path: "camera_lenses[*].stabilization"
         context: "Per-lens stabilisation type for the specific lens that has OIS"
-      - path: "camera_lenses[*].camera_features"
-        context: "General camera system feature — the camera system supports OIS"
+      - path: camera_features
+        context: "General camera system feature — the camera system supports OIS (Change 1a: moved from per-lens)"
 
   - rule: "Samsung App Lock"
     maps_to: "os_and_security.security_features"
     canonical_value: "Secure Folder"
-    note: >
-      For Samsung phones, 'App Lock' is not a standalone feature.
-      App Lock functionality lives inside Secure Folder. Map to 'Secure Folder'.
-      Do NOT create a separate 'App Lock' entry for Samsung.
+    note: For Samsung phones, App Lock functionality lives inside Secure Folder. Map to "Secure Folder".
 
   - rule: "Wi-Fi calling / VoWiFi"
     maps_to: "connectivity.wifi_technologies"
-    note: >
-      Wi-Fi Calling (VoWiFi) goes under connectivity.wifi_technologies,
-      NOT under network. It is a Wi-Fi feature, not a cellular network feature.
+    note: Wi-Fi Calling goes under connectivity.wifi_technologies, not network.
 
   - rule: "5G SA vs NSA"
     maps_to: "network.bands_5g"
     note: >
-      SA (Standalone) and NSA (Non-Standalone) 5G modes are not band names.
-      Do NOT include 'SA' or 'NSA' in bands_5g. Extract only actual band names
-      (e.g. n28, n78, n5, n8). SA/NSA support goes in network.vo5g or
-      body_features.other_features if explicitly stated.
+      SA/NSA are not band names — put them in network.cellular_features.
+      bands_5g contains only actual band names (n28, n78, etc.).
 
   - rule: "USB features vs USB standard"
-    note: >
-      connectivity.usb_standard: The USB version (e.g. USB 3.2 Gen 2, USB 2.0).
-      connectivity.usb_features: Capabilities (DisplayPort, OTG, USB-C Alt Mode).
-      These are different fields. USB 3.2 Gen 2 is a standard; OTG is a feature.
+    note: usb_standard = USB version (e.g. USB 3.2 Gen 2). usb_features = capabilities (OTG, DisplayPort). Different fields.
 
   - rule: "Bluetooth profiles vs version"
+    note: bluetooth_version = version string only (e.g. "5.4"). Do not include profile names (A2DP, LE Audio).
+
+  # ---------------------------------------------------------------------------
+  # Change 4 — added 2026-05-07
+  # ---------------------------------------------------------------------------
+
+  - rule: "SIM configuration and eSIM support"
     note: >
-      connectivity.bluetooth_version: The version string only (e.g. '5.4', '5.3').
-      Do NOT include profile names (A2DP, LE Audio, Auracast) in bluetooth_version.
-      Bluetooth profiles are not currently a separate field — omit them or note in
-      body_features.other_features if explicitly important.
+      OEM India site is authoritative. GSMArena may show global eSIM variants not sold in India.
+      If OEM India shows Dual Nano-SIM only → esim_support=false, sim_configuration="Dual SIM (Nano-SIM, dual stand-by)".
+      Silence on eSIM = false. See also rule 5p.
+    applies_to:
+      - path: network.esim_support
+      - path: network.sim_configuration
+      - path: network.number_of_sims
+
+  - rule: "Wireless charging — India variants"
+    note: >
+      OEM India site is authoritative. Some phones support wireless charging globally but not in India.
+      If OEM India is silent on wireless charging → wireless_charging=false.
+    applies_to:
+      - path: charging.wireless_charging
+      - path: charging.wireless_charging_power
+      - path: charging.wireless_charging_standard
+
+  - rule: "Phone variants — India vs global"
+    note: >
+      OEM India site only. GSMArena lists global tiers not sold in India.
+      Output exactly the variants listed on the India OEM page — no more, no less.
+    applies_to:
+      - path: "variants[*]"
+
+  - rule: "BIS certification"
+    note: Always true — BIS/MTCTE is mandatory for all phones sold in India. See rule 5l.
+    applies_to:
+      - path: certifications.bis_certification
+
+  - rule: "Camera features — phone-level not per-lens"
+    note: >
+      camera_features is a TOP-LEVEL root field. Collect from all lenses and sources into one
+      deduplicated list. Use only lookup canonical names. Never assign inside camera_lenses[*].
+    applies_to:
+      - path: camera_features
+
+  - rule: "Video resolution normalization"
+    note: >
+      Normalize: UHD = 4K | FHD = 1080p | HD = 720p. Combine same res+fps entries
+      that differ only in aspect ratio. Highest resolution first.
+    applies_to:
+      - path: video_capabilities.rear_video_resolutions
+      - path: video_capabilities.front_video_resolutions
+
+  - rule: "Benchmark score rounding and verbal conversion"
+    note: >
+      Convert verbal to integer first ("around 2 million" = 2000000).
+      Average multiple sources then round: AnTuTu nearest 100k | Geekbench nearest 100 | 3DMark nearest 10.
+      Record version (v9/v10, v5/v6) when available.
+    applies_to:
+      - path: performance_benchmarks.antutu_score
+      - path: performance_benchmarks.geekbench_single_core
+      - path: performance_benchmarks.geekbench_multi_core
+      - path: performance_benchmarks.three_d_mark_score
+
+  # ---------------------------------------------------------------------------
+  # Change E — added 2026-05-09
+  # ---------------------------------------------------------------------------
+
+  - rule: "VoNR / Vo5G / Voice over 5G terminology"
+    note: >
+      All map to network.vo5g = true: "VoNR" | "Vo5G" | "Voice over 5G NR" | "Voice over 5G" | "VNR" | "supports vnr".
+      5G support alone does NOT imply vo5g. volte and vowifi are separate fields.
+    applies_to:
+      - path: network.vo5g
+
+# ---------------------------------------------------------------------------
+# NOTE: Run B experience deduplication rules are NOT read from this file.
+# ecd_generator.py only reads: source_priority + disambiguation_rules.
+# The deduplication instructions are hardcoded in:
+#   app/services/extraction_run_b.py → EXPERIENCE_SYSTEM_PROMPT (lines ~163–176)
+# Edit them there, not here.
+# ---------------------------------------------------------------------------

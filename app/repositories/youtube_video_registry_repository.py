@@ -14,6 +14,7 @@ async def upsert_video(
     video_url: str,
     video_title: str | None,
     published_at: str | None,
+    video_type: str | None = None,
 ) -> bool:
     """
     Inserts a new row into pipeline.youtube_video_url_registry.
@@ -38,6 +39,7 @@ async def upsert_video(
                 "video_url": video_url,
                 "video_title": video_title,
                 "published_at": published_at,
+                "video_type": video_type,
             },
             on_conflict="url_registry_id,yt_video_id",
             ignore_duplicates=True,
@@ -53,6 +55,28 @@ async def upsert_video(
 # ---------------------------------------------------------------------------
 # Task 4.2 — get_videos_for_phone()
 # ---------------------------------------------------------------------------
+
+async def reset_stale_video_locks(url_registry_id: int, stale_minutes: int = 15) -> int:
+    """
+    Finds any videos for the given url_registry_id that are stuck in 'currently_fetching'
+    for longer than stale_minutes, and resets them to 'not_fetched'.
+    Returns the number of rows reset.
+    """
+    from datetime import datetime, timedelta, timezone
+    stale_threshold = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+    
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("youtube_video_url_registry")
+        .update({"status": "not_fetched"})
+        .eq("url_registry_id", url_registry_id)
+        .eq("status", "currently_fetching")
+        .lt("updated_at", stale_threshold.isoformat())
+        .execute()
+    )
+    return len(result.data) if result.data else 0
+
 
 async def get_videos_for_phone(url_registry_id: int) -> list[dict]:
     """

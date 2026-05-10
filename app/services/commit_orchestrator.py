@@ -46,6 +46,8 @@ STRICT WRITE ORDER (dependencies must be inserted before their children):
   16. mobile_specs.ai_capabilities → phone_ai_features[]
   17. mobile_specs.phone_extra_features[]
   18. mobile_specs.phone_box_contents[]
+  20a. mobile_specs.video_capabilities
+  20b. mobile_specs.phone_camera_features[]  (root-level camera_features)
   19. pipeline.url_registry.status = 'stored_mainDB'   ← LAST WRITE (commit marker)
 
 FK RESOLUTION AT COMMIT TIME
@@ -121,11 +123,24 @@ from app.repositories.mobile_specs_repository import (
     upsert_phone,
     upsert_sensors,
     upsert_variant,
+    upsert_video_capabilities,
 )
 from app.services.normalizer import LOOKUP_CACHE, clean_for_lookup
 from app.services.validation_service import run_pre_commit_validation
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# S2-P1-8: Display type → position semantic mapping
+# Replaces brittle index-based defaulting (idx==0 → "Primary").
+# Foldable phones may have Cover display at index 0 in final_json.
+# ---------------------------------------------------------------------------
+_DISPLAY_TYPE_TO_POSITION: dict[str, str] = {
+    "main":  "Primary",
+    "inner": "Primary",    # foldable main/inner screen → Primary
+    "cover": "Secondary",  # foldable cover/external screen → Secondary
+}
 
 
 # ---------------------------------------------------------------------------
@@ -228,12 +243,8 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
     final_json: dict = dict(package["final_json"])  # shallow copy — safe to mutate
     normalized_id: int = package.get("normalized_id")
 
-    # ── C5 fix: strip video_capabilities — no mobile_specs table for it ────
-    # video_capabilities is output by spec_template.yaml and recognised by
-    # KNOWN_SPEC_TOP_LEVEL_KEYS (after C5 fix in conflict_resolver.py), but
-    # there is no destination table in mobile_specs. Silently discard it here
-    # so it doesn't cause key-not-found warnings later in the commit loop.
-    final_json.pop("video_capabilities", None)
+    # video_capabilities is committed in Step 20a below.
+    # The field is left in final_json — no pop needed.
 
     # ── Step 1: Pre-commit validation (Layer 3) ──────────────────────────────
     validation = await run_pre_commit_validation(
@@ -261,7 +272,7 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
 
     try:
         # ── Step 3: Resolve brand ─────────────────────────────────────────────
-        brand_name: str = final_json.get("basic", {}).get("brand", "")
+        brand_name: str = final_json.get("brand", {}).get("brand_name", "")  # v5: was basic.brand
         brand_id: int | None = await _t(fetch_brand_id, brand_name)
         if brand_id is None:
             raise ValueError(
@@ -275,37 +286,46 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
 
         chipset_name = chipset_data.get("chipset_name")
         if chipset_name:
-            cs_row: dict[str, Any] = {"chipset_name": chipset_name}
-            _copy_if_present(chipset_data, cs_row, {
-                "cpu_architecture":       "cpu_architecture",
-                "fabrication_node":       "fabrication_node",
-                "number_of_cores":        "number_of_cores",
-                "cpu_high_performance":   "cpu_high_performance",
-                "cpu_performance_cores":  "cpu_performance_cores",
-                "cpu_efficiency_cores":   "cpu_efficiency_cores",
-                "cpu_clock_speed":        "cpu_clock_speed",
-                "gpu_name":               "gpu_name",
-                "gpu_architecture":       "gpu_architecture",
-                "gpu_unit_count":         "gpu_unit_count",
-                "gpu_unit_type":          "gpu_unit_type",
-                "gpu_clock_speed":        "gpu_clock_speed",
-                "npu_details":            "npu_details",
-                "npu_tops":               "npu_tops",
-            })
-            chipset_id = await _t(upsert_chipset, cs_row)
-            tables_written.append("mobile_specs.chipsets")
-            rows_inserted += 1
+            # Change 6b: If the normalizer dedup step already resolved the chipset
+            # (chipset_id sentinel present), skip the INSERT and reuse the existing row.
+            dedup_chipset_id: int | None = chipset_data.get("chipset_id")
+            if dedup_chipset_id is not None:
+                chipset_id = dedup_chipset_id
+                logger.info(
+                    "run_db_commit: chipset %r already in DB (chipset_id=%d) — "
+                    "skipping upsert_chipset, reusing existing row.",
+                    chipset_name, chipset_id,
+                )
+            else:
+                cs_row: dict[str, Any] = {"chipset_name": chipset_name}
+                _copy_if_present(chipset_data, cs_row, {
+                    "cpu_architecture":           "cpu_architecture",
+                    "fabrication_node":           "fabrication_node",
+                    "number_of_cores":            "number_of_cores",
+                    "cpu_high_performance_cores": "cpu_high_performance_cores",  # Change 1c
+                    "cpu_performance_cores":      "cpu_performance_cores",
+                    "cpu_efficiency_cores":       "cpu_efficiency_cores",
+                    "cpu_clock_speed":            "cpu_clock_speed",
+                    "gpu_name":                   "gpu_name",
+                    # gpu_architecture removed — Change 1d: column dropped from DB
+                    "gpu_unit_count":             "gpu_unit_count",
+                    "gpu_unit_type":              "gpu_unit_type",
+                    "gpu_clock_speed":            "gpu_clock_speed",
+                    "npu_details":                "npu_details",
+                    "npu_tops":                   "npu_tops",
+                })
+                chipset_id = await _t(upsert_chipset, cs_row)
+                tables_written.append("mobile_specs.chipsets")
+                rows_inserted += 1
 
         # ── Step 5: Upsert phone ──────────────────────────────────────────────
-        # C4 fix: normalise model_name casing — strip whitespace only.
-        # We use the exact string from basic.model_name. LOWER() expression
-        # indexes are replaced by a named UNIQUE CONSTRAINT (uq_phone_brand_model)
-        # on the literal column, so consistent casing at write time is essential.
-        basic = final_json.get("basic", {})
-        raw_model_name: str = (basic.get("model_name") or "").strip()
+        # v5: model_name and launch_date moved from "basic" → "phone_identity".
+        # We strip whitespace only; casing is preserved for the UNIQUE CONSTRAINT.
+        phone_identity = final_json.get("phone_identity", {})
+        raw_model_name: str = (phone_identity.get("model_name") or "").strip()
         if not raw_model_name:
             raise ValueError(
-                f"run_db_commit: basic.model_name is empty for final_id={final_id}. "
+                f"run_db_commit: phone_identity.model_name is empty for final_id={final_id}. "
                 "Cannot upsert phones without a model_name."
             )
         phone_row: dict[str, Any] = {
@@ -314,7 +334,7 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
         }
         if chipset_id is not None:
             phone_row["chipset_id"] = chipset_id
-        launch_date = basic.get("launch_date")
+        launch_date = phone_identity.get("launch_date")
         if launch_date:
             phone_row["launch_date"] = launch_date
 
@@ -349,8 +369,8 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
                 "launch_price":             "launch_price",
                 "is_base_variant":          "is_base_variant",
             })
-            vrow["ram_type_id"] = ram_type_pk if ram_type_pk is not None else 0
-            vrow["storage_type_id"] = storage_type_pk if storage_type_pk is not None else 0
+            vrow["ram_type_id"] = ram_type_pk       # None → NULL; 0 is not a valid FK
+            vrow["storage_type_id"] = storage_type_pk  # None → NULL; 0 is not a valid FK
 
             await _t(upsert_variant, vrow)
             rows_inserted += 1
@@ -363,13 +383,12 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
         display_features_written = False
 
         for idx, display in enumerate(displays):
-            # display_type/display_position used as idempotency key
-            display_type = display.get("display_type", "Main")
-            display_position = display.get("display_position", "Primary")
-            if idx == 0 and not display.get("display_position"):
-                display_position = "Primary"
-            elif idx == 1 and not display.get("display_position"):
-                display_position = "Secondary"
+            # S2-P1-8: derive display_position from display_type semantics,
+            # not from array index. Foldable phones may have Cover at index 0.
+            display_type = display.get("display_type") or "main"
+            display_type_lower = str(display_type).lower()
+            fallback_position = _DISPLAY_TYPE_TO_POSITION.get(display_type_lower, "Primary")
+            display_position = display.get("display_position") or fallback_position
 
             panel_type_pk = _resolve_fk(
                 display.get("panel_type"),
@@ -443,12 +462,12 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
         if body:
             brow: dict[str, Any] = {"model_id": model_id}
             _copy_if_present(body, brow, {
-                "length":           "length",
-                "breadth":          "breadth",
                 "height":           "height",
-                "length_folded":    "length_folded",
-                "breadth_folded":   "breadth_folded",
+                "width":            "width",
+                "thickness":        "thickness",
                 "height_folded":    "height_folded",
+                "width_folded":     "width_folded",
+                "thickness_folded": "thickness_folded",
                 "weight":           "weight",
                 "build":            "build",
                 "buttons":          "buttons",
@@ -825,16 +844,8 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
                     rows_inserted += 1
                     lens_stab_written = True
 
-            # Camera features (junction on model_id — shared across all lenses)
-            cf_table = "mobile_specs.lookup_camera_features.feature_name"
-            cf_ids, cf_un = _resolve_array_fk(lens.get("camera_features", []), cf_table)
-            for uid in cf_un:
-                unresolved_fields.append(f"camera_lenses[{idx}].camera_features.{uid}")
-            for fid in cf_ids:
-                inserted = await _t(insert_camera_feature, model_id, fid)
-                if inserted:
-                    rows_inserted += 1
-                    cam_feat_written = True
+            # camera_features is now a root-level field (committed in Step 20b below).
+            # Per-lens camera_features is always [] after the schema change — do not read it here.
 
         if camera_lenses:
             tables_written.append("mobile_specs.camera_lens_specs")
@@ -1069,6 +1080,35 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
         if box_written:
             tables_written.append("mobile_specs.phone_box_contents")
 
+        # ── Step 20a: Video capabilities ─────────────────────────────────────
+        vc_data = final_json.get("video_capabilities", {})
+        if vc_data and isinstance(vc_data, dict):
+            vcrow: dict[str, Any] = {"model_id": model_id}
+            _copy_if_present(vc_data, vcrow, {
+                "rear_video_resolutions":  "rear_video_resolutions",
+                "front_video_resolutions": "front_video_resolutions",
+                "slow_motion":             "slow_motion",
+            })
+            if len(vcrow) > 1:  # at least one field beyond model_id
+                await _t(upsert_video_capabilities, vcrow)
+                tables_written.append("mobile_specs.video_capabilities")
+                rows_inserted += 1
+
+        # ── Step 20b: Root-level camera_features (junction on model_id) ───────
+        root_cf_table = "mobile_specs.lookup_camera_features.feature_name"
+        root_cf_ids, root_cf_un = _resolve_array_fk(
+            final_json.get("camera_features", []), root_cf_table
+        )
+        for uid in root_cf_un:
+            unresolved_fields.append(f"camera_features.{uid}")
+        for fid in root_cf_ids:
+            inserted = await _t(insert_camera_feature, model_id, fid)
+            if inserted:
+                rows_inserted += 1
+                cam_feat_written = True
+        if cam_feat_written:
+            tables_written.append("mobile_specs.phone_camera_features")
+
         # ── Step 21: Commit phone_experiences (mark as committed) ─────────────
         # phone_experiences live in the pipeline schema. For Phase 10 the design
         # is to mark committed = TRUE on the pipeline rows (they are already the
@@ -1213,6 +1253,7 @@ def _mark_experiences_committed(url_registry_id: int) -> int:
         .update({"is_verified": True})
         .eq("url_registry_id", url_registry_id)
         .eq("is_suppressed", False)
+        .eq("is_superseded", False)   # C3 fix: never touch superseded rows at commit
         .execute()
     )
     count = len(result.data or [])

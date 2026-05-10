@@ -69,6 +69,7 @@ _CHIPSET_VENDOR_HINTS: dict[str, str] = {
 }
 
 
+
 def _resolve_chipset_site_hint(chipset_name: str | None) -> str | None:
     """
     Resolves chipset.npu_tops site hint dynamically from chipset_name.
@@ -152,6 +153,9 @@ async def detect_missing_fields(normalized_id: int) -> list[int]:
     normalized_json: dict = norm_row["normalized_json"] or {}
     url_registry_id: int = norm_row["url_registry_id"]
 
+    # L7.3 Fix 5: extract brand for deterministic charging fill check
+    brand: str = (normalized_json.get("brand") or {}).get("brand_name") or ""
+
     # Fetch url_registry status + chipset_name for dynamic hints
     registry_row = await asyncio.to_thread(fetch_url_registry_status, url_registry_id)
     registry_status: str = registry_row.get("status", "")
@@ -172,6 +176,24 @@ async def detect_missing_fields(normalized_id: int) -> list[int]:
 
     for concrete_path in gap_paths:
         generic = _generic_path(concrete_path)
+
+        # L7.3 Fix 5 — Dependency filter: stylus_features requires has_stylus=True ---
+        if generic == "body.stylus_features":
+            has_stylus = (normalized_json.get("body") or {}).get("has_stylus")
+            if has_stylus is False:
+                continue  # Phone confirmed no stylus — stylus_features will always be null
+
+        # L7.3 Fix 5 — Dependency filter: wireless charging sub-fields ---
+        _WIRELESS_CHARGING_DEPS = {
+            "charging.wireless_charging_power",
+            "charging.wireless_charging_standard",
+            "charging.reverse_wireless_charging",
+            "charging.reverse_wireless_charging_power",
+        }
+        if generic in _WIRELESS_CHARGING_DEPS:
+            wireless = (normalized_json.get("charging") or {}).get("wireless_charging")
+            if wireless is False:
+                continue  # Phone confirmed no wireless charging — sub-fields are N/A
 
         # --- Field type ---
         is_junction = generic in JUNCTION_TABLE_FIELDS

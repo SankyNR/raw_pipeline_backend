@@ -9,6 +9,7 @@ from app.repositories.youtube_search_log_repository import (
     update_url_registry_search_denorm,
 )
 from app.repositories.youtube_video_registry_repository import upsert_video
+from app.core.supabase_client import get_client
 from app.services.youtube_api_client import search_videos_for_channel, fetch_video_descriptions
 from app.services.video_relevance_filter import (
     extract_search_tokens, _normalize_text, _matches
@@ -66,6 +67,45 @@ def prioritize_by_connectivity(
         return videos
 
 
+_SIGNAL_RANK:     dict[str, int] = {"high": 0, "medium": 1, "low": 2}
+_CONFIDENCE_RANK: dict[str, int] = {"high": 0, "medium": 1, "low": 2}
+
+# Maximum transcripts to register per phone.
+# Applied AFTER Stage 2 LLM filter, BEFORE upsert.
+# Videos beyond the cap are never registered, fetched, or extracted.
+# Extend with per-phone category logic once category tagging is added.
+# Suggested values: flagship=12, midrange=10, budget=5.
+_TRANSCRIPT_CAP_DEFAULT: int = 10
+
+# Maximum Stage 1 survivors passed to Stage 2 LLM classification.
+# Prevents cost explosion on popular phones with many raw search results.
+_PRE_FILTER_CAP: int = 20
+
+
+def _apply_transcript_cap(videos: list[dict], cap: int) -> list[dict]:
+    """
+    Sorts passing videos by LLM signal quality and keeps the top `cap` videos.
+    Sort key: (signal_strength rank, confidence rank) — ascending = best first.
+    Videos without _llm_* keys (e.g. no description available) default to medium/medium.
+    Returns the full list unchanged if len(videos) <= cap.
+    """
+    if len(videos) <= cap:
+        return videos
+
+    def _sort_key(v: dict) -> tuple[int, int]:
+        sig  = _SIGNAL_RANK.get(v.get("_llm_signal_strength", "medium"), 1)
+        conf = _CONFIDENCE_RANK.get(v.get("_llm_confidence", "medium"), 1)
+        return (sig, conf)
+
+    sorted_videos = sorted(videos, key=_sort_key)
+    capped = sorted_videos[:cap]
+    logger.info(
+        "_apply_transcript_cap: %d videos → capped to %d (dropped %d lower-signal videos)",
+        len(videos), len(capped), len(videos) - len(capped),
+    )
+    return capped
+
+
 async def run_youtube_search(brand: str, model_name: str, triggered_by: str) -> dict:
     """
     Full search flow for one phone.
@@ -114,6 +154,10 @@ async def run_youtube_search(brand: str, model_name: str, triggered_by: str) -> 
                     # Passes ~30/70 raw videos through to Stage 2.
                     videos = stage1_prefilter(videos, descriptions, brand, model_name)
 
+                    # Stage 2 pre-filter cap: limit LLM classification calls on popular phones.
+                    # Applied BEFORE Stage 2 to prevent cost explosion.
+                    videos = videos[:_PRE_FILTER_CAP]
+
                     # Stage 2: LLM semantic verification of Stage 1 survivors.
                     # Handles description pollution, comparison videos, variant suffix
                     # disambiguation, and successor-framing that presence checks cannot resolve.
@@ -141,9 +185,39 @@ async def run_youtube_search(brand: str, model_name: str, triggered_by: str) -> 
                 )
                 continue
 
-        # 5. Upsert all found videos — ON CONFLICT DO NOTHING, existing rows untouched
-        new_count = 0
+        # 4.5. Deduplicate across channels (first occurrence wins), then apply transcript cap.
+        # Dedup is needed because the same video may surface from multiple channel searches.
+        # Cap is applied BEFORE upsert: videos beyond the cap are never registered and
+        # therefore never fetched or extracted. Primary cost and review-load lever.
+        seen_ids: set[str] = set()
+        deduped: list[dict] = []
         for v in all_videos:
+            vid_id = v.get("yt_video_id")
+            if vid_id and vid_id not in seen_ids:
+                seen_ids.add(vid_id)
+                deduped.append(v)
+        all_videos = deduped
+
+        videos_found_total = len(all_videos)
+        all_videos = _apply_transcript_cap(all_videos, _TRANSCRIPT_CAP_DEFAULT)
+
+        # 5. Upsert all found videos — ON CONFLICT DO NOTHING, existing rows untouched.
+        # Hard ceiling: never register more than _TRANSCRIPT_CAP_DEFAULT videos per phone
+        # total, across all runs. Per-run cap (_apply_transcript_cap) already limits the
+        # candidate list — this ceiling ensures re-runs never inflate the total count.
+        existing_result = (
+            get_client()
+            .schema("pipeline")
+            .table("youtube_video_url_registry")
+            .select("video_registry_id", count="exact")
+            .eq("url_registry_id", url_registry_id)
+            .execute()
+        )
+        existing_count = existing_result.count or 0
+        slots_remaining = max(0, _TRANSCRIPT_CAP_DEFAULT - existing_count)
+
+        new_count = 0
+        for v in all_videos[:slots_remaining]:
             inserted = await upsert_video(
                 url_registry_id=url_registry_id,
                 channel_id=v["channel_id"],
@@ -151,6 +225,7 @@ async def run_youtube_search(brand: str, model_name: str, triggered_by: str) -> 
                 video_url=v["video_url"],
                 video_title=v.get("video_title"),
                 published_at=v.get("published_at"),
+                video_type=v.get("_llm_video_type"),
             )
             if inserted:
                 new_count += 1
@@ -167,7 +242,7 @@ async def run_youtube_search(brand: str, model_name: str, triggered_by: str) -> 
         await close_search_log(
             search_log_id=search_log_id,
             search_status=search_status,
-            videos_found=len(all_videos),
+            videos_found=videos_found_total,
             channels_searched=len(channels),
             error_message=None,
         )
@@ -179,7 +254,7 @@ async def run_youtube_search(brand: str, model_name: str, triggered_by: str) -> 
         return {
             "success": True,
             "search_log_id": search_log_id,
-            "videos_found": len(all_videos),
+            "videos_found": videos_found_total,
             "new_videos_registered": new_count,
             "channels_searched": len(channels),
             "message": search_status,

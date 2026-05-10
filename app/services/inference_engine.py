@@ -95,7 +95,7 @@ async def run_inference_engine(
 
     if not rules:
         logger.warning("Run C: no active inference rules found — nothing to evaluate.")
-        _finalize_audit(inference_run_id, 0, 0, 0, [])
+        await _finalize_audit(inference_run_id, 0, 0, 0, [])
         return {
             "success":          True,
             "model_id":         model_id,
@@ -139,7 +139,7 @@ async def run_inference_engine(
     )
 
     # M2 — close audit row
-    _finalize_audit(inference_run_id, len(rules), rules_written, rules_skipped, errors)
+    await _finalize_audit(inference_run_id, len(rules), rules_written, rules_skipped, errors)
 
     return {
         "success":          success,
@@ -152,7 +152,7 @@ async def run_inference_engine(
     }
 
 
-def _finalize_audit(
+async def _finalize_audit(
     inference_run_id: int,
     rules_evaluated: int,
     rules_written: int,
@@ -163,7 +163,10 @@ def _finalize_audit(
     if inference_run_id == -1:
         return
     try:
-        update_inference_run(
+        # S4-P1-9: wrap sync DB call in asyncio.to_thread to avoid blocking the
+        # FastAPI event loop for the duration of the DB round-trip (~50–200ms).
+        await asyncio.to_thread(
+            update_inference_run,
             inference_run_id=inference_run_id,
             rules_evaluated=rules_evaluated,
             rules_written=rules_written,
@@ -308,13 +311,13 @@ async def _rule_jio_5g(rule: dict, model_id: int, url_registry_id: int) -> dict 
     bands_partial   = int(thresholds.get("bands_partial",   2))
 
     client = _get_ms_client()
-    result = (
+    result = await asyncio.to_thread(lambda: (
         client
         .table("phone_network_bands")
         .select("band_id, lookup_network_bands(band_name)")
         .eq("model_id", model_id)
         .execute()
-    )
+    ))
     rows = result.data or []
 
     found_bands = set()
@@ -369,13 +372,13 @@ async def _rule_airtel_5g(rule: dict, model_id: int, url_registry_id: int) -> di
     bands_partial = int(thresholds.get("bands_partial", 1))
 
     client = _get_ms_client()
-    result = (
+    result = await asyncio.to_thread(lambda: (
         client
         .table("phone_network_bands")
         .select("band_id, lookup_network_bands(band_name)")
         .eq("model_id", model_id)
         .execute()
-    )
+    ))
     rows = result.data or []
 
     found_bands = set()
@@ -443,14 +446,14 @@ async def _rule_battery_endurance(rule: dict, model_id: int, url_registry_id: in
     client = _get_ms_client()
 
     # Battery capacity
-    charge_res = (
+    charge_res = await asyncio.to_thread(lambda: (
         client
         .table("charging_specs")
         .select("battery_capacity")
         .eq("model_id", model_id)
         .limit(1)
         .execute()
-    )
+    ))
     charge_rows = charge_res.data or []
     if not charge_rows or charge_rows[0].get("battery_capacity") is None:
         logger.debug("battery_endurance: no battery_capacity for model_id=%d — skip", model_id)
@@ -459,13 +462,13 @@ async def _rule_battery_endurance(rule: dict, model_id: int, url_registry_id: in
     mah = float(charge_rows[0]["battery_capacity"])
 
     # C3 FIX: correct column name is refresh_rate, not refresh_rate_max_hz
-    disp_res = (
+    disp_res = await asyncio.to_thread(lambda: (
         client
         .table("phone_displays")
-        .select("refresh_rate, display_position")             # C3 FIX
+        .select("display_id, refresh_rate, display_position")  # Fix 12: added display_id
         .eq("model_id", model_id)
         .execute()
-    )
+    ))
     disp_rows = disp_res.data or []
     primary_refresh = None
     primary_display_id = None
@@ -484,13 +487,13 @@ async def _rule_battery_endurance(rule: dict, model_id: int, url_registry_id: in
     # N2 FIX: exempt LTPO/adaptive displays from battery downgrade
     is_adaptive = False
     if high_refresh and primary_display_id is not None:
-        feat_res = (
+        feat_res = await asyncio.to_thread(lambda: (
             client
             .table("phone_display_features")
             .select("lookup_display_features(feature_name)")
             .eq("display_id", primary_display_id)
             .execute()
-        )
+        ))
         for feat_row in (feat_res.data or []):
             feat_lookup = feat_row.get("lookup_display_features") or {}
             feat_name   = (feat_lookup.get("feature_name") or "").lower()
@@ -559,14 +562,14 @@ async def _rule_charger_in_box(rule: dict, model_id: int, url_registry_id: int) 
     watt_premium = float(thresholds.get("watt_premium", 65))
 
     client = _get_ms_client()
-    res = (
+    res = await asyncio.to_thread(lambda: (
         client
         .table("charging_specs")
         .select("charger_in_box, charging_power")             # C2 FIX
         .eq("model_id", model_id)
         .limit(1)
         .execute()
-    )
+    ))
     rows = res.data or []
     if not rows:
         return None
@@ -606,14 +609,14 @@ async def _rule_hybrid_sim(rule: dict, model_id: int, url_registry_id: int) -> d
     M1 FIX: Schema column is sim_config_id (not sim_configuration_id).
     """
     client = _get_ms_client()
-    res = (
+    res = await asyncio.to_thread(lambda: (
         client
         .table("network")
         .select("sim_config_id, lookup_sim_configurations(configuration_name)")  # M1 FIX
         .eq("model_id", model_id)
         .limit(1)
         .execute()
-    )
+    ))
     rows = res.data or []
     if not rows:
         return None
@@ -650,14 +653,14 @@ async def _rule_multimedia_quality(rule: dict, model_id: int, url_registry_id: i
     speakers_stereo = int(thresholds.get("speakers_stereo", 2))
 
     client = _get_ms_client()
-    res = (
+    res = await asyncio.to_thread(lambda: (
         client
         .table("audio")
         .select("speaker_count, speaker_positions")
         .eq("model_id", model_id)
         .limit(1)
         .execute()
-    )
+    ))
     rows = res.data or []
     if not rows:
         return None
@@ -716,13 +719,13 @@ async def _rule_aperture_low_light(rule: dict, model_id: int, url_registry_id: i
     aperture_min_sane  = float(thresholds.get("aperture_min_sane",  0.8))  # N5
 
     client = _get_ms_client()
-    res = (
+    res = await asyncio.to_thread(lambda: (
         client
         .table("camera_lens_specs")
         .select("aperture, lens_type_id")
         .eq("model_id", model_id)
         .execute()
-    )
+    ))
     rows = res.data or []
 
     apertures = [

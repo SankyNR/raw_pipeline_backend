@@ -26,7 +26,7 @@ extraction_task:
       3rd        — Aggregator sites (GSMArena, Smartprix): used when OEM and
                    transcript are both silent on a field
     EXCEPTION: For numeric precision fields (resolution_px, battery_capacity,
-    exact mm dimensions, megapixels) prefer aggregator values over transcript —
+    exact mm dimensions (height/width/thickness), megapixels) prefer aggregator values over transcript —
     transcripts round and approximate.
 
   derived_fields_do_not_extract: |
@@ -48,12 +48,11 @@ output:
     cpu_architecture: null
     fabrication_node: null
     number_of_cores: null
-    cpu_high_performance: null
+    cpu_high_performance_cores: null
     cpu_performance_cores: null
     cpu_efficiency_cores: null
     cpu_clock_speed: null
     gpu_name: null
-    gpu_architecture: null
     gpu_unit_count: null
     gpu_unit_type: null
     gpu_clock_speed: null
@@ -91,12 +90,12 @@ output:
       display_features: []
 
   body:
-    length: null
-    breadth: null
     height: null
-    length_folded: null
-    breadth_folded: null
+    width: null
+    thickness: null
     height_folded: null
+    width_folded: null
+    thickness_folded: null
     weight: null
     build: null
     buttons: null
@@ -186,7 +185,6 @@ output:
       is_macro_capable: null
       lens_features: null
       stabilization: []
-      camera_features: []
 
   video_capabilities:
     rear_video_resolutions: null
@@ -219,6 +217,18 @@ output:
     ai_features: []
 
   extra_features: []
+
+  camera_features: []
+
+  performance_benchmarks:
+    antutu_version: null
+    antutu_score: null
+    geekbench_version: null
+    geekbench_single_core: null
+    geekbench_multi_core: null
+    three_d_mark_test: null
+    three_d_mark_score: null
+    cooling_system: null
 
   in_the_box:
     - item_name: null
