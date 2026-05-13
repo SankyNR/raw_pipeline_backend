@@ -590,6 +590,7 @@ from app.repositories.extraction_repository import (  # noqa: E402 — deferred 
     fetch_latest_commit_validation,
     fetch_non_suppressed_experiences_for_commit,
     fetch_brand_for_phone,
+    fetch_pending_staging_entries,
     insert_commit_validation_run,
 )
 from app.config.field_mapping import SCALAR_FK_MAP  # noqa: E402
@@ -755,6 +756,7 @@ async def run_pre_commit_validation(
 
     # ------------------------------------------------------------------
     # Check 2 — FK pre-resolution check
+    # Section 5: pending staged FK strings are downgraded to warnings
     # ------------------------------------------------------------------
     if not LOOKUP_CACHE:
         logger.warning(
@@ -762,6 +764,18 @@ async def run_pre_commit_validation(
             "FK check skipped. build_lookup_cache() may not have run."
         )
     else:
+        # Fetch pending staging entries once for the whole check
+        pending_staging = await asyncio.to_thread(
+            fetch_pending_staging_entries, url_registry_id
+        )
+        # Build a quick-lookup set of (cleaned_value, table_path) pairs that
+        # are currently staged — these will become warnings, not hard errors.
+        pending_staging_pairs: set[tuple[str, str]] = {
+            (clean_for_lookup(str(p["extracted_value"])), p["target_lookup_table"])
+            for p in pending_staging
+            if p.get("extracted_value") and p.get("target_lookup_table")
+        }
+
         for wildcard_path, table_path in SCALAR_FK_MAP.items():
             concrete_paths = _expand_wildcard_path(final_json, wildcard_path)
             for field_path in concrete_paths:
@@ -773,7 +787,7 @@ async def run_pre_commit_validation(
                 cleaned = clean_for_lookup(str(value))
                 lookup = LOOKUP_CACHE.get(table_path, {})
                 if cleaned not in lookup:
-                    errors.append({
+                    entry = {
                         "check":   "fk_not_resolved",
                         "field":   field_path,
                         "value":   value,
@@ -783,7 +797,19 @@ async def run_pre_commit_validation(
                             f"{table_path} and is not NULL. "
                             f"Resolve via staging queue before committing."
                         ),
-                    })
+                    }
+                    # Section 5: if the unresolved value has a pending staging row,
+                    # the Step 2.5 auto-resolver will handle it at commit time —
+                    # downgrade to a warning instead of a hard error.
+                    if (cleaned, table_path) in pending_staging_pairs:
+                        entry["message"] = (
+                            f"Value {value!r} has a pending staging entry for "
+                            f"{table_path} — will be auto-resolved at commit (Step 2.5). "
+                            f"Advisory only."
+                        )
+                        warnings.append(entry)
+                    else:
+                        errors.append(entry)
 
     # ------------------------------------------------------------------
     # Check 3 — Five-condition gate (live DB re-read)

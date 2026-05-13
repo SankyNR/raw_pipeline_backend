@@ -385,6 +385,7 @@ async def call_gemini_json(
     output_schema: type | None,
     temperature: float = 0.1,
     max_retries: int = 3,
+    return_raw_response: bool = False,
 ) -> dict[str, Any]:
     """
     Calls Gemini with JSON mode enforced (response_mime_type="application/json").
@@ -393,16 +394,20 @@ async def call_gemini_json(
     One API call per extraction. No chaining, no AFC, no tool calling.
 
     Args:
-        system_prompt:  ECD for Run A; experience system prompt for Run B.
-        user_content:   Assembled sources string (Run A) or transcript text (Run B).
-        output_schema:  Must be a Pydantic BaseModel subclass (NOT a dict or raw type).
-                        The Gemini SDK requires a structured schema object.
-                        Passing a raw dict will fail or disable schema enforcement.
-        temperature:    0.1 for Run A (deterministic); 0.3 for Run B (expressive).
-        max_retries:    Maximum retry attempts (backoff: 2s → 4s → 8s).
+        system_prompt:        ECD for Run A; experience system prompt for Run B.
+        user_content:         Assembled sources string (Run A) or transcript text (Run B).
+        output_schema:        Must be a Pydantic BaseModel subclass (NOT a dict or raw type).
+                              The Gemini SDK requires a structured schema object.
+                              Passing a raw dict will fail or disable schema enforcement.
+        temperature:          0.1 for Run A (deterministic); 0.3 for Run B (expressive).
+        max_retries:          Maximum retry attempts (backoff: 2s → 4s → 8s).
+        return_raw_response:  If True, returns (parsed_dict, raw_response) instead of just
+                              parsed_dict. Used by Stage 1 to read usage_metadata for token
+                              counting without an extra API call.
 
     Returns:
         Parsed dict matching output_schema structure.
+        If return_raw_response=True: (parsed_dict, raw_response) tuple.
 
     Raises:
         GeminiNonRetryableError: If output_schema is not a Pydantic BaseModel subclass,
@@ -443,13 +448,13 @@ async def call_gemini_json(
 
             try:
                 # Strip any backslash that isn't part of a valid JSON escape sequence (\| → |, etc.)
-                raw_text = re.sub(r'\\([^"\\/bfnrtu\n\r])', r'\1', raw_text)
+                raw_text = re.sub(r'\\([^"\\\/bfnrtu\n\r])', r'\1', raw_text)
                 parsed = json.loads(raw_text)
                 logger.debug(
                     "call_gemini_json success | model=%s | response_chars=%d",
                     EXTRACTION_MODEL, len(raw_text),
                 )
-                return parsed
+                return (parsed, response) if return_raw_response else parsed
             except json.JSONDecodeError as exc:
                 cleaned = _extract_json_object(raw_text)
                 try:
@@ -458,7 +463,7 @@ async def call_gemini_json(
                         "call_gemini_json success (fallback parse) | model=%s | response_chars=%d",
                         EXTRACTION_MODEL, len(raw_text),
                     )
-                    return parsed
+                    return (parsed, response) if return_raw_response else parsed
                 except json.JSONDecodeError:
                     raise GeminiNonRetryableError(
                         f"call_gemini_json: JSON decode failed: {exc}. "

@@ -130,6 +130,61 @@ def fetch_pipeline_run(run_id: str) -> dict | None:
     return result.data[0] if result.data else None
 
 
+def update_normalized_spec_flag(
+    normalized_id: int,
+    *,
+    new_chipset_detected: bool | None = None,
+    chipset_name_enriched: bool | None = None,
+    tier_id: int | None = None,
+    price_verified_at: str | None = None,
+) -> None:
+    """
+    Patches one or more flag columns on pipeline.normalized_spec_json.
+
+    Used by:
+      - pre_normalizer_enrichment.py  → sets chipset_name_enriched, price_verified_at
+      - normalizer.py (Section 3.1)   → sets new_chipset_detected
+      - gap_analyzer.py (Section 4)   → sets tier_id
+
+    All arguments are keyword-only and optional. Only non-None kwargs are written.
+    Silently succeeds if normalized_id does not exist (fire-and-forget pattern).
+
+    Args:
+        normalized_id:         PK of pipeline.normalized_spec_json row.
+        new_chipset_detected:  TRUE when chipset name resolved but no DB row in chipsets.
+        chipset_name_enriched: TRUE when chipset name was filled by pre-normalizer Gemini call.
+        tier_id:               FK to pipeline.lookup_price_tiers (cached tier classification).
+        price_verified_at:     ISO timestamp string of last successful price verification.
+                               Pass \"now()\" to use current UTC time (resolved here).
+
+    Synchronous. Always wrap with asyncio.to_thread() from async callers.
+    """
+    payload: dict = {}
+
+    if new_chipset_detected  is not None: payload["new_chipset_detected"]  = new_chipset_detected
+    if chipset_name_enriched is not None: payload["chipset_name_enriched"] = chipset_name_enriched
+    if tier_id               is not None: payload["tier_id"]               = tier_id
+    if price_verified_at     is not None:
+        import datetime as _dt
+        payload["price_verified_at"] = (
+            _dt.datetime.now(_dt.timezone.utc).isoformat()
+            if price_verified_at == "now()"
+            else price_verified_at
+        )
+
+    if not payload:
+        return  # nothing to write — skip round trip
+
+    (
+        get_client()
+        .schema("pipeline")
+        .table("normalized_spec_json")
+        .update(payload)
+        .eq("normalized_id", normalized_id)
+        .execute()
+    )
+
+
 def fetch_recent_pipeline_runs(url_registry_id: int, limit: int = 10) -> list[dict]:
     """
     Returns the N most recent pipeline runs for a phone, ordered by started_at DESC.

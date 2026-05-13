@@ -38,12 +38,14 @@ from app.core.db_retry import db_call_with_retry  # #9 fix: retry on transient D
 from app.core.supabase_client import get_client
 from app.repositories.extraction_repository import (
     fetch_spec_extraction_output,
+    fetch_brand_model_by_url_registry_id,
     insert_normalisation_run,
     insert_lookup_value_staging,
     update_normalisation_run,
     upsert_normalized_spec,
 )
-from app.repositories.mobile_specs_repository import fetch_chipset_by_name
+from app.repositories.mobile_specs_repository import fetch_brand_id, fetch_chipset_by_name
+from app.services.pre_normalizer_enrichment import run_pre_normalizer_enrichment
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +159,56 @@ LOOKUP_CACHE: dict[str, dict[str, int]] = {}
 # Structure: {table_path: {cleaned_value: raw_canonical_value}}
 _LOOKUP_CANONICAL: dict[str, dict[str, str]] = {}
 
+# ---------------------------------------------------------------------------
+# Section 2.1 — Alias cache for camera feature brand-aware resolution
+# Structure: {cleaned_brand_alias: {brand_id_or_None: feature_id}}
+# brand_id_or_None preserves brand-aware resolution for collision cases (N7).
+# ---------------------------------------------------------------------------
+ALIAS_CACHE: dict[str, dict[int | None, int]] = {}
+
+# ---------------------------------------------------------------------------
+# Section 3.1 — Chipset row cache
+# Loaded once at startup via warm_chipset_rows().
+# Structure: {chipset_id: full_row_dict}
+# Replaces per-phone fetch_chipset_by_name DB calls — zero I/O at runtime.
+# Table is small (~500 rows), low write frequency, high read frequency.
+# ---------------------------------------------------------------------------
+CHIPSET_ROW_CACHE: dict[int, dict] = {}
+
+
+def warm_chipset_rows() -> None:
+    """
+    Section 3.1 — Loads all rows from mobile_specs.chipsets into CHIPSET_ROW_CACHE.
+
+    Called once at app startup inside build_lookup_cache(), after standard lookup
+    tables are loaded.  Re-called via POST /extraction/cache/refresh so admin
+    chipset additions are picked up without an app restart.
+
+    Synchronous — wrapped in asyncio.to_thread() by build_lookup_cache().
+    """
+    result = (
+        get_client()
+        .schema("mobile_specs")
+        .table("chipsets")
+        .select("*")
+        .execute()
+    )
+    rows = result.data or []
+    CHIPSET_ROW_CACHE.clear()
+    for row in rows:
+        cid = row.get("chipset_id")
+        if cid is not None:
+            CHIPSET_ROW_CACHE[int(cid)] = row
+    logger.info(
+        "warm_chipset_rows: loaded %d chipset rows into CHIPSET_ROW_CACHE.",
+        len(CHIPSET_ROW_CACHE),
+    )
+
+
+def get_chipset_row(chipset_id: int) -> dict:
+    """Returns the cached chipset row dict for chipset_id, or empty dict if not cached."""
+    return CHIPSET_ROW_CACHE.get(chipset_id, {})
+
 # Levenshtein distance threshold — accept fuzzy if distance <= this value
 _FUZZY_THRESHOLD = 2
 
@@ -212,6 +264,28 @@ async def build_lookup_cache() -> None:
     logger.info(
         "build_lookup_cache: complete. %d tables cached.", len(LOOKUP_CACHE)
     )
+
+    # Section 2.1 — load the alias cache after all standard tables
+    await _load_alias_cache()
+
+    # Section 3.1 — warm chipset row cache (for DB-injection branch in Step 2.5)
+    try:
+        await asyncio.to_thread(warm_chipset_rows)
+    except Exception as exc:
+        logger.error(
+            "build_lookup_cache: warm_chipset_rows failed: %s — "
+            "chipset DB-injection will fall back to fetch_chipset_by_name.", exc
+        )
+
+    # Section 4 — warm gap analyzer caches (price tiers + enrichment policy)
+    try:
+        from app.services.gap_analyzer import warm_gap_caches
+        await asyncio.to_thread(warm_gap_caches)
+    except Exception as exc:
+        logger.error(
+            "build_lookup_cache: warm_gap_caches failed: %s — "
+            "gap analyzer will fall back to legacy FIELD_PRIORITY_MAP.", exc
+        )
 
 
 def _load_one_table(table_path: str) -> None:
@@ -274,6 +348,36 @@ def _load_one_table(table_path: str) -> None:
     _LOOKUP_CANONICAL[table_path] = canonical_map
     logger.debug(
         "_load_one_table: %s → %d entries cached.", table_path, len(value_map)
+    )
+
+
+async def _load_alias_cache() -> None:
+    """
+    Section 2.1 — Load lookup_feature_aliases into ALIAS_CACHE preserving brand_id.
+
+    Structure: {cleaned_brand_alias: {brand_id_or_None: feature_id}}
+    brand_id_or_None allows brand-aware resolution so the same alias string
+    can map to different canonicals per brand (N7 collision scenario).
+
+    Called at the end of build_lookup_cache() and on cache/refresh.
+    """
+    def _do() -> None:
+        client = get_client()
+        result = (
+            client.schema("mobile_specs")
+            .table("lookup_feature_aliases")
+            .select("brand_alias, brand_id, feature_id")
+            .execute()
+        )
+        ALIAS_CACHE.clear()
+        for row in (result.data or []):
+            cleaned = clean_for_lookup(str(row["brand_alias"]))
+            ALIAS_CACHE.setdefault(cleaned, {})[row["brand_id"]] = row["feature_id"]
+
+    await asyncio.to_thread(_do)
+    logger.info(
+        "build_lookup_cache: loaded %d alias entries into ALIAS_CACHE",
+        sum(len(v) for v in ALIAS_CACHE.values()),
     )
 
 
@@ -348,6 +452,44 @@ def resolve_lookup_value(
         return best_pk, canonical.get(best_key, best_key), "fuzzy"
 
     return None, None, "not_found"
+
+
+# ---------------------------------------------------------------------------
+# Section 2.2 — Brand-aware camera feature resolver
+# ---------------------------------------------------------------------------
+
+def resolve_camera_feature_value(
+    raw_value: str,
+    brand_id: int | None,
+) -> tuple[int | None, str | None, str]:
+    """
+    Three-pass resolution for camera_features (Section 2.2 of roadmap):
+      1. Brand-specific alias match  (brand_alias, brand_id)  → ALIAS_CACHE
+      2. Brand-agnostic alias match  (brand_alias, NULL)      → ALIAS_CACHE
+      3. Canonical feature_name match → delegates to resolve_lookup_value()
+         (includes Levenshtein fuzzy fallback)
+      Falls through to not_found if all three passes fail — caller sends to staging.
+
+    Args:
+        raw_value: String extracted by the LLM (e.g. "Nightography").
+        brand_id:  Integer PK from public.brands, or None if brand is unknown.
+
+    Returns:
+        (feature_id, corrected_name, resolution_type) where resolution_type is one of:
+          'alias_brand_specific' | 'alias_global' | 'exact' | 'fuzzy' | 'not_found'
+    """
+    cleaned = clean_for_lookup(raw_value)
+
+    # Pass 1: brand-specific alias match
+    if cleaned in ALIAS_CACHE and brand_id is not None and brand_id in ALIAS_CACHE[cleaned]:
+        return ALIAS_CACHE[cleaned][brand_id], raw_value, "alias_brand_specific"
+
+    # Pass 2: brand-agnostic alias match
+    if cleaned in ALIAS_CACHE and None in ALIAS_CACHE[cleaned]:
+        return ALIAS_CACHE[cleaned][None], raw_value, "alias_global"
+
+    # Pass 3: canonical name match (exact + fuzzy via standard resolver)
+    return resolve_lookup_value(raw_value, "mobile_specs.lookup_camera_features.feature_name")
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +580,61 @@ _BRAND_CHARGING_FALLBACK: dict[str, str | None] = {
     "Nothing":    None,
     "Honor":      "Honor SuperCharge",
 }
+
+
+def _apply_tier_gated_wireless_cascade(data: dict) -> dict:
+    """
+    Section 3.2 — Step 8.7: Tier-gated wireless charging cascade.
+
+    Wireless charging default logic, gated by base variant launch_price:
+
+    Case 1: wireless_charging IS NULL
+        - base_variant_price < ₹30,000  → default False + full cascade nulls
+        - base_variant_price ≥ ₹30,000  → leave null (gap analyzer will enrich)
+        - price unknown (no base variant) → leave null (safe default)
+
+    Case 2: wireless_charging IS FALSE (explicit LLM output)
+        → always enforce cascade nulls (power/standard) + default reverse=False
+
+    Case 3: wireless_charging IS TRUE
+        → no action; gap analyzer handles missing power/standard fields.
+
+    cpu_clock_speed / gpu_clock_speed are NOT touched — they live in the chipset
+    block and are phone-specific; this function only touches the charging block.
+    """
+    charging = data.get("charging")
+    if not isinstance(charging, dict):
+        return data
+
+    variants = data.get("variants") or []
+    base_variant_price: int | None = next(
+        (v.get("launch_price") for v in variants if v.get("is_base_variant") is True),
+        None,
+    )
+
+    wc = charging.get("wireless_charging")
+
+    if wc is None:
+        # Only default to False for confirmed budget phones (< ₹30,000)
+        if base_variant_price is not None and base_variant_price < 30000:
+            charging["wireless_charging"]               = False
+            charging["wireless_charging_power"]         = None
+            charging["wireless_charging_standard"]      = None
+            charging["reverse_wireless_charging"]       = False
+            charging["reverse_wireless_charging_power"] = None
+        # else: ≥ ₹30,000 or unknown price → leave null, gap analyzer enriches
+
+    elif wc is False:
+        # Explicit False from LLM → cascade to dependents
+        charging["wireless_charging_power"]    = None
+        charging["wireless_charging_standard"] = None
+        # Default reverse to False only if currently null
+        if charging.get("reverse_wireless_charging") is None:
+            charging["reverse_wireless_charging"] = False
+        if charging.get("reverse_wireless_charging") is False:
+            charging["reverse_wireless_charging_power"] = None
+
+    return data
 
 
 def _check_range(field_path: str, value: Any) -> tuple[Any, str | None]:
@@ -553,48 +750,121 @@ async def run_normalisation(output_id: int) -> dict:
         issues: list[dict] = []
         staging_count = 0
 
-        # Step 2.5 — Chipset deduplication (Change 6b)
+        # ── Section 2 — Pre-normalizer enrichment pass ───────────────────────
+        # Runs before ALL normalisation steps so prices are clean integers and
+        # chipset.chipset_name is populated before Step 2.5 fires.
+        # Failure is non-fatal: issues are logged, pipeline continues unchanged.
+        try:
+            brand_model = await asyncio.to_thread(
+                fetch_brand_model_by_url_registry_id, url_registry_id
+            )
+            if brand_model:
+                _pre_brand, _pre_model = brand_model
+                normalized_json, pre_issues = await run_pre_normalizer_enrichment(
+                    normalized_json,
+                    brand=_pre_brand,
+                    model_name=_pre_model,
+                    normalized_id=None,   # row not yet created at this point
+                    price_verified_at=None,
+                    force_price_check=False,
+                )
+                issues.extend(pre_issues)
+                logger.info(
+                    "run_normalisation: pre-normalizer enrichment complete — "
+                    "%d pre-issues for output_id=%d",
+                    len(pre_issues), output_id,
+                )
+            else:
+                logger.warning(
+                    "run_normalisation: could not resolve brand/model for "
+                    "url_registry_id=%d — pre-normalizer enrichment skipped.",
+                    url_registry_id,
+                )
+        except Exception as _pre_exc:
+            logger.warning(
+                "run_normalisation: pre-normalizer enrichment raised unexpectedly "
+                "(output_id=%d): %s — continuing without pre-enrichment.",
+                output_id, _pre_exc,
+            )
+
+        # Step 2.5 — Chipset deduplication + DB-injection (Change 6b + Section 3.1)
         # Must run BEFORE gap analysis so the gap analyzer sees finalized chipset data.
-        # If the chipset already exists in the DB, overwrite all chipset fields with
-        # DB-canonical values and embed chipset_id so the commit orchestrator skips
-        # the INSERT and links to the existing row directly.
+        # If the chipset already exists in the DB:
+        #   a) Overwrite all chipset fields with DB-canonical values.
+        #   b) Inject additional detail fields from CHIPSET_ROW_CACHE (zero I/O).
+        #      new_chipset_detected flag is left False (chip is known).
+        # If NOT in DB: retain LLM-extracted values; capture name so we can set
+        #   new_chipset_detected=True after Step 9 (when normalized_id exists).
+        _new_chipset_name: str | None = None  # set below if chip not found in DB
         chipset_raw = normalized_json.get("chipset", {})
         chipset_name_raw: str | None = chipset_raw.get("chipset_name") if isinstance(chipset_raw, dict) else None
         if chipset_name_raw:
-            existing_chipset = await asyncio.to_thread(fetch_chipset_by_name, chipset_name_raw)
+            # Use in-memory cache when warm; fall back to DB query on cache miss.
+            existing_chipset: dict | None = None
+            _cached_by_name = next(
+                (row for row in CHIPSET_ROW_CACHE.values()
+                 if row.get("chipset_name", "").strip().lower() == chipset_name_raw.strip().lower()),
+                None,
+            )
+            if _cached_by_name:
+                existing_chipset = _cached_by_name
+            else:
+                # Cache miss (cache empty or not yet warmed) — fall back to DB
+                existing_chipset = await asyncio.to_thread(fetch_chipset_by_name, chipset_name_raw)
+
             if existing_chipset:
-                # Overwrite extracted values with DB-canonical values.
-                # All fields — even those the LLM may have filled differently — are replaced.
-                normalized_json["chipset"] = {
+                chipset_id_from_db = existing_chipset.get("chipset_id")
+
+                # Section 3.1 — DB-injection: build canonical chipset block.
+                # cpu_clock_speed and gpu_clock_speed are intentionally excluded:
+                # these are phone-specific (OEMs bin/underclock the same chipset).
+                # They remain from LLM extraction or null — gap analyzer will enrich.
+                _CHIPSET_CANONICAL_COLS = (
+                    "chipset_id",
+                    "chipset_name",
+                    "cpu_architecture",
+                    "fabrication_node",
+                    "number_of_cores",
+                    "cpu_high_performance_cores",
+                    "cpu_performance_cores",
+                    "cpu_efficiency_cores",
+                    "gpu_name",
+                    "gpu_unit_count",
+                    "gpu_unit_type",
+                    "npu_details",
+                    "npu_tops",
+                )
+                # Preserve phone-specific speed fields from LLM extraction
+                lm_cpu_clock = (chipset_raw or {}).get("cpu_clock_speed")
+                lm_gpu_clock = (chipset_raw or {}).get("gpu_clock_speed")
+
+                injected_block = {
                     k: existing_chipset.get(k)
-                    for k in (
-                        "chipset_id",
-                        "chipset_name",
-                        "cpu_architecture",
-                        "fabrication_node",
-                        "number_of_cores",
-                        "cpu_high_performance_cores",
-                        "cpu_performance_cores",
-                        "cpu_efficiency_cores",
-                        "cpu_clock_speed",
-                        "gpu_name",
-                        "gpu_unit_count",
-                        "gpu_unit_type",
-                        "gpu_clock_speed",
-                        "npu_details",
-                        "npu_tops",
-                    )
+                    for k in _CHIPSET_CANONICAL_COLS
                 }
+                # Re-inject phone-specific speed fields from LLM (may be null)
+                injected_block["cpu_clock_speed"] = lm_cpu_clock
+                injected_block["gpu_clock_speed"] = lm_gpu_clock
+
+                # Also pull any extra detail fields from in-memory cache row
+                if chipset_id_from_db and chipset_id_from_db in CHIPSET_ROW_CACHE:
+                    cache_row = CHIPSET_ROW_CACHE[int(chipset_id_from_db)]
+                    for col in _CHIPSET_CANONICAL_COLS:
+                        if injected_block.get(col) is None and cache_row.get(col) is not None:
+                            injected_block[col] = cache_row[col]
+
+                normalized_json["chipset"] = injected_block
                 logger.info(
                     "run_normalisation: chipset %r found in DB (chipset_id=%s) — "
-                    "overriding extracted chipset fields with DB-canonical values. "
-                    "Chipset fields will not appear in gap analysis.",
-                    chipset_name_raw, existing_chipset.get("chipset_id"),
+                    "DB-canonical values injected; phone-specific clock speeds retained.",
+                    chipset_name_raw, chipset_id_from_db,
                 )
             else:
+                # Chipset not in DB — LLM values retained; flag after Step 9
+                _new_chipset_name = chipset_name_raw
                 logger.info(
                     "run_normalisation: chipset %r is NEW — extracted values retained. "
-                    "Gap analysis will identify missing chipset fields for enrichment.",
+                    "new_chipset_detected flag will be set after persist.",
                     chipset_name_raw,
                 )
 
@@ -630,11 +900,16 @@ async def run_normalisation(output_id: int) -> dict:
         # Runs after range validation so it never overwrites a valid extracted value.
         normalized_json = _apply_brand_charging_fallback(normalized_json)
 
-        # BIS certification — always true for all phones in this database.
-        # All phones are sold in India; BIS/MTCTE is mandatory.
-        # LLM cannot reliably set this without source evidence, so normalizer enforces it.
+        # Step 8.6 — BIS certification hardcode
+        # Always true: all phones in this DB are sold in India (BIS/MTCTE mandatory).
+        # LLM cannot set this reliably without source evidence — normalizer enforces it.
         if "certifications" in normalized_json and isinstance(normalized_json["certifications"], dict):
             normalized_json["certifications"]["bis_certification"] = True
+
+        # Step 8.7 — Tier-gated wireless charging cascade (Section 3.2)
+        # Only defaults wireless_charging=False for phones < ₹30,000.
+        # Premium phones (≥ ₹30,000) keep null so gap analyzer can enrich.
+        normalized_json = _apply_tier_gated_wireless_cascade(normalized_json)
 
         # Count remaining nulls
         remaining_nulls = _count_nulls(normalized_json)
@@ -655,6 +930,27 @@ async def run_normalisation(output_id: int) -> dict:
                 "ready_for_commit":     ready_for_commit,
             },
         )
+
+        # Section 3.1 — Set new_chipset_detected flag now that normalized_id exists.
+        # Fire-and-forget: a flag write failure never blocks the pipeline.
+        if _new_chipset_name:
+            try:
+                from app.repositories.pipeline_run_repository import update_normalized_spec_flag
+                await asyncio.to_thread(
+                    update_normalized_spec_flag,
+                    normalized_id,
+                    new_chipset_detected=True,
+                )
+                logger.info(
+                    "run_normalisation: new_chipset_detected=True set for "
+                    "normalized_id=%d chipset=%r — admin must add to mobile_specs.chipsets.",
+                    normalized_id, _new_chipset_name,
+                )
+            except Exception as _flag_exc:
+                logger.warning(
+                    "run_normalisation: failed to set new_chipset_detected for "
+                    "normalized_id=%d: %s", normalized_id, _flag_exc
+                )
 
         # Step 10 — Mark run complete
         # N9: issues_found (full log) goes to the run record, not to normalized_spec_json.
@@ -836,9 +1132,29 @@ def _resolve_array_fks(
 
     Change 3c: Skips any wifi_technology value found in _WIFI_TECHNOLOGIES_EXCLUDE
     so that "Wi-Fi Hotspot" etc. are silently dropped rather than sent to staging.
+
+    Section 2.3: For camera_features, uses resolve_camera_feature_value() which
+    performs three-pass alias-aware resolution (brand-specific → brand-agnostic →
+    canonical) before falling back to staging. brand_id is fetched once for the
+    whole call; failures fall back gracefully to brand-agnostic resolution.
     """
     issues: list[dict] = []
     staging_count = 0
+
+    # Section 2.3 — fetch brand_id once for camera_features alias resolution.
+    # _resolve_array_fks is called inside asyncio.to_thread so a sync DB call is safe.
+    brand_name = (data.get("brand") or {}).get("brand_name") or ""
+    brand_id: int | None = None
+    if brand_name:
+        try:
+            brand_id = fetch_brand_id(brand_name)
+        except Exception as exc:
+            logger.warning(
+                "_resolve_array_fks: failed to fetch brand_id for %r: %s. "
+                "camera_features alias resolution will fall back to brand-agnostic + canonical only.",
+                brand_name, exc,
+            )
+            brand_id = None
 
     for field_path, table_path in ARRAY_FK_MAP.items():
         concrete_paths = _expand_wildcard_path(data, field_path)
@@ -850,6 +1166,10 @@ def _resolve_array_fks(
 
             resolved_pairs: list[tuple[str, int]] = []  # N10: (canonical_str, pk)
             seen_pks: set[int] = set()
+
+            # Section 2.3 — camera_features uses brand-aware three-pass resolution.
+            # All other arrays use the standard band-prefix-normalised path.
+            is_camera_features = (concrete_path == "camera_features")
 
             for raw_value in raw_array:
                 if raw_value is None:
@@ -863,14 +1183,21 @@ def _resolve_array_fks(
                     )
                     continue
 
-                # Fix: enforce correct band prefix before fuzzy matching
-                # so "28" becomes "B28" (4G) or "n28" (5G) before lookup.
-                normalized_value = _normalize_band_value(str(raw_value), field_path)
-                pk, corrected, resolution_type = resolve_lookup_value(
-                    normalized_value, table_path
-                )
+                if is_camera_features:
+                    # Section 2.3: alias-aware three-pass resolution
+                    pk, corrected, resolution_type = resolve_camera_feature_value(
+                        str(raw_value), brand_id
+                    )
+                else:
+                    # Standard path: enforce band prefix then resolve
+                    normalized_value = _normalize_band_value(str(raw_value), field_path)
+                    pk, corrected, resolution_type = resolve_lookup_value(
+                        normalized_value, table_path
+                    )
 
-                if resolution_type == "exact":
+                # resolution_type values that yield a valid pk:
+                # 'exact', 'fuzzy', 'alias_brand_specific', 'alias_global'
+                if resolution_type in ("exact", "alias_brand_specific", "alias_global"):
                     if pk not in seen_pks:
                         resolved_pairs.append((corrected or str(raw_value), pk))
                         seen_pks.add(pk)

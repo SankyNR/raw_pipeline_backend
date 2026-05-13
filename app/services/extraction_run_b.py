@@ -198,18 +198,24 @@ _CATEGORY_NORMALISE: dict[str, str] = {c.lower(): c for c in _VALID_CATEGORIES}
 # ---------------------------------------------------------------------------
 
 EXPERIENCE_SYSTEM_PROMPT = """\
-Extract subjective experiential observations from a YouTube phone review transcript.
-This is Stage 1. Your output feeds Stage 2 which deduplicates across all transcripts.
+You are extracting user-experience observations from a phone review transcript.
+Extract every distinct observation the reviewer makes about the phone.
 
-AIM: 8–12 distinct observations. HARD MAXIMUM: 15. Never exceed 15.
-Quality over quantity. If you find fewer than 8 worthy observations, output only those.
+GRANULARITY RULE — THE MOST IMPORTANT INSTRUCTION:
+Extract each aspect of the phone's performance as a SEPARATE experience entry.
+Never combine two observations into one, even if the reviewer mentions them
+in the same sentence. One aspect = one experience entry.
 
-=== EXTRACT ONLY — real subjective experiences ===
-Things the reviewer personally observed, felt, or experienced during actual use:
-  "battery easily lasts a full day with heavy usage"
-  "photos in low light are surprisingly sharp"
-  "display becomes warm during extended gaming sessions"
-  "speaker sounds loud but slightly tinny at maximum volume"
+WRONG (combined): "The camera has good portrait mode and also performs well at night."
+CORRECT (separate):
+  Entry 1: "Portrait mode produces pleasing results."
+  Entry 2: "Night photos retain good detail and brightness."
+
+WRONG (combined): "The display is bright and smooth with vibrant colors."
+CORRECT (separate):
+  Entry 1: "The display is bright and readable in direct sunlight."
+  Entry 2: "The 144Hz refresh rate makes scrolling feel very smooth."
+  Entry 3: "Display colors are vibrant and vivid."
 
 === NEVER EXTRACT ===
 
@@ -245,18 +251,6 @@ DO NOT EXTRACT:
 DO EXTRACT (no competitor named):
   "display is bright enough to use in direct sunlight" → EXTRACT
 
-RULE 3 — ATOMIC OBSERVATIONS ONLY
-One entry = one distinct aspect of the phone's real-world experience.
-
-DO NOT EXTRACT (multiple signals bundled):
-  "the design, display, battery and camera all impressed me" → 4 signals, skip
-  "solid phone with good connectivity and smooth performance" → too vague, skip
-
-Camera has many sub-aspects — each is a separate observation:
-  "portrait mode captures excellent background blur"      → EXTRACT (portrait)
-  "low-light photos retain detail with minimal noise"     → EXTRACT (low light)
-  "video stabilisation is smooth while walking outdoors"  → EXTRACT (video)
-
 RULE 4 — NO GENERIC STATEMENTS
 Drop statements under 10 words or with no concrete claim.
 
@@ -268,15 +262,185 @@ DO NOT EXTRACT:
 DO EXTRACT:
   "app launches feel instant with no stutter during typical daily use" → EXTRACT
 
+CATEGORY ASPECTS — extract each of these as separate entries when mentioned:
+
+CAMERA (most important — be maximally granular):
+  Daylight photos:
+    - Color science: is it natural/realistic or processed/saturated/social-media-ready?
+    - Detail and sharpness: fine texture, crop quality, resolving power
+    - Dynamic range and HDR: highlight recovery, shadow detail
+  Portrait mode:
+    - Edge detection: accuracy on hair, glasses, complex background outlines
+    - Bokeh intensity: blur strength, how natural or artificial the falloff looks
+    - Skin tone accuracy: warmth, realism, level of beautification or smoothing
+  Night and low-light:
+    - Night photo quality: noise level, brightness, detail retention in darkness
+    - Night mode artifacts: oversharpening, halos, smearing, ghosting
+    - Low-light indoor: performance under artificial light specifically
+  Ultra-wide lens:
+    - Sharpness and distortion: center vs edge sharpness, barrel distortion
+    - Color consistency: how well it matches the main lens color and exposure
+    - Low-light performance: how much quality drops in dim conditions
+  Selfie and front camera:
+    - Detail and skin tone: clarity, naturalness vs beautification
+    - Selfie portrait: front camera bokeh and background cutout quality
+  Video:
+    - Stabilization: walking, handheld, sports, action stabilization quality
+    - Color science: natural vs saturated in video specifically
+    - Exposure consistency: against backlight, against the sun, mixed lighting
+    - Audio quality: microphone clarity, wind noise, background noise pickup
+  Special camera capabilities:
+    - Horizon lock: stability when phone is rotated during video recording
+    - Slow motion: quality and available fps options (120fps, 240fps, 960fps)
+    - Macro: sharpness and usable minimum focus distance
+    - Zoom: optical quality, point at which digital degradation becomes visible
+    - Capture speed: shot-to-shot speed, shutter lag, burst rate, time between consecutive photos
+    - Camera app features: unique modes such as Tilt-Shift, Live Filters, Active Photos, AR Stickers
+
+DISPLAY:
+  - Outdoor brightness: sunlight readability, perceived peak nits
+  - Color accuracy: natural and calibrated vs vivid and oversaturated
+  - Smoothness: 120Hz/144Hz feel, whether it works in third-party apps
+  - Black depth and contrast: OLED black quality, shadow detail in dark scenes
+  - Wet touch: does touch work reliably with wet fingers or in rain
+  - Accidental touches: palm rejection on curved edges, especially during gaming
+  - HDR content: quality of Netflix, YouTube, Dolby Vision playback
+  - Always-on display: usefulness and battery impact
+  - Eye comfort: blue light, PWM flicker sensitivity over long sessions
+
+PERFORMANCE:
+  - App launch speed: cold start times vs warm launch
+  - Multitasking and RAM: does switching between apps reload them or keep state
+  - UI smoothness: jank, dropped frames, stutter during scrolling and transitions
+  - Storage speed: app install time, file transfer speed, UFS optimization
+  - Fingerprint sensor: unlock latency, reliability with wet fingers
+  - Face unlock: speed and reliability in low light
+  - Heavy workloads: video export, large file processing, rendering
+  - Micro-stutters: performance consistency degradation under sustained load
+
+AUDIO:
+  - Loudness: maximum volume at a distance
+  - Clarity at max volume: distortion, crackling, harshness
+  - Bass response: low-end presence
+  - Stereo separation: left-right channel width and imaging
+  - Dolby Atmos / spatial audio: immersive effect in content
+  - Earpiece quality: clarity and volume specifically during phone calls
+  - Microphone: voice pickup, wind noise rejection, call clarity
+
+BUILD QUALITY:
+  - In-hand feel and grip: material texture, non-slip quality, comfort
+  - Weight and balance: how heavy it feels, distribution
+  - Thinness: slim feel in pocket and hand
+  - Material quality: metal frame, vegan leather, glass back specifics
+  - Smudge and fingerprint attraction: how quickly finish picks up marks
+  - Structural rigidity: frame flex, creak, any gaps
+  - Drop survivability: only extract from long-term reviews with actual drops
+
+SOFTWARE:
+  - Bloatware: pre-installed apps, which ones exist, uninstallability
+  - Ads in system apps: weather, gallery, browser, notification ads
+  - UI cleanliness: visual design quality and clutter level
+  - Update policy: OS years and security patch commitment
+  - Unique features: Ready For, Moto gestures, AI wallpapers, Peek Display, etc.
+  - Reliability: crashes, reboots, bugs encountered over time
+  - Customization: themes, lock screen, always-on, home screen options
+  - Notifications: spam, permission handling, dismissibility
+
+GAMING:
+  - Frame rate in titles: BGMI, COD, PUBG — fps achieved and max settings
+  - Frame rate stability: consistency over a 20-30 minute session
+  - Touch response: input lag, gaming touch sampling
+  - Gaming thermal: heat during extended gaming specifically
+  - High FPS mode: whether 90fps or 120fps is unlocked for supported games
+  - Speaker vibration: any uncomfortable tickle or vibration sensation during loud audio
+  - Game Mode: performance boost, notification blocking, latency mode features
+
+BATTERY LIFE:
+  - Screen-on time: hours of active use per charge
+  - Heavy use drain: gaming, camera, hotspot drain rate
+  - Light use endurance: day and a half, two-day use on minimal load
+  - Background drain: overnight idle battery loss
+  - Long-term degradation: capacity loss over months (long-term reviews only)
+
+CHARGING SPEED:
+  - Full charge time: 0 to 100% duration
+  - First half speed: 0 to 50% top-up time
+  - In-use charging: speed when phone is actively being used while charging
+  - Charger hardware: GaN, compact, versatility (can it charge a laptop too)
+  - Wireless charging: speed if the phone supports it
+  - Reverse wireless: practicality if supported
+
+THERMAL:
+  - Gaming thermal: how hot it gets during gaming
+  - Charging thermal: heat from fast charging
+  - Sustained load thermal: heat from benchmarks or video export
+  - Daily use thermal: warmth during browsing, calls, streaming
+  - Throttling: does heat cause noticeable performance degradation
+
+HAPTICS:
+  - Typing feedback: feel of keyboard vibration
+  - Notification and call vibration: pocket detectability, strength
+  - Motor type: linear motor vs basic rotary, X-axis motor quality
+  - Precision: crisp and intentional vs generic buzzy
+  - System UI: button presses, sliders, system sounds paired with haptics
+
+CONNECTIVITY:
+  - 5G speed: real-world throughput on 5G
+  - 5G consistency: indoor 5G hold, band switching
+  - Wi-Fi speed and range: 5GHz performance at distance
+  - Wi-Fi stability: drops, reconnections
+  - Bluetooth stability: audio dropout, range
+  - Bluetooth codec: LDAC, aptX, AAC quality
+  - USB: OTG, DisplayPort, data transfer speed
+  - Hotspot: speed to connected devices, battery drain
+
+CALL QUALITY:
+  - Earpiece voice clarity: received audio quality
+  - Noise cancellation: background rejection from microphone
+  - VoLTE: 4G HD voice clarity
+  - VoNR/Vo5G: 5G call quality, SIM staying on 5G during calls
+  - Loudspeaker calls: speakerphone volume and clarity
+  - Signal reception: network hold in weak areas
+
+IN THE BOX:
+  - Charger: wattage, GaN, compact size, multi-device compatibility
+  - Cable: material, length, connector type
+  - Protective case: material, fit quality, premium vs basic
+  - Packaging: eco-friendly, unboxing premium feel
+  - Missing items: what was NOT included that users expected
+
+DURABILITY:
+  - IP rating experience: real water or rain resistance in actual use
+  - Drop outcomes: screen, back, frame results from actual drops
+  - Screen scratch resistance: keys, coins, pocket debris
+  - Back finish wear: color fading, coating wear over months
+  - Glass protection: crack resistance from impact in real use
+
+OVERALL:
+  - Value for money: is it worth the price
+  - Target audience: who should buy this phone specifically
+  - Competitor comparison: vs specific named phones at the same price
+  - Long-term verdict: after 3+ months, would they recommend it
+  - Buy recommendation: yes / conditionally / no
+
+SENTIMENT RULES:
+  Positive: clearly good, praised, impressive, better than expected
+  Negative: clearly bad, criticized, disappointing, worse than expected
+  Neutral: factual statement with no evaluative judgment
+  Mixed: same single aspect has both positive and negative qualities
+
 === EVIDENCE QUOTE ===
 Verbatim sentence(s) from the transcript directly supporting the observation.
 Copy exactly — do not paraphrase or construct a composite.
 Set to null ONLY if no single sentence clearly supports the observation.
 
-=== CATEGORIES ===
-Thermal | Camera | Battery Life | Charging Speed | Display | Performance |
-Audio | Build Quality | Software | Gaming | Call Quality | Haptics |
-Connectivity | In the Box | Durability | Overall
+CONFIDENCE SCORING:
+  0.90-0.95: clear explicit statement, unambiguous
+  0.80-0.89: implied or indirect but clearly supported
+  0.70-0.79: inferred, context-dependent
+  Below 0.70: skip — do not extract this observation
+
+Extract every buyer-meaningful observation as a separate entry. Over-extraction of genuinely distinct aspects is fine. Avoid micro-fragmentation — do not split a single observation into sub-observations that carry the same buyer-facing signal.
 """
 
 
@@ -284,29 +448,139 @@ _STAGE2_TIMEOUT_SECONDS: float = 120.0
 _STAGE2_MAX_INPUT_CANDIDATES: int = 200
 
 _STAGE2_SYSTEM_PROMPT = """\
-You receive Stage 1 candidate experiences extracted from multiple YouTube phone review
-transcripts of the SAME phone. Aggregate, deduplicate, filter, and produce a final
-high-quality set.
+You are aggregating phone experience candidates extracted from multiple reviewer
+transcripts into a final deduplicated set of experiences.
 
-=== MANDATORY RULES ===
+MERGE PHILOSOPHY — INSIGHT LEVEL, NOT TOPIC LEVEL:
+Merge candidates only when they express the same specific user-facing insight.
+Different aspects of the same broad category are NOT the same insight and must
+NEVER be merged into one entry.
 
-RULE 1 — SEMANTIC DEDUPLICATION
-Merge candidates that express the same underlying observation, even if worded differently.
-Produce ONE canonical experience per semantic cluster.
+GENERAL MERGE RULE:
+  MERGE: same specific claim, same aspect, just different wording by different reviewers
+  DO NOT MERGE: different aspects of the same category, different scenarios,
+                contradictory claims
 
-MERGE THESE (same idea, different words):
-  [CANDIDATE] transcript=23: "Battery lasted 7 hours in my testing run"
-  [CANDIDATE] transcript=24: "I got 7 to 8 hours of screen on time"
-  [CANDIDATE] transcript=26: "Easily lasts all day with moderate usage"
-  [CANDIDATE] transcript=29: "Over a day of battery with typical use"
-  → ONE experience: "Battery provides 7–8 hours of screen-on time under typical usage."
-  → source_transcript_count = 4
+EXAMPLES OF CORRECT MERGING:
+  "Battery lasts all day" + "Got 7 hours SOT" + "Lasts a day and a half on light use"
+  → ONE: "Battery provides approximately 7-8 hours of screen-on time on moderate
+          use, and can stretch to a day and a half on light usage."
 
-KEEP SEPARATE (genuinely different sub-aspects):
-  "Portrait mode edge detection is precise and sharp"          → keep separate
-  "Low-light photos retain detail with minimal noise"          → keep separate
-  "Video stabilisation is smooth while walking outdoors"       → keep separate
-  These are distinct experiential aspects of the camera — not duplicates.
+  "Clean UI, no bloatware" + "Near stock, zero unnecessary apps" + "99.9% clean software"
+  → ONE: "The software is clean with minimal pre-installed apps, most of which
+          can be uninstalled."
+
+  "Stereo speakers sound great" + "Dolby Atmos gets loud without crackling" + "Rich crisp sound"
+  → ONE: "Stereo speakers with Dolby Atmos deliver loud, rich, crisp audio
+          without distortion even at maximum volume."
+
+  "5G speeds were consistently good" + "5G speeds higher than competitor phones"
+  → ONE: "5G real-world speeds are consistently strong, outperforming competing
+          phones at the same price point."
+
+EXAMPLES OF INCORRECT MERGING — NEVER DO THESE:
+  WRONG: Merging "portrait edge detection is sharp" + "portrait bokeh is quite aggressive"
+         into "portrait mode performs well"
+         → Two separate aspects, different sentiments. Keep both as separate entries.
+
+  WRONG: Merging "night photos look great" + "night mode causes oversharpening"
+         into "night photography is decent"
+         → Different scenarios. General night vs night mode specifically. Keep both.
+
+  WRONG: Merging "display is bright outdoors" + "144Hz feels very smooth"
+         into "display is great"
+         → Completely different aspects. Brightness and smoothness are independent.
+
+  WRONG: Merging "charges to 100% in 45 minutes" + "charges extremely slowly when in active use"
+         into "charging is generally fast"
+         → Different scenarios. Idle charging vs in-use charging. Keep both.
+
+  WRONG: Merging "haptics feel unrefined and buzzy" + "haptics are stronger than basic motors"
+         → Contradictory claims about different aspects. Keep both.
+
+  WRONG: Merging "gaming performance is smooth at 60fps" + "phone gets warm during gaming"
+         into "gaming experience is decent"
+         → Frame rate and thermal are completely separate aspects. Keep both.
+
+CATEGORY-SPECIFIC NO-MERGE RULES:
+Each item in these lists is a SEPARATE experience. Never combine across them.
+
+CAMERA:
+  Daylight color science | Daylight detail/sharpness | Daylight dynamic range/HDR |
+  Portrait edge detection | Portrait bokeh intensity | Portrait skin tone accuracy |
+  Night photo quality | Night mode artifacts | Low-light indoor performance |
+  Ultra-wide sharpness/distortion | Ultra-wide color consistency | Ultra-wide low-light |
+  Selfie detail/skin tone | Selfie portrait/edge detection |
+  Video stabilization | Video color science | Video exposure consistency | Video audio quality |
+  Horizon lock | Slow motion | Macro | Zoom | Capture speed | Camera app features
+
+DISPLAY:
+  Outdoor brightness | Color accuracy | Smoothness/refresh rate |
+  Black depth/contrast | Wet touch | Accidental touch rejection |
+  HDR content rendering | Always-on display | Eye comfort
+
+PERFORMANCE:
+  App launch speed | Multitasking/RAM management | UI smoothness |
+  Storage speed | Fingerprint sensor | Face unlock |
+  Heavy workload handling | Micro-stutters under sustained load
+
+AUDIO:
+  Loudness | Clarity/distortion at max volume | Bass response |
+  Stereo separation/soundstage | Dolby Atmos/spatial audio |
+  Earpiece call quality | Microphone quality
+
+BUILD QUALITY:
+  In-hand feel/grip | Weight/balance | Thinness |
+  Frame/back material quality | Smudge/fingerprint attraction |
+  Structural rigidity | Drop survivability
+
+SOFTWARE:
+  Bloatware | Ads in system apps | UI design/cleanliness |
+  Update policy | Unique/exclusive features | Software reliability |
+  Customization depth | Notification management
+
+GAMING:
+  Frame rate in demanding titles | Frame rate stability |
+  Touch response/latency | Gaming thermal |
+  High FPS mode availability | Speaker vibration during gaming | Game Mode features
+
+BATTERY LIFE:
+  Screen-on time | Heavy use endurance |
+  Light/standby endurance | Background drain | Long-term degradation
+
+CHARGING SPEED:
+  Full charge time (0-100%) | First-half speed (0-50%) |
+  In-use charging speed | Charger hardware quality |
+  Wireless charging speed | Reverse wireless charging
+
+THERMAL:
+  Gaming thermal | Charging thermal |
+  Sustained load thermal | Daily use thermal | Throttling impact on performance
+
+HAPTICS:
+  Typing feedback | Notification/call vibration strength |
+  Motor type/quality | Precision and refinement | System UI haptic feedback
+
+CONNECTIVITY:
+  5G speed | 5G consistency/band stability | Wi-Fi speed/range |
+  Wi-Fi stability | Bluetooth stability | Bluetooth codec quality |
+  USB connectivity | Mobile hotspot performance
+
+CALL QUALITY:
+  Voice clarity over earpiece | Noise cancellation |
+  VoLTE quality | VoNR/Vo5G quality | Loudspeaker call quality | Signal reception
+
+IN THE BOX:
+  Charger quality/versatility | Cable quality | Case/cover quality |
+  Packaging quality/sustainability | Missing accessories
+
+DURABILITY:
+  IP rating real-world | Drop survivability |
+  Screen scratch resistance | Back/finish wear | Glass protection effectiveness
+
+OVERALL:
+  Value for money | Target audience fit |
+  Competitor comparison | Long-term ownership verdict | Buy recommendation
 
 RULE 2 — CANONICAL REWRITING
 Write experience_text as a neutral, precise, present-tense third-person statement.
@@ -349,17 +623,22 @@ Drop entries with fewer than 10 words in experience_text.
 Drop non-atomic bundles (multiple unrelated aspects combined).
 
 RULE 7 — CATEGORY CAP
-Maximum 6 experiences per category.
-If a category has more clusters than 6, keep the 6 most distinct and informative.
+For all categories except Camera, aim for no more than 6 experiences.
+For Camera, all materially distinct aspects may be kept — do not merge aspects to hit a cap.
 
-RULE 8 — TOTAL OUTPUT CAP
-Produce 15–25 final experiences total.
-Prioritise breadth of category coverage over deep redundancy in one category.
-If fewer than 15 worthy observations exist, output only those — do not pad.
+RULE 8 — OUTPUT CALIBRATION
+OUTPUT CALIBRATION: For a typical 8-10 transcript set, expect 45-70 final experiences. Treat this as a calibration range, not a hard constraint. A phone with shallow transcripts may produce 30. A heavily reviewed flagship may produce 85. Prioritise semantic uniqueness and buyer usefulness. Do not merge distinct aspects to reduce count. Do not split single observations to increase count.
 
 RULE 9 — source_transcript_count
 Count distinct raw_transcript_ids from the input candidates merged into this cluster.
 Minimum: 1. A single specific observation from one high-quality transcript is valid.
+
+WHEN MERGING:
+  - Write ONE clean experience_text capturing the full insight with all nuances
+  - Use the most specific and informative evidence_quote from the group
+  - Set source_transcript_count = number of unique raw_transcript_ids that contributed
+  - Set confidence = average confidence of the group, rounded to 2 decimal places
+  - Use the raw_transcript_id from the highest-confidence candidate in the group
 
 === INPUT FORMAT ===
 [CANDIDATE] transcript={raw_transcript_id} category={category} conf={confidence}
@@ -626,20 +905,41 @@ async def _run_single_transcript_stage1(
         )
 
         async with _RUN_B_SEMAPHORE:
-            raw_output: dict = await asyncio.wait_for(
+            response = await asyncio.wait_for(
                 call_gemini_json(
                     system_prompt=EXPERIENCE_SYSTEM_PROMPT,
                     user_content=user_content,
                     output_schema=RunBExtractionSchema,
                     temperature=0.3,
+                    return_raw_response=True,
                 ),
                 timeout=_RUN_B_TIMEOUT_SECONDS,
             )
+
+        # Unpack: call_gemini_json returns (dict, raw_response) when return_raw_response=True
+        if isinstance(response, tuple):
+            raw_output, raw_response = response
+        else:
+            raw_output, raw_response = response, None
 
         logger.info(
             "_run_single_transcript_stage1: exp_run_id=%d — Stage 1 call complete",
             exp_run_id,
         )
+
+        # Change 2 — capture token usage from the Gemini response object
+        input_tokens = None
+        output_tokens = None
+        try:
+            usage = getattr(raw_response, "usage_metadata", None)
+            if usage:
+                input_tokens = getattr(usage, "prompt_token_count", None)
+                output_tokens = getattr(usage, "candidates_token_count", None)
+        except Exception as token_exc:
+            logger.warning(
+                "_run_single_transcript_stage1: failed to read token usage "
+                "(exp_run_id=%d): %s", exp_run_id, token_exc
+            )
 
         passing, filtered_count = _parse_experiences(raw_output=raw_output, exp_run_id=exp_run_id)
 
@@ -664,14 +964,20 @@ async def _run_single_transcript_stage1(
                 bulk_insert_experience_candidates, candidate_rows
             )
 
+        update_payload = {
+            "status":                "completed",
+            "finished_at":           "now()",
+            "experiences_extracted": candidates_stored,
+        }
+        if input_tokens is not None:
+            update_payload["input_token_count"] = input_tokens
+        if output_tokens is not None:
+            update_payload["output_token_count"] = output_tokens
+
         await asyncio.to_thread(
             update_experience_run,
             exp_run_id,
-            {
-                "status":                "completed",
-                "finished_at":           "now()",
-                "experiences_extracted": candidates_stored,
-            },
+            update_payload,
         )
 
         logger.info(
@@ -889,6 +1195,27 @@ async def _run_stage2_aggregation(
                 "dropped %d experiences (missing evidence or transcript ID)",
                 aggregation_run_id, dropped,
             )
+
+        # Change 3 — Safety net: dedup by experience_text before insert.
+        # Keeps highest confidence on collision. Prevents idx_phone_exp_unique_active_text
+        # from firing when Stage 2 LLM produces two experiences with identical text.
+        original_count = len(experience_rows)
+        seen_texts: dict[str, dict] = {}
+        for row in experience_rows:
+            text = row.get("experience_text", "")
+            if not text:
+                continue
+            existing = seen_texts.get(text)
+            if existing is None:
+                seen_texts[text] = row
+            elif row.get("confidence", 0) > existing.get("confidence", 0):
+                seen_texts[text] = row
+        experience_rows = list(seen_texts.values())
+        logger.info(
+            "_run_stage2_aggregation: aggregation_run_id=%d — "
+            "after text dedup: %d experiences (was %d before dedup)",
+            aggregation_run_id, len(experience_rows), original_count,
+        )
 
         # Supersede AFTER Stage 2 succeeds — old data is safe until now
         superseded_count = await asyncio.to_thread(supersede_experiences, url_registry_id)

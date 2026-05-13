@@ -126,6 +126,7 @@ from app.repositories.mobile_specs_repository import (
     upsert_video_capabilities,
 )
 from app.services.normalizer import LOOKUP_CACHE, clean_for_lookup
+from app.services.staging_resolver import auto_resolve_staging_at_commit
 from app.services.validation_service import run_pre_commit_validation
 
 logger = logging.getLogger(__name__)
@@ -263,6 +264,29 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
 
     # ── Step 2: Create audit row ─────────────────────────────────────────────
     commit_run_id = await _t(insert_commit_run, final_id, url_registry_id, session_id)
+
+    # ── Step 2.5: Auto-resolve pending staging entries ────────────────────────
+    # Reads pipeline.lookup_value_staging WHERE url_registry_id=... AND status='pending_review'.
+    # For each entry: INSERT into target table, hot-patch LOOKUP_CACHE / ALIAS_CACHE,
+    # back-patch final_json (APPEND for arrays, REPLACE for scalars), mark resolved.
+    # Skipped silently if no pending entries (steady-state behaviour).
+    # Individual row errors are collected but do NOT abort the commit.
+    auto_resolve_result = await auto_resolve_staging_at_commit(
+        url_registry_id=url_registry_id,
+        final_json=final_json,
+    )
+    if auto_resolve_result["inserted_count"] > 0:
+        logger.info(
+            "run_db_commit: Step 2.5 — auto-resolved %d staging entries for url_registry_id=%d",
+            auto_resolve_result["inserted_count"], url_registry_id,
+        )
+    if auto_resolve_result["errors"]:
+        logger.warning(
+            "run_db_commit: Step 2.5 — %d staging entries failed to auto-resolve for "
+            "url_registry_id=%d (commit continues): %s",
+            len(auto_resolve_result["errors"]), url_registry_id,
+            auto_resolve_result["errors"],
+        )
 
     # ── Commit state tracking ────────────────────────────────────────────────
     tables_written: list[str] = []

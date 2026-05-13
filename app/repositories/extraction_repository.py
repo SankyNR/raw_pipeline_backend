@@ -197,6 +197,78 @@ def fetch_latest_validation(canonical_url_id: int) -> dict | None:
     return rows[0] if rows else None
 
 
+def fetch_brand_model_by_url_registry_id(url_registry_id: int) -> tuple[str, str] | None:
+    """
+    Returns (brand, model_name) for the given url_registry_id, or None if not found.
+
+    Used by run_normalisation() to pass brand + model_name into the pre-normalizer
+    enrichment pass (Section 2) without the caller needing to supply them separately.
+
+    Synchronous. Wrap with asyncio.to_thread() from async callers.
+    """
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("url_registry")
+        .select("brand, model_name")
+        .eq("url_id", url_registry_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return None
+    row = result.data[0]
+    return row["brand"], row["model_name"]
+
+
+def fetch_gap_enrichment_policies() -> dict[str, dict]:
+    """
+    Section 4 — Loads all rows from pipeline.gap_enrichment_policy.
+
+    Returns a dict keyed by field_path for O(1) lookup during gap analysis.
+    Each value is the full row dict:
+      {policy, min_tier_id, threshold_count, threshold_op,
+       comma_split, preferred_site_hint, notes, ...}
+
+    Called once at app startup (via build_lookup_cache / gap analyzer warm-up).
+    Synchronous — wrap with asyncio.to_thread() from async callers.
+    """
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("gap_enrichment_policy")
+        .select(
+            "field_path, policy, min_tier_id, threshold_count, "
+            "threshold_op, comma_split, preferred_site_hint, notes"
+        )
+        .execute()
+    )
+    rows = result.data or []
+    return {row["field_path"]: row for row in rows}
+
+
+def fetch_price_tiers() -> list[dict]:
+    """
+    Section 4 — Loads all rows from pipeline.lookup_price_tiers ordered by sort_order.
+
+    Each row: {tier_id, tier_name, min_inr, max_inr, enrichment_cap, sort_order}
+    Used to build _TIER_CACHE in gap_analyzer.py.
+
+    Synchronous — wrap with asyncio.to_thread() from async callers.
+    """
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("lookup_price_tiers")
+        .select("tier_id, tier_name, min_inr, max_inr, enrichment_cap, sort_order")
+        .order("sort_order")
+        .execute()
+    )
+    return result.data or []
+
+
+
+
 # ---------------------------------------------------------------------------
 # Phase 2 — Run A source and transcript fetching
 # ---------------------------------------------------------------------------
@@ -802,7 +874,8 @@ def fetch_normalized_spec(normalized_id: int) -> dict:
     Fetches a normalized_spec_json row by normalized_id.
 
     Returns the full row including normalized_json, url_registry_id,
-    remaining_null_count, ready_for_enrichment.
+    remaining_null_count, ready_for_enrichment, and Section 4/5 fields
+    (tier_id, new_chipset_detected, chipset_name_enriched).
 
     Raises:
         ValueError: If normalized_id not found.
@@ -814,7 +887,7 @@ def fetch_normalized_spec(normalized_id: int) -> dict:
         .select(
             "normalized_id, normalization_run_id, url_registry_id, "
             "normalized_json, remaining_null_count, ready_for_enrichment, "
-            "ready_for_commit"
+            "ready_for_commit, tier_id, new_chipset_detected, chipset_name_enriched"
         )
         .eq("normalized_id", normalized_id)
         .execute()
@@ -869,11 +942,13 @@ def insert_missing_field_log(payload: dict) -> int | None:
         priority                str    — "high" | "medium" | "low" | "skip"
         preferred_site_hint     str | None
         query_template_override str | None  — E3 fix: column exists in schema, default None
+        is_flag_only            bool   — Section 4: True for flag_only policy rows (never enriched)
 
     Returns:
         missing_field_id (int) always — whether newly inserted or already existing.
         None only on unexpected DB error (logged by caller).
     """
+
     result = (
         get_client()
         .schema("pipeline")
@@ -1027,9 +1102,12 @@ def fetch_gap_fields_for_enrichment(normalized_id: int) -> list[dict]:
     Returns all missing_fields_log rows for a phone where enrichment
     has not yet been attempted (enrichment_attempted=FALSE).
 
+    Section 5.1: Filters WHERE is_flag_only = FALSE so that flag_only policy
+    rows (network bands etc.) are never sent to the enrichment orchestrator.
+
     Returns columns needed by the enrichment orchestrator:
         missing_field_id, field_path, missing_type, priority,
-        preferred_site_hint, query_template_override
+        preferred_site_hint, query_template_override, is_flag_only
 
     Ordered by priority: high first, then medium.
     """
@@ -1039,17 +1117,19 @@ def fetch_gap_fields_for_enrichment(normalized_id: int) -> list[dict]:
         .table("missing_fields_log")
         .select(
             "missing_field_id, field_path, missing_type, priority, "
-            "preferred_site_hint, query_template_override"
+            "preferred_site_hint, query_template_override, is_flag_only"
         )
         .eq("normalized_id", normalized_id)
         .eq("enrichment_attempted", False)
-        .neq("priority", "skip")          # L7.2: exclude skip-priority fields from enrichment
+        .eq("is_flag_only", False)          # Section 5.1: exclude flag-only rows
+        .neq("priority", "skip")            # L7.2: exclude skip-priority fields from enrichment
         .execute()
     )
     rows = result.data or []
     # Sort: high priority first, then medium, then everything else
     _priority_order = {"high": 0, "medium": 1}
     return sorted(rows, key=lambda r: _priority_order.get(r.get("priority", "medium"), 2))
+
 
 
 def insert_enrichment_search_query(payload: dict) -> int:
@@ -3198,4 +3278,56 @@ def bulk_insert_aggregated_experiences(rows: list[dict]) -> int:
             f"(aggregation_run_id={rows[0].get('aggregation_run_id')})."
         )
     return len(result.data)
+
+
+# ---------------------------------------------------------------------------
+# Section 6 — Staging split + metadata helpers
+# ---------------------------------------------------------------------------
+
+def update_staging_entry_metadata(
+    staging_id: int,
+    resolution_target_table: str | None,
+    new_row_data: dict | None,
+) -> None:
+    """
+    Persists admin-supplied deferred-insert metadata onto an existing
+    lookup_value_staging row.
+
+    Called by /staging/resolve when resolution='inserted_new' and the admin
+    provides new_row_data (N4/N5/N6 alias or canonical insert paths).
+    The commit-time Step 2.5 auto-resolver reads these columns back and
+    performs the actual lookup-table insert.
+
+    Args:
+        staging_id:              PK of the staging row to update.
+        resolution_target_table: Schema-qualified table name where the new row
+                                 should be inserted, e.g.
+                                 'mobile_specs.lookup_feature_aliases'.
+        new_row_data:            Dict of column → value pairs for the new row.
+
+    Raises:
+        RuntimeError: If staging_id is not found (no rows updated).
+    """
+    updates: dict = {}
+    if resolution_target_table is not None:
+        updates["resolution_target_table"] = resolution_target_table
+    if new_row_data is not None:
+        updates["new_row_data"] = new_row_data
+
+    if not updates:
+        return  # Nothing to persist; caller passed both None
+
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("lookup_value_staging")
+        .update(updates)
+        .eq("staging_id", staging_id)
+        .execute()
+    )
+    if not result.data:
+        raise RuntimeError(
+            f"update_staging_entry_metadata: staging_id={staging_id} not found "
+            f"or no update applied."
+        )
 

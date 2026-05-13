@@ -1,5 +1,5 @@
 """
-Phase 6 — Enrichment
+Phase 6 — Enrichment  (Section 5 rewrite)
 
 Task 6.1 — Confidence Adjustment (adjust_confidence_for_source_url)
 Task 6.2 — Enrichment Orchestrator     (run_enrichment)
@@ -20,6 +20,16 @@ Key design points:
       of firing a new API call.
     - Cost tracking: ₹2.94 accumulated per grounded query, written to
       enrichment_runs.total_api_cost_inr at run completion.
+
+Section 5 additions:
+    - EnrichmentSession (5.2): reads tier_id → enrichment_cap from _TIER_CACHE.
+      Mandatory fields (SAR head/body) run outside the cap.
+      Discretionary fields are capped by tier: Ultra Flagship=35, Entry Level=10.
+    - is_flag_only filter: fetch_gap_fields_for_enrichment already filters
+      WHERE is_flag_only=FALSE; orchestrator adds defensive check.
+    - Chipset detail skip guard (5.3): if a chipset.* detail path (not chipset_name,
+      cpu_clock_speed, gpu_clock_speed) reaches the orchestrator, it is dropped
+      with a warning rather than firing a needless API call.
 
 Auto-selection rules (one is_selected=TRUE per field):
     1. source_tier='oem_official' AND confidence >= 0.85 → select immediately
@@ -87,11 +97,95 @@ def _clean_extracted_value(val: Any) -> Any:
 
 _GROUNDED_QUERY_COST_INR: float = 2.94  # paid tier, ₹ per grounded query
 
-# Maximum fields processed per enrichment run.
-# Prevents cost explosion on flagship phones with 60+ null fields after normalization.
-# fetch_gap_fields_for_enrichment already returns rows ordered high→medium priority,
-# so slicing preserves the most impactful fields.
-_MAX_ENRICHMENT_FIELDS_PER_RUN: int = 20
+# Section 5.2 — Fallback discretionary cap when tier_id is unknown.
+# (e.g. price data missing, tier not yet classified)
+_DEFAULT_ENRICHMENT_CAP: int = 20
+
+# ---------------------------------------------------------------------------
+# Section 5.1 — Mandatory fields (run outside cap)
+# ---------------------------------------------------------------------------
+
+# These field paths always run regardless of tier cap (mandatory SAR enrichment).
+# Policy table marks them enrich_always; orchestrator routes them through
+# EnrichmentSession.run_mandatory() so they never decrement the discretionary counter.
+_MANDATORY_FIELD_PATHS: frozenset[str] = frozenset({
+    "certifications.sar_head",
+    "certifications.sar_body",
+})
+
+# ---------------------------------------------------------------------------
+# Section 5.3 — Chipset detail skip guard
+# ---------------------------------------------------------------------------
+
+# Chipset fields that ARE eligible for enrichment (all others are policy=skip,
+# handled by the gap analyzer). If a detail path somehow bypasses the policy
+# filter and arrives here, it is dropped with a warning.
+_CHIPSET_ENRICHABLE_PATHS: frozenset[str] = frozenset({
+    "chipset.chipset_name",
+    "chipset.cpu_clock_speed",
+    "chipset.gpu_clock_speed",
+})
+
+
+def _is_chipset_detail_skip(generic_path: str) -> bool:
+    """
+    Section 5.3 — Returns True if this chipset.* path should be dropped by the
+    enrichment orchestrator because it is a detail field handled by DB-injection.
+    """
+    return (
+        generic_path.startswith("chipset.")
+        and generic_path not in _CHIPSET_ENRICHABLE_PATHS
+)
+
+
+# ---------------------------------------------------------------------------
+# Section 5.2 — EnrichmentSession: cap counter
+# ---------------------------------------------------------------------------
+
+class EnrichmentSession:
+    """
+    Section 5.2 — Tracks mandatory vs. discretionary enrichment queries for
+    one phone enrichment run.
+
+    Mandatory queries (SAR head + SAR body) are fired unconditionally and do
+    NOT decrement the discretionary cap.
+
+    Discretionary queries count against the tier cap; once exhausted, the
+    caller stops and leaves remaining rows as pending_admin.
+
+    Args:
+        normalized_id: pipeline.normalized_spec_json PK.
+        tier_id:       FK to pipeline.lookup_price_tiers (None if unclassified).
+    """
+
+    def __init__(self, normalized_id: int, tier_id: int | None) -> None:
+        self.normalized_id     = normalized_id
+        self.tier_id           = tier_id
+        self.discretionary_count = 0
+
+        # Resolve cap from _TIER_CACHE (populated at startup by warm_gap_caches)
+        from app.services.gap_analyzer import _TIER_CACHE
+        tier_row = _TIER_CACHE.get(tier_id) if tier_id else None
+        self.cap: int = (
+            tier_row["enrichment_cap"]
+            if tier_row and tier_row.get("enrichment_cap") is not None
+            else _DEFAULT_ENRICHMENT_CAP
+        )
+
+    @property
+    def cap_exhausted(self) -> bool:
+        return self.discretionary_count >= self.cap
+
+    def consume_discretionary(self) -> bool:
+        """
+        Attempt to consume one discretionary slot.
+        Returns True if the slot was available (caller should fire API),
+        False if cap is already exhausted (caller should stop).
+        """
+        if self.cap_exhausted:
+            return False
+        self.discretionary_count += 1
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -413,32 +507,37 @@ async def run_enrichment(
             "enrichment_run_id":   int,
             "fields_targeted":     int,
             "fields_resolved":     int,   # fields where value is not None
+            "fields_skipped_cap":  int,   # fields dropped because tier cap was hit
             "total_api_cost_inr":  float,
         }
 
-    Flow:
-        1. Fetch normalized_spec_json ONCE → url_registry_id + chipset_name (E11 fix)
-        2. INSERT enrichment_runs → enrichment_run_id
-        3. Fetch all missing_fields_log rows where enrichment_attempted=FALSE
-        4. Per field:
-             a. Chipset dedup check (chipset.npu_tops only)
-             b. Build prompt
-             c. INSERT enrichment_search_queries → query_id
-             d. call_gemini_grounded() with retry
-             e. Classify source tier + adjust confidence (E5 fix)
-             f. Deselect existing candidates if E1 rule applies (E1 fix)
-             g. INSERT enrichment_field_candidates
-             h. UPDATE missing_fields_log.enrichment_attempted
-             i. UPDATE enrichment_search_queries with cost/status
-        5. Zero-resolution → status='failed' (E4 fix)
-        6. UPDATE enrichment_runs with final summary
+    Section 5 flow:
+        1. Fetch normalized_spec_json ONCE → url_registry_id + chipset_name + tier_id
+        2. Build EnrichmentSession from tier_id (→ enrichment_cap)
+        3. INSERT enrichment_runs → enrichment_run_id
+        4. Fetch all missing_fields_log rows WHERE is_flag_only=FALSE AND enrichment_attempted=FALSE
+        5. Per field:
+             a. Section 5.3: chipset detail skip guard — drop + warn if slipped through
+             b. Section 5.1: mandatory routing — SAR head/body bypass cap counter
+             c. Section 5.2: discretionary cap — stop when session.cap_exhausted
+             d. Chipset dedup check (chipset.npu_tops only)
+             e. Build prompt
+             f. INSERT enrichment_search_queries → query_id
+             g. call_gemini_grounded() with retry
+             h. Classify source tier + adjust confidence (E5 fix)
+             i. Deselect existing candidates if E1 rule applies (E1 fix)
+             j. INSERT enrichment_field_candidates
+             k. UPDATE missing_fields_log.enrichment_attempted
+             l. UPDATE enrichment_search_queries with cost/status
+        6. Zero-resolution → status='failed' (E4 fix)
+        7. UPDATE enrichment_runs with final summary
     """
     logger.info(
         "run_enrichment: START normalized_id=%d brand=%r model=%r",
         normalized_id, brand, model,
     )
 
-    # Step 1: Fetch normalized spec ONCE — extract url_registry_id + chipset_name
+    # Step 1: Fetch normalized spec ONCE — extract url_registry_id + chipset_name + tier_id
     # E11 fix: single fetch shared between run creation and chipset dedup
     norm_row = await asyncio.to_thread(fetch_normalized_spec, normalized_id)
     url_registry_id: int       = norm_row["url_registry_id"]
@@ -446,8 +545,16 @@ async def run_enrichment(
     chipset_name_for_run: str | None = (
         (norm_json.get("chipset") or {}).get("chipset_name")
     )
+    phone_tier_id: int | None = norm_row.get("tier_id")  # Section 5.2: set by gap_analyzer
 
-    # Step 2: Create enrichment run record
+    # Step 2: Build EnrichmentSession (derives cap from tier)
+    session = EnrichmentSession(normalized_id=normalized_id, tier_id=phone_tier_id)
+    logger.info(
+        "run_enrichment: normalized_id=%d tier_id=%s discretionary_cap=%d",
+        normalized_id, phone_tier_id, session.cap,
+    )
+
+    # Step 3: Create enrichment run record
     enrichment_run_id: int = await asyncio.to_thread(
         insert_enrichment_run,
         {
@@ -458,45 +565,68 @@ async def run_enrichment(
         },
     )
 
-    # Steps 3–6: wrapped in global crash guard
+    # Steps 4–7: wrapped in global crash guard
     # If anything between here and the final run update crashes unhandled,
     # the run record is marked 'failed' instead of staying 'running' forever.
-    fields_targeted  = 0
-    fields_resolved  = 0
-    cost_accumulator = 0.0
-    run_status       = "completed"
+    fields_targeted   = 0
+    fields_resolved   = 0
+    fields_skipped_cap = 0
+    cost_accumulator  = 0.0
+    run_status        = "completed"
     try:
-        # Step 3: Load all pending gap fields
+        # Step 4: Load all pending gap fields (is_flag_only=FALSE already filtered in repo)
         gap_fields: list[dict] = await asyncio.to_thread(
             fetch_gap_fields_for_enrichment, normalized_id
         )
 
-        # Cap to prevent cost explosion on phones with many null fields.
-        # fetch_gap_fields_for_enrichment orders by priority (high → medium),
-        # so slicing preserves the most important fields.
-        if len(gap_fields) > _MAX_ENRICHMENT_FIELDS_PER_RUN:
-            logger.warning(
-                "run_enrichment: normalized_id=%d has %d gap fields — "
-                "capping to %d to control cost.",
-                normalized_id, len(gap_fields), _MAX_ENRICHMENT_FIELDS_PER_RUN,
-            )
-            gap_fields = gap_fields[:_MAX_ENRICHMENT_FIELDS_PER_RUN]
-
         fields_targeted = len(gap_fields)
 
-        # Step 4: Per-field processing
+        # Step 5: Per-field processing
         for field_row in gap_fields:
             missing_field_id: int      = field_row["missing_field_id"]
             field_path:       str      = field_row["field_path"]
             site_hint:        str | None = field_row.get("preferred_site_hint")
             template_override: str | None = field_row.get("query_template_override")
 
+            generic_path = re.sub(r"\[\d+\]", "[*]", field_path)  # E7 fix
+
+            # -----------------------------------------------------------------
+            # Section 5.3 — Chipset detail skip guard
+            # The gap analyzer's POLICY_CACHE should prevent detail paths from
+            # appearing here (policy=skip → no log row). This is a safety net.
+            # -----------------------------------------------------------------
+            if _is_chipset_detail_skip(generic_path):
+                logger.warning(
+                    "run_enrichment: chipset detail path %r reached enrichment "
+                    "orchestrator for normalized_id=%d — dropping. Check policy table.",
+                    generic_path, normalized_id,
+                )
+                continue
+
+            # -----------------------------------------------------------------
+            # Section 5.1 — Mandatory vs. discretionary routing
+            # Mandatory fields (SAR head + body) run outside the cap.
+            # All other fields consume one discretionary slot.
+            # -----------------------------------------------------------------
+            is_mandatory = generic_path in _MANDATORY_FIELD_PATHS
+
+            if not is_mandatory:
+                # Try to consume a discretionary slot; stop if cap exhausted
+                if not session.consume_discretionary():
+                    fields_skipped_cap += 1
+                    logger.info(
+                        "run_enrichment: cap hit at %d/%d — skipping field=%r "
+                        "and remaining fields for normalized_id=%d.",
+                        session.discretionary_count, session.cap,
+                        field_path, normalized_id,
+                    )
+                    # Stop processing further — remaining rows stay pending_admin
+                    break
+
             # -----------------------------------------------------------------
             # Chipset deduplication (chipset.npu_tops only)
             # E11 fix: chipset_name already fetched above — pass it directly
             # -----------------------------------------------------------------
-            generic_path = re.sub(r"\[\d+\]", "[*]", field_path)  # E7 fix
-
             if generic_path == "chipset.npu_tops":
                 copied = await _try_chipset_dedup(
                     chipset_name=chipset_name_for_run,
@@ -667,8 +797,12 @@ async def run_enrichment(
         if fields_resolved == 0 and fields_targeted > 0:
             run_status = "failed"
 
-        # Step 6: Final run update
+        # Step 7: Final run update
         total_cost = round(cost_accumulator, 2)
+        logger.info(
+            "run_enrichment: normalized_id=%d cap=%d used=%d skipped_cap=%d",
+            normalized_id, session.cap, session.discretionary_count, fields_skipped_cap,
+        )
         await asyncio.to_thread(
             update_enrichment_run,
             enrichment_run_id,
@@ -715,11 +849,12 @@ async def run_enrichment(
     )
 
     return {
-        "success":            success,
-        "enrichment_run_id":  enrichment_run_id,
-        "fields_targeted":    fields_targeted,
-        "fields_resolved":    fields_resolved,
-        "total_api_cost_inr": round(cost_accumulator, 2),
+        "success":             success,
+        "enrichment_run_id":   enrichment_run_id,
+        "fields_targeted":     fields_targeted,
+        "fields_resolved":     fields_resolved,
+        "fields_skipped_cap":  fields_skipped_cap,
+        "total_api_cost_inr":  round(cost_accumulator, 2),
     }
 
 

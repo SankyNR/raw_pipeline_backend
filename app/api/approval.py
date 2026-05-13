@@ -69,6 +69,7 @@ from app.repositories.extraction_repository import (
     update_experience_field,
     update_final_json_direct,
     update_gate_conditions,
+    update_staging_entry_metadata,
 )
 from app.services.conflict_resolver import (
     _coerce_to_match,
@@ -237,11 +238,14 @@ class ApproveExperiencesRequest(BaseModel):
 
 
 class StagingResolveRequest(BaseModel):
-    staging_id:         int
-    final_id:           int
-    url_registry_id:    int
-    resolution:         str          # 'inserted_new' | 'mapped_to_existing' | 'commit_as_null'
-    resolved_lookup_id: int | None = None
+    staging_id:              int
+    final_id:                int
+    url_registry_id:         int
+    resolution:              str          # 'inserted_new' | 'mapped_to_existing' | 'commit_as_null'
+    resolved_lookup_id:      int | None = None
+    # Section 4.1 — new fields for N4/N5/N6 alias + canonical insert flows
+    resolution_target_table: str | None = None   # 'mobile_specs.lookup_feature_aliases' for N4/N5
+    new_row_data:            dict | None = None  # admin metadata for new canonical / alias inserts
 
     @field_validator("resolution")
     @classmethod
@@ -993,17 +997,46 @@ async def resolve_staging(
         req.resolved_lookup_id,
     )
 
-    # Back-propagate resolved FK into final_json (if we captured a field_path above)
+    # Section 4.1 — when resolution == 'inserted_new' and new_row_data is provided,
+    # persist resolution_target_table + new_row_data to the staging row so that
+    # Step 2.5 auto-resolve can pick them up at commit time. Do NOT insert into
+    # the lookup table here — that happens at commit Step 2.5.
+    if req.resolution == "inserted_new" and req.new_row_data is not None:
+        await asyncio.to_thread(
+            update_staging_entry_metadata,
+            req.staging_id,
+            req.resolution_target_table,
+            req.new_row_data,
+        )
+        logger.info(
+            "staging/resolve: staged metadata for deferred insert — staging_id=%d "
+            "resolution_target_table=%r",
+            req.staging_id, req.resolution_target_table,
+        )
+
+    # Back-propagate resolved FK into final_json (if we captured a field_path above).
+    # Section 4.2 — FIX: for array FK fields (_get_at_path returns a list),
+    # APPEND the resolved PK instead of replacing the entire array.
     if field_path_to_patch and req.resolved_lookup_id is not None:
         pkg = await asyncio.to_thread(fetch_approval_package, req.final_id)
         if pkg:
             final_json = copy.deepcopy(pkg.get("final_json") or {})
-            _set_at_path(final_json, field_path_to_patch, req.resolved_lookup_id)
+            current_val = _get_at_path(final_json, field_path_to_patch)
+            if isinstance(current_val, list):
+                # Array FK — APPEND to avoid destroying sibling resolved values
+                if req.resolved_lookup_id not in current_val:
+                    current_val.append(req.resolved_lookup_id)
+                # _get_at_path returns the live list; appending mutates final_json in-place
+            else:
+                # Scalar FK — REPLACE as before
+                _set_at_path(final_json, field_path_to_patch, req.resolved_lookup_id)
             await asyncio.to_thread(update_final_json_direct, req.final_id, final_json)
             logger.info(
                 "staging/resolve: back-propagated resolved_lookup_id=%d "
-                "into final_json field_path=%r for final_id=%d",
-                req.resolved_lookup_id, field_path_to_patch, req.final_id,
+                "into final_json field_path=%r (mode=%s) for final_id=%d",
+                req.resolved_lookup_id, field_path_to_patch,
+                "append" if isinstance(current_val, list) else "replace",
+                req.final_id,
             )
         else:
             logger.warning(
@@ -1143,8 +1176,9 @@ async def get_validate_pre_commit_status(
 
 
 class CommitRequest(BaseModel):
-    final_id: int
-    session_id: int | None = None
+    final_id:             int
+    session_id:           int | None = None
+    confirmed_new_values: bool = False   # Section 4.3 — two-press confirmation for new staging inserts
 
 
 @router.post("/commit")
@@ -1184,9 +1218,41 @@ async def commit_to_db(
     admin = _admin_user(x_admin_user)
 
     logger.info(
-        "commit_to_db: final_id=%d session_id=%s admin=%s",
-        req.final_id, req.session_id, admin,
+        "commit_to_db: final_id=%d session_id=%s confirmed_new_values=%s admin=%s",
+        req.final_id, req.session_id, req.confirmed_new_values, admin,
     )
+
+    # Section 4.3 — two-press confirmation gate for pending staging inserts.
+    # First press: if pending staging entries exist and admin has not confirmed,
+    # return a warning payload describing what will be auto-inserted at commit.
+    # Second press: confirmed_new_values=True passes through to run_db_commit.
+    pkg = await asyncio.to_thread(fetch_approval_package, req.final_id)
+    if not pkg:
+        raise HTTPException(status_code=404, detail=f"final_id={req.final_id} not found.")
+    url_registry_id_for_gate: int = pkg["url_registry_id"]
+
+    pending = await asyncio.to_thread(fetch_pending_staging_entries, url_registry_id_for_gate)
+    if pending and not req.confirmed_new_values:
+        # First press — surface what will be inserted so admin can confirm
+        return {
+            "requires_confirmation": True,
+            "pending_inserts": [
+                {
+                    "staging_id":              p["staging_id"],
+                    "extracted_value":         p["extracted_value"],
+                    "target_lookup_table":     p["target_lookup_table"],
+                    "resolution_target_table": p.get("resolution_target_table"),
+                    "field_path":              p["field_path"],
+                    "new_row_data":            p.get("new_row_data"),
+                }
+                for p in pending
+            ],
+            "message": (
+                f"{len(pending)} new lookup value(s) will be inserted on confirmation. "
+                f"Re-submit with confirmed_new_values=true to proceed."
+            ),
+        }
+    # Second press — confirmed_new_values=True or no pending entries; fall through to commit.
 
     try:
         result = await run_db_commit(
