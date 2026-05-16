@@ -326,15 +326,14 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
                     "cpu_architecture":           "cpu_architecture",
                     "fabrication_node":           "fabrication_node",
                     "number_of_cores":            "number_of_cores",
-                    "cpu_high_performance_cores": "cpu_high_performance_cores",  # Change 1c
-                    "cpu_performance_cores":      "cpu_performance_cores",
+                    "cpu_ultra_high_performance_cores": "cpu_ultra_high_performance_cores",  # Change 1c
+                    "cpu_high_performance_cores":      "cpu_high_performance_cores",
                     "cpu_efficiency_cores":       "cpu_efficiency_cores",
-                    "cpu_clock_speed":            "cpu_clock_speed",
+                    # cpu_clock_speed removed — Migration 49: phone-level, written to phones row
                     "gpu_name":                   "gpu_name",
-                    # gpu_architecture removed — Change 1d: column dropped from DB
-                    "gpu_unit_count":             "gpu_unit_count",
-                    "gpu_unit_type":              "gpu_unit_type",
-                    "gpu_clock_speed":            "gpu_clock_speed",
+                    # gpu_unit_count + gpu_unit_type removed — Migration 50: replaced by gpu_cores
+                    "gpu_cores":                  "gpu_cores",
+                    # gpu_clock_speed removed — Migration 49: phone-level, written to phones row
                     "npu_details":                "npu_details",
                     "npu_tops":                   "npu_tops",
                 })
@@ -361,6 +360,13 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
         launch_date = phone_identity.get("launch_date")
         if launch_date:
             phone_row["launch_date"] = launch_date
+
+        # Migration 49 — cpu_clock_speed and gpu_clock_speed are now phone-level columns.
+        # Read from chipset block (where LLM placed them) and write to the phones row.
+        _copy_if_present(chipset_data, phone_row, {
+            "cpu_clock_speed": "cpu_clock_speed",
+            "gpu_clock_speed": "gpu_clock_speed",
+        })
 
         model_id = await _t(upsert_phone, phone_row)
         tables_written.append("mobile_specs.phones")
@@ -770,6 +776,20 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
             for uid in band_un:
                 unresolved_fields.append(f"network.bands.{uid}")
             for bid in band_ids:
+                if bid in seen_band_ids:
+                    continue
+                seen_band_ids.add(bid)
+                inserted = await _t(insert_network_band, model_id, bid)
+                if inserted:
+                    rows_inserted += 1
+                    net_junctions_written.add("mobile_specs.phone_network_bands")
+
+            # Satellite bands (Migration 51) → same phone_network_bands junction table
+            sat_bands: list = list(network.get("bands_satellite", []) or [])
+            sat_band_ids, sat_band_un = _resolve_array_fk(sat_bands, band_table)
+            for uid in sat_band_un:
+                unresolved_fields.append(f"network.bands_satellite.{uid}")
+            for bid in sat_band_ids:
                 if bid in seen_band_ids:
                     continue
                 seen_band_ids.add(bid)

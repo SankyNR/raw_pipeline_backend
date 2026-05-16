@@ -53,6 +53,7 @@ from app.services.enrichment_orchestrator import run_enrichment
 from app.services.conflict_resolver import (
     detect_and_resolve_conflicts,
     build_final_merged_json,
+    promote_normalized_to_final,
 )
 from app.repositories.pipeline_run_repository import (
     create_pipeline_run,
@@ -1182,6 +1183,20 @@ async def trigger_gap_analysis(request: Request, body: GapAnalysisRequest):
 # Phase 6 — Enrichment
 # ---------------------------------------------------------------------------
 
+class ResolveConflictsResponse(BaseModel):
+    success:             bool
+    final_id:            int
+    flagged_count:       int
+    auto_resolved_count: int
+    fill_count:          int
+    concordant_count:    int
+    message:             str
+
+
+class PromoteNormalizedRequest(BaseModel):
+    normalized_id: int
+
+
 class EnrichRequest(BaseModel):
     normalized_id: int
     brand: str
@@ -1248,6 +1263,57 @@ async def trigger_enrichment(request: Request, body: EnrichRequest) -> EnrichRes
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.post("/promote-normalized", response_model=ResolveConflictsResponse)
+@limiter.limit("20/minute")
+async def trigger_promote_normalized(request: Request, body: PromoteNormalizedRequest):
+    """
+    Skip-enrichment fast-path.
+
+    Promotes normalized_spec_json directly to final_merged_json without
+    running gap analysis, enrichment, or conflict resolution.
+
+    Use when you want to review and fill null fields manually in the Admin UI
+    rather than running the enrichment pipeline.
+
+    Body:
+        normalized_id: pipeline.normalized_spec_json.normalized_id
+
+    Returns:
+        final_id, all conflict counts as zero.
+
+    Raises:
+        HTTP 404: If normalized_id not found.
+        HTTP 500: On unexpected error.
+    """
+    logger.info(
+        "trigger_promote_normalized: normalized_id=%d",
+        body.normalized_id,
+    )
+    try:
+        result = await promote_normalized_to_final(body.normalized_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.exception(
+            "trigger_promote_normalized: unexpected error normalized_id=%d",
+            body.normalized_id,
+        )
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return ResolveConflictsResponse(
+        success=True,
+        final_id=result["final_id"],
+        flagged_count=0,
+        auto_resolved_count=0,
+        fill_count=0,
+        concordant_count=0,
+        message=(
+            f"Normalized spec promoted directly to final_merged_json "
+            f"(final_id={result['final_id']}). No enrichment was run."
+        ),
+    )
+
+
 # ===========================================================================
 # Phase 7 — Conflict Resolution
 # ===========================================================================
@@ -1255,16 +1321,6 @@ async def trigger_enrichment(request: Request, body: EnrichRequest) -> EnrichRes
 class ResolveConflictsRequest(BaseModel):
     normalized_id:     int
     enrichment_run_id: int
-
-
-class ResolveConflictsResponse(BaseModel):
-    success:             bool
-    final_id:            int
-    flagged_count:       int
-    auto_resolved_count: int
-    fill_count:          int
-    concordant_count:    int
-    message:             str
 
 
 @router.post("/resolve-conflicts", response_model=ResolveConflictsResponse)
@@ -1291,7 +1347,7 @@ async def trigger_conflict_resolution(request: Request, body: ResolveConflictsRe
         body.normalized_id, body.enrichment_run_id,
     )
     try:
-        conflict_result = await detect_and_resolve_conflicts(body.normalized_id)
+        conflict_result = await detect_and_resolve_conflicts(body.normalized_id,  body.enrichment_run_id)
     except Exception as exc:
         logger.exception(
             "trigger_conflict_resolution: conflict detection failed normalized_id=%d",
@@ -1300,7 +1356,7 @@ async def trigger_conflict_resolution(request: Request, body: ResolveConflictsRe
         raise HTTPException(status_code=500, detail=str(exc))
 
     try:
-        final_id = await build_final_merged_json(body.normalized_id)
+        final_id = await build_final_merged_json(body.normalized_id, body.enrichment_run_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:

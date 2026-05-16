@@ -169,6 +169,22 @@ def _generic_path(concrete_path: str) -> str:
     return re.sub(r"\[\d+\]", "[*]", concrete_path)
 
 
+def _extract_variant_index(field_path: str) -> int | None:
+    """
+    Parses the numeric index from a 'variants[N].field' path string.
+
+    Returns the integer index if the path starts with 'variants[N]',
+    or None if the path doesn't match the expected pattern.
+
+    Examples:
+        "variants[0].virtual_ram_size"  → 0
+        "variants[2].ram_frequency"     → 2
+        "charging.wireless_charging"    → None
+    """
+    m = re.match(r"^variants\[(\d+)\]", field_path)
+    return int(m.group(1)) if m else None
+
+
 def _walk_nulls(data: Any, prefix: str = "") -> list[str]:
     """
     Recursively walks a nested dict/list. Returns a list of concrete dot-bracket
@@ -327,6 +343,15 @@ async def detect_missing_fields(normalized_id: int) -> list[int]:
         if generic in _WIRELESS_DEPS:
             if (normalized_json.get("charging") or {}).get("wireless_charging") is False:
                 continue
+
+        # ── Dependency filter: virtual_ram_size requires virtual_ram_availability=True ──
+        if generic == "variants[*].virtual_ram_size":
+            variant_idx = _extract_variant_index(concrete_path)
+            if variant_idx is not None:
+                all_variants = normalized_json.get("variants") or []
+                parent_variant = all_variants[variant_idx] if variant_idx < len(all_variants) else {}
+                if not parent_variant.get("virtual_ram_availability"):
+                    continue  # skip — virtual RAM not available on this variant
 
         # ── Policy routing ──
         policy_row = POLICY_CACHE.get(generic)

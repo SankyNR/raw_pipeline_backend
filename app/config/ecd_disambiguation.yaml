@@ -125,10 +125,6 @@ disambiguation_rules:
     applies_to:
       - path: "variants[*]"
 
-  - rule: "BIS certification"
-    note: Always true — BIS/MTCTE is mandatory for all phones sold in India. See rule 5l.
-    applies_to:
-      - path: certifications.bis_certification
 
   - rule: "Camera features — phone-level not per-lens"
     note: >

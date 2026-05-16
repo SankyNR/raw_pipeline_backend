@@ -109,6 +109,8 @@ KNOWN_SPEC_TOP_LEVEL_KEYS: frozenset[str] = frozenset({
     "extra_features",
     "in_the_box",
     "video_capabilities",
+    "camera_features",
+    "performance_benchmarks"
 })
 
 # ---------------------------------------------------------------------------
@@ -779,3 +781,76 @@ async def build_final_merged_json(
     )
 
     return final_id
+
+
+# ---------------------------------------------------------------------------
+# Skip-enrichment fast-path — promote_normalized_to_final
+# ---------------------------------------------------------------------------
+
+async def promote_normalized_to_final(normalized_id: int) -> dict:
+    """
+    Skip-enrichment fast-path.
+
+    Promotes the normalized_spec_json directly to final_merged_json without
+    running gap analysis, enrichment, or conflict resolution.
+
+    Use when you want to review and fill null fields manually in the Admin UI
+    rather than running the enrichment pipeline.
+
+    Args:
+        normalized_id: pipeline.normalized_spec_json.normalized_id
+
+    Returns:
+        {
+            "final_id":            int,
+            "flagged_count":       0,
+            "auto_resolved_count": 0,
+            "fill_count":          0,
+            "concordant_count":    0,
+        }
+
+    Raises:
+        ValueError: If normalized_id is not found.
+    """
+    logger.info(
+        "promote_normalized_to_final: START normalized_id=%d",
+        normalized_id,
+    )
+
+    norm_row = await asyncio.to_thread(fetch_normalized_spec, normalized_id)
+
+    if norm_row is None:
+        raise ValueError(f"normalized_id={normalized_id} not found")
+
+    url_registry_id: int = norm_row["url_registry_id"]
+    normalized_json: dict = norm_row.get("normalized_json") or {}
+
+    final_id = await asyncio.to_thread(
+        upsert_final_merged_json,
+        {
+            "url_registry_id":             url_registry_id,
+            "normalized_id":               normalized_id,
+            "enrichment_run_id":           None,
+            "final_json":                  normalized_json,
+            "fields_remaining_null":       _count_nulls(normalized_json),
+            "has_unresolved_conflicts":    False,
+            "pending_staging_values":      0,
+            "spec_human_approved":         False,
+            "experience_human_approved":   False,
+            "experience_entries_reviewed": False,
+            "ready_for_commit":            False,
+        },
+    )
+
+    logger.info(
+        "promote_normalized_to_final: COMPLETE normalized_id=%d final_id=%d",
+        normalized_id, final_id,
+    )
+
+    return {
+        "final_id":            final_id,
+        "flagged_count":       0,
+        "auto_resolved_count": 0,
+        "fill_count":          0,
+        "concordant_count":    0,
+    }

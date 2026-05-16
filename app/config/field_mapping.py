@@ -121,6 +121,7 @@ ARRAY_FK_MAP: dict[str, str] = {
     # Network
     "network.bands_5g":                        "mobile_specs.lookup_network_bands.band_name",
     "network.bands_4g":                        "mobile_specs.lookup_network_bands.band_name",
+    "network.bands_satellite":                 "mobile_specs.lookup_network_bands.band_name",  # Migration 51
     "network.cellular_features":               "mobile_specs.lookup_cellular_features.feature_name",
 
     # OS & Security  (C4 fix: was "security.*")
@@ -218,6 +219,7 @@ FIELD_PRIORITY_MAP: dict[str, str] = {
     "certifications.widevine_level": "high",
     "network.vo5g":                  "high",
     "charging.charger_in_box":       "high",
+    "chipset.npu_details":           "medium",
     "chipset.npu_tops":              "medium",
 
     # ------------------------------------------------------------------
@@ -281,8 +283,9 @@ FIELD_PRIORITY_MAP: dict[str, str] = {
 
     # Bands are always in spec sheets and extracted by Run A.
     # If they appear as gaps (extraction failure) re-run extraction — not enrichment.
-    "network.bands_4g": "skip",
-    "network.bands_5g": "skip",
+    "network.bands_4g":       "skip",
+    "network.bands_5g":       "skip",
+    "network.bands_satellite": "skip",  # NTN/satellite bands — extraction-only
 
     # ------------------------------------------------------------------
     # Connectivity
@@ -310,6 +313,15 @@ FIELD_PRIORITY_MAP: dict[str, str] = {
     # Extra features — too broad for reliable enrichment
     # ------------------------------------------------------------------
     "extra_features": "skip",
+
+    # ------------------------------------------------------------------
+    # Chipset GPU/clock fields — Migration 49/50: skip enrichment;
+    # gpu_cores is admin-entered canonical data;
+    # clock speeds are now phone-level facts written at commit time.
+    # ------------------------------------------------------------------
+    "chipset.gpu_cores":       "skip",
+    "chipset.cpu_clock_speed": "skip",  # removed from chipset; written to phones table
+    "chipset.gpu_clock_speed": "skip",  # removed from chipset; written to phones table
 
     # ------------------------------------------------------------------
     # Video capabilities — scalar free-text fields, skip enrichment

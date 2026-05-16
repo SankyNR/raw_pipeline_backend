@@ -309,8 +309,8 @@ _FIELD_LABELS: dict[str, str] = {
     # Chipset
     "chipset.npu_tops":                 "NPU AI performance in TOPS (Tera Operations Per Second)",
     "chipset.fabrication_node":         "fabrication node size in nm",
-    "chipset.cpu_high_performance_cores": "prime/performance core configuration (e.g. '1x Cortex-X4 @ 3.3GHz')",
-    "chipset.cpu_performance_cores":    "mid-tier core configuration",
+    "chipset.cpu_ultra_high_performance_cores": "prime/performance core configuration (e.g. '1x Cortex-X4 @ 3.3GHz')",
+    "chipset.cpu_high_performance_cores":    "mid-tier core configuration",
     "chipset.cpu_efficiency_cores":     "efficiency core configuration",
     # Network
     "network.vo5g":                     "VoNR / Voice over 5G support",

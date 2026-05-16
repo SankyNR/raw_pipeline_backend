@@ -523,8 +523,11 @@ Case-sensitive: "LPDDR5X" not "lpddr5x". If no match: null, never invent a value
 STORAGE AND RAM — ALWAYS IN GB: storage_capacity and ram_capacity must be output in GB. \
 Convert TB to GB (1 TB = 1024 GB). Never output TB values.
 
-SAR VALUES — INDIA STANDARD: India uses 0 mm separation (tec.fptc.gov.in). \
-GSMArena SAR values use EU 10 mm separation — NOT India values.
+SAR VALUES — DO NOT EXTRACT:
+  certifications.sar_head and certifications.sar_body: Leave both null.
+  SAR values for India (0mm separation) are always fetched during enrichment
+  from tec.fptc.gov.in. GSMArena SAR values use EU 10mm standard and are
+  never valid for India. Do not extract from any source.
 
 CHARGER IN BOX — INDIA UNIT: Must reflect India retail unit specifically. \
 International "no charger" news ≠ India unit policy. If not stated, output null.
@@ -533,6 +536,14 @@ BAND FORMAT — ALWAYS PREFIX:
   bands_4g values must be prefixed with "B": output "B1", "B28", "B41" — never "1", "28", "41".
   bands_5g values must be prefixed with "n": output "n78", "n28", "n41" — never "78", "28", "41".
   Never output raw numbers without the prefix. Never output "Band 28" or "n 78" with a space.
+
+SATELLITE BANDS (bands_satellite) — NTN/SAT CONNECTIVITY:
+  Populate network.bands_satellite[] ONLY when the source explicitly mentions satellite
+  connectivity, NTN (Non-Terrestrial Network), or satellite SOS/messaging support.
+  Allowed values: "n253", "n254", "n255", "n256", "NB-IoT 23", "NTN".
+  Always prefix numbered bands with "n": output "n253", never "253" or "Band n253".
+  Output "NTN" only for generic satellite support with no specific band stated.
+  If no satellite connectivity is mentioned: output [] (empty array).
 
 FORBIDDEN — NEVER EXTRACT (computed by Run C):
   displays[*].ppi            → computed: sqrt(h²+w²) / size_inch
@@ -579,10 +590,29 @@ BANDS_2G AND BANDS_3G:
   bands_3g: plain text, e.g. "UMTS: B1/B2/B4/B5/B8". Output null if not present.
   These are NOT junction arrays — do NOT split them into separate values.
 
-FINGERPRINT SENSOR:
-  Extract under sensors.fingerprint_sensor as free-text description.
-  Examples: "In-display (Optical)", "Side-mounted", "Under-display (Ultrasonic)".
-  Not a lookup field — output the type as described in source.
+FINGERPRINT SENSOR (sensors.fingerprint_sensor):
+  Always specify the exact technology and mounting. Never write "In-display"
+  or "Fingerprint on display" — these are ambiguous and technically imprecise.
+
+  Use exactly one of these canonical values:
+    "Under Display (Optical)"      — optical sensor behind the display panel
+    "Under Display (Ultrasonic)"   — ultrasonic sensor behind the display panel
+    "Side-mounted"                 — integrated into the power button on the frame
+    "Rear-mounted"                 — on the back of the phone
+    "None"                         — phone has no fingerprint sensor
+
+  Decision rules:
+    - "In-display", "on-screen", or "under-display" without type stated
+      → check source for "ultrasonic" or "Qualcomm Ultrasonic":
+          found    → "Under Display (Ultrasonic)"
+          not found → "Under Display (Optical)"  (optical is far more common;
+                       ultrasonic is almost exclusively Qualcomm flagship only)
+    - "Side fingerprint" / "power button fingerprint" → "Side-mounted"
+    - "Rear fingerprint"                              → "Rear-mounted"
+    - No fingerprint sensor mentioned                 → "None"
+
+  If sensors.fingerprint_sensor is in biometrics[] instead — still populate
+  the sensors.fingerprint_sensor field with the canonical value above.
 
 CHIPSET NAME — STRIP PART NUMBERS (5a):
   Extract the canonical marketing name only. Remove internal model/part number prefixes.
@@ -593,26 +623,51 @@ CHIPSET NAME — STRIP PART NUMBERS (5a):
   Apple:    "Apple A17 Pro"                           → "Apple A17 Pro" (no part number to strip)
   Rule: Remove "SM####-XX" (Qualcomm) or "MT####" (MediaTek) part numbers. Keep brand + marketing name.
 
-CHIPSET — ALWAYS EXTRACT ALL FIELDS (5b):
-  Always extract all available chipset fields from source data.
-  The normalizer checks if the chipset already exists in the DB by name.
-  If it exists, the DB values will override your extracted values before commit.
-  If it does not exist, your extracted values create the new chipset record.
-  Do NOT skip chipset extraction assuming it is already in the database.
-  Extract all: chipset_name, fabrication_node, number_of_cores,
-               cpu_high_performance_cores, cpu_efficiency_cores,
-               cpu_performance_cores (null for dual-cluster),
-               gpu_name, gpu_unit_count, gpu_unit_type, npu_details, npu_tops.
+CHIPSET — NAME AND CLOCK SPEEDS ONLY (5b):
+  chipset_name: MUST extract.
+  cpu_clock_speed: Extract if explicitly stated in source. GHz. Phone-specific.
+  gpu_clock_speed: Extract if explicitly stated in source. MHz. Phone-specific.
+
+  CRITICAL — OUTPUT FORMAT FOR ALL CHIPSET FIELDS:
+    Every chipset field MUST appear in your output JSON, even if you have no
+    data for it. For fields with no source data, output the field with value null.
+    NEVER omit a field from the chipset object — always include it explicitly.
+
+  Fields to leave with value null (NOT omit) when no source data is found:
+    fabrication_node, number_of_cores,
+    cpu_ultra_high_performance_cores, cpu_high_performance_cores,
+    cpu_efficiency_cores, cpu_architecture, gpu_name, gpu_cores,
+    npu_details, npu_tops.
+
+  CORRECT output when fields are absent from source:
+    "chipset": {
+      "chipset_name": "Qualcomm Snapdragon 7s Gen 2",
+      "cpu_clock_speed": 2.4,
+      "gpu_clock_speed": null,
+      "number_of_cores": 8,
+      "fabrication_node": 4,
+      "cpu_architecture": null,
+      "cpu_ultra_high_performance_cores": null,
+      "cpu_high_performance_cores": "4x2.40 GHz Cortex-A78",
+      "cpu_efficiency_cores": "4x1.95 GHz Cortex-A55",
+      "gpu_name": "Adreno 710",
+      "gpu_cores": null,
+      "npu_details": null,
+      "npu_tops": null
+    }
+
+  WRONG output (fields omitted):
+    "chipset": {
+      "chipset_name": "Qualcomm Snapdragon 7s Gen 2",
+      "cpu_clock_speed": 2.4,
+      "gpu_name": "Adreno 710"
+    }
+    ↑ gpu_cores, npu_details, npu_tops, cpu_architecture etc. MUST be present as null.
 
 CPU ARCHITECTURE — DO NOT EXTRACT (5c):
   chipset.cpu_architecture: Leave this field NULL in extraction output.
   Site data (GSMArena, OEM sites) does not mention ARMv9.2, ARMv8-A, etc.
   This field is sourced from chipset manufacturer datasheets during ENRICHMENT — not extraction.
-
-GPU CLOCK SPEED — DO NOT EXTRACT (5d):
-  chipset.gpu_clock_speed: Leave this field NULL in extraction output.
-  GPU clock speed for mobile chipsets is rarely published in consumer-facing specs.
-  This field is sourced from chipset manufacturer technical documentation during ENRICHMENT.
 
 CAMERA SENSOR TYPE — TECHNOLOGY NOT BRAND (5e):
   camera_lenses[*].sensor_type: Extract the image sensor TECHNOLOGY TYPE, not the manufacturer.
@@ -635,14 +690,6 @@ OPTICAL ZOOM — TELEPHOTO AND PERISCOPE ONLY (5f):
   "In-sensor zoom" or "lossless crop zoom" on the main camera is NOT optical zoom.
   Digital zoom is not optical zoom — never use digital zoom values here.
 
-SPEAKER POSITIONS — INFER FROM COUNT (5g):
-  audio.speaker_positions: Must be consistent with audio.speaker_count.
-  If speaker_count = 2 (stereo/dual speakers):
-    Default positions = "Earpiece, Bottom"
-    The earpiece doubles as a speaker in stereo configurations unless stated otherwise.
-  If speaker_count = 1 (mono/single speaker):
-    Default position = "Bottom"
-  If source data explicitly states different positions, use those and override the default.
 
 CHARGING VOLTAGE AND AMPERAGE — EXPLICIT ONLY (5h):
   charging.charging_voltage and charging.charging_ampere:
@@ -651,16 +698,62 @@ CHARGING VOLTAGE AND AMPERAGE — EXPLICIT ONLY (5h):
   DO NOT guess standard values (e.g. do not assume "5V/3A" for a 15W charger).
   If not explicitly stated: set null.
 
-CPU CORE CLASSIFICATION (5i):
-  chipset.cpu_high_performance_cores: The high-clock Performance cluster.
-    Cortex-A78, A710, A720, X-series (X1, X2, X3, X4) = Performance cores.
-  chipset.cpu_efficiency_cores: The low-power Efficiency cluster.
-    Cortex-A55, A510, A520, A53 = Efficiency cores.
-  chipset.cpu_performance_cores: The mid-tier cluster.
-    ONLY for tri-cluster designs (Snapdragon 8 Gen 2+, Dimensity 9300+).
-    NULL for all standard dual-cluster (big.LITTLE) chipsets.
-  If you do not know which core type a specific model belongs to, leave the field null.
-  It will be corrected in Admin UI during the first-time chipset setup.
+CPU CORE CLASSIFIER — HIERARCHICAL LOGIC (5i):
+  Apply these rules in strict priority order. Stop at the first matching rule.
+  Classify each core cluster by its ARM codename only — ignore cluster count or position.
+  Three output slots:
+    [ULTRA]  → cpu_ultra_high_performance_cores
+    [PERF]   → cpu_high_performance_cores
+    [EFF]    → cpu_efficiency_cores
+
+  RULE 1 — ARM Cortex-X series → ALWAYS [ULTRA]:
+    Any core starting with "Cortex-X" (X1, X2, X3, X4, X925, X1-Extreme etc.) → [ULTRA]
+    No exceptions. These are always the highest-performance tier by definition.
+
+  RULE 2 — ARM Cortex-A7x series → ALWAYS [PERF]:
+    A72, A73, A75, A76, A77, A78, A710, A715, A720, A725, A78C, A78AE → [PERF]
+    These are ALWAYS [PERF] regardless of what other cores are present.
+    CRITICAL: A7x cores go to cpu_high_performance_cores. NEVER to cpu_ultra_high_performance_cores.
+    If no Cortex-X core exists → cpu_ultra_high_performance_cores = null. Do not promote A7x.
+    Example: "4x2.40 GHz Cortex-A78 & 4x1.95 GHz Cortex-A55"
+      → cpu_high_performance_cores = "4x2.40 GHz Cortex-A78"
+      → cpu_efficiency_cores = "4x1.95 GHz Cortex-A55"
+      → cpu_ultra_high_performance_cores = null
+
+  RULE 3 — ARM Cortex-A5x series → ALWAYS [EFF]:
+    A53, A55, A510, A520 → [EFF] always.
+    A35, A37, A7 → [EFF] always (legacy 32-bit efficiency cores).
+
+  RULE 4 — Qualcomm Oryon (Snapdragon 8 Elite and newer):
+    Oryon Phoenix L (2 prime cores) → [ULTRA]
+    Oryon Phoenix M (6 performance cores) → [PERF]
+    cpu_efficiency_cores = null (Oryon has no efficiency cores).
+
+  RULE 5 — Apple:
+    2 P-cores (performance) → [ULTRA]
+    4 E-cores (efficiency) → [EFF]
+    cpu_high_performance_cores = null (Apple uses two-tier only).
+
+  RULE 6 — MediaTek All-Big (Dimensity 9300, 9400):
+    cpu_efficiency_cores = null ALWAYS for these chips.
+    Dimensity 9300: 4×Cortex-X4 → [ULTRA], 4×Cortex-A720 → [PERF]
+    Dimensity 9400: 1×Cortex-X925 + 3×Cortex-X4 → [ULTRA], 4×Cortex-A720 → [PERF]
+
+  RULE 7 — Qualcomm Kryo legacy (Kryo 200–490 series, Snapdragon ~2017–2021):
+    Kryo Prime → [ULTRA], Kryo Gold → [PERF], Kryo Silver → [EFF]
+    Kryo 5xx+ uses direct Cortex naming — apply Rules 1–3 instead.
+
+  RULE 8 — Samsung Exynos Mongoose:
+    Mongoose / Exynos M series → [ULTRA]
+    Paired Cortex-A cores → apply Rules 2–3.
+
+  RULE 9 — Fallback:
+    If core name matches none of the above → leave field null. Admin fills via chipset DB.
+
+  SELF-CHECK before finalising:
+    If you placed any A7x core (A78, A715, A720, etc.) in cpu_ultra_high_performance_cores
+    → MOVE it to cpu_high_performance_cores and set cpu_ultra_high_performance_cores = null.
+    A7x NEVER goes to ULTRA. No exceptions.
 
 CAMERA FEATURES — PHONE-LEVEL, LOOKUP NAMES ONLY (5j):
   camera_features (TOP-LEVEL field):
@@ -713,9 +806,14 @@ SENSOR SIZE DENOMINATOR — EXACT FORMAT ONLY (5n):
 REAR CAMERA SETUP:
   Count ONLY rear-facing lens types in camera_lenses[]:
   Valid rear types: Main | Ultra-wide | Telephoto | Periscope | Macro | Depth
-  NEVER count the Front lens.
+  NEVER count any Front* lens type ("Front", "Front (Cover Display)", "Front (Inner Display)", "Front (Secondary)").
   1 rear lens → "Single" | 2 → "Dual" | 3 → "Triple" | 4 → "Quad"
   Count the lens objects with rear types, then map to word. Do not guess.
+
+  CAMERA LENS TYPE — ALLOWED VALUES:
+  Standard phones: "Main" | "Ultra-wide" | "Telephoto" | "Periscope" | "Macro" | "Depth" | "Front"| "Front (Secondary)"
+  Foldable/flip phones only:
+  "Front (Cover Display)" | "Front (Inner Display)" 
 
 ESIM AND SIM CONFIGURATION — LOGICAL CONSISTENCY REQUIRED (5p):
   network.esim_support and network.sim_configuration MUST be logically consistent.
@@ -737,17 +835,42 @@ ESIM AND SIM CONFIGURATION — LOGICAL CONSISTENCY REQUIRED (5p):
     Contradictory values (esim=true + Dual Nano-SIM config) are FORBIDDEN.
     If sources conflict, defer to OEM India site. Set esim_support = false when unsure.
 
-AUDIO CODECS — EXPLICIT SOURCE ONLY (5q):
+AUDIO CODECS — EXPLICIT SOURCE ONLY, ALWAYS CHECK DEVICESPECIFICATIONS (5q):
   audio.audio_codecs: Extract ONLY codec names that are EXPLICITLY listed in the
   source documents. Do NOT infer, assume, or fill from training knowledge.
 
-  CORRECT: Source says "Supports LDAC, aptX Adaptive, AAC" → extract those three.
-  WRONG:   Source says nothing about codecs → do NOT output MP3, AAC, FLAC, etc.
-           These are standard formats that all smartphones support, but they are
-           not your data to add — they must come from the source.
+  DEVICESPECIFICATIONS SOURCE — MANDATORY CHECK:
+    The <source type="other" site="devicespecifications"> section reliably lists
+    supported audio formats and codecs under its "Audio" or "Multimedia" section.
+    This section is always present and always lists codec data for every phone.
+    You MUST extract audio codecs from this section when it is present in the input.
+    Do NOT skip this source for audio_codecs. If devicespecifications lists
+    "MP3, AAC, FLAC, WAV, ALAC, APE, OGG" → extract all of them.
 
-  If the source does not list audio codecs explicitly: output [].
-  The empty list is the correct answer when codec data is absent from sources.
+  CORRECT: Source says "Supports LDAC, aptX Adaptive, AAC" → extract those.
+  CORRECT: devicespecifications lists audio formats → extract them all.
+  WRONG:   Source says nothing about codecs → do NOT invent them from training knowledge.
+
+  If no source (including devicespecifications) lists audio codecs explicitly: output [].
+
+  IMPORTANT — CERTIFICATIONS ARE NOT CODECS:
+    Dolby Atmos, Hi-Res Audio, DTS, DTS:X, DTS HD are audio CERTIFICATIONS.
+    They belong in certifications.audio_certifications ONLY.
+    NEVER put them in audio.audio_codecs. NEVER put them in audio.audio_features.
+    audio.audio_features is for speaker configuration notes only (e.g. "Stereo Speakers").
+    If source mentions Dolby Atmos in the audio section → certifications.audio_certifications.
+
+USB FEATURES — LOOKUP VALUES ONLY (5r-pre):
+  connectivity.usb_features must contain ONLY values from the lookup_usb_features table:
+    "OTG" | "DisplayPort" | "USB Power Delivery" | "Audio Adapter Accessory Mode" |
+    "Reverse Charging" | "Desktop Mode" | "USB Tethering"
+
+  NEVER extract generic capabilities as usb_features:
+    "USB Charging" → this is not a feature, every USB port charges. Omit entirely.
+    "USB Storage" → this is not a distinct feature. Omit entirely.
+    "USB Data Transfer" → omit.
+    "Mass Storage" → omit.
+  Only extract values that exactly match the allowed list above.
 
 WIFI TECHNOLOGIES — PROTOCOLS ONLY (5r):
   connectivity.wifi_technologies must contain ONLY technology protocol names
@@ -837,6 +960,23 @@ FRONT CAMERA SHAPE vs POSITION — TWO DIFFERENT FIELDS (5y):
   "Punch-hole" is a SHAPE, never a position.
   Center punch-hole camera → front_camera_shape="Punch-hole", front_camera_position="Center".
 
+  FOLDABLE AND DUAL FRONT CAMERA RULES:
+  Use the three specialised lens_type values ONLY for phones with multiple front cameras:
+    "Front (Cover Display)" — selfie camera on the outer/cover panel of a flip or fold phone.
+    "Front (Inner Display)" — selfie camera on the inner display of a book-fold phone.
+    "Front (Secondary)"    — second selfie camera on the SAME display face (e.g. Xiaomi 14 CiVi
+                             with dual punch-holes on the main display side by side).
+  For all standard single-front-camera phones: use "Front" — never use the specialised types.
+
+  PER-LENS front_camera_position: For each Front* lens, populate the per-lens
+  front_camera_position field with the cutout location ("Center", "Left", "Top Bezel" etc.).
+  This is SEPARATE from camera_overview.front_camera_position which holds the primary
+  front camera's position for convenience.
+
+  For foldables with Front (Cover Display) AND Front (Inner Display): the two cameras are
+  on physically different display panels — extract each lens with its own position value.
+  Leave camera_overview.front_camera_position as the position of the primary (Inner) camera.
+
 AI CAPABILITIES — STRICT GROUNDING (5z):
   ai_system: Only set if source explicitly names a branded AI platform.
     Examples: "Galaxy AI", "Apple Intelligence", "Moto AI".
@@ -845,25 +985,11 @@ AI CAPABILITIES — STRICT GROUNDING (5z):
     Do NOT generate from training knowledge. If source is silent → ai_features = [].
   If ai_capabilities has nothing grounded → output ai_capabilities: {}
 
-BIS CERTIFICATION AND WIDEVINE DEFAULTS (reinforce 5l and 5s):
-  BIS CERTIFICATION: Always output {"value": true} with NO _source tag.
-  BIS is mandatory for all India phones — the rule IS the evidence. Never null.
-
-  WIDEVINE: Default for phones launched 2017 or later:
-    widevine_level → {"value": "L1"} with NO _source tag.
-    widevine_support → {"value": true} with NO _source tag.
-    Do not search for evidence. Do not output null. The rule is the source.
-    Pre-2017 → extract from source, null if absent.
-
-CPU CORE FIELDS — FULL CLUSTER DESCRIPTION REQUIRED:
-  cpu_high_performance_cores and cpu_efficiency_cores must be the FULL cluster
-  description string, not a bare integer count.
-  CORRECT: "4x2.40 GHz Cortex-A78" | "2x3.36 GHz Oryon V2"
-  WRONG:   4  (bare count is useless without clock speed and core name)
-  Source format "Octa-core (4x2.40 GHz Cortex-A78 & 4x1.95 GHz Cortex-A55)":
-    cpu_high_performance_cores = "4x2.40 GHz Cortex-A78"
-    cpu_efficiency_cores = "4x1.95 GHz Cortex-A55"
-    cpu_performance_cores = null (dual-cluster design)
+BIS AND WIDEVINE — DO NOT EXTRACT:
+  certifications.bis_certification: Leave null. Normalizer sets true unconditionally.
+  certifications.widevine_support: Leave null. Normalizer sets true for all phones >= 2017.
+  certifications.widevine_level: Leave null. Normalizer sets "L1" for all phones >= 2017.
+  Do not output evidence-free values for these fields. Null is the correct extraction output.
 
 STRUCTURAL FIELDS — NO _source WRAPPER:
   The following fields must be plain values with NO _source wrapper:
@@ -901,47 +1027,44 @@ UNLOCK METHODS — ALWAYS INCLUDE DEFAULTS:
   Never output an empty unlock_methods array for Android phones.
   FORBIDDEN: "Smart Lock" is NOT in the lookup table — never include it.
 
-VIDEO RESOLUTIONS vs SLOW MOTION — SPLIT BY FPS THRESHOLD:
-  Sites often list all supported fps in one place:
-  "1080p@24,30,60,120,240fps" or "FHD@30fps, FHD@120fps, FHD@240fps"
+SLOW MOTION RESOLUTIONS (video_capabilities.slow_motion_resolutions):
+  ONLY populate this field when a resolution is captured at ≥120fps.
+  Standard frame rates (24, 30, 60fps) are NOT slow motion — leave null.
+  The field is a free-text string listing only the qualifying entries.
 
-  SPLIT RULE — threshold is 60fps:
-    ≤60fps → goes to rear_video_resolutions or front_video_resolutions (normal video)
-    >60fps → goes to slow_motion_resolutions (slow motion capture)
+  Rule:
+    For each resolution/fps pair in the source:
+      fps < 120  → exclude entirely, do not write it
+      fps ≥ 120  → include in the field
+    If no resolution reaches 120fps → leave null.
 
-  Example source: "UHD@30fps, FHD@30fps, FHD@60fps, FHD@120fps, FHD@240fps"
-    rear_video_resolutions = "4K@30fps, 1080p@30fps, 1080p@60fps"
-    slow_motion_resolutions = "1080p@120fps, 1080p@240fps"
+  Format: "1080p@240fps, 720p@960fps"  (comma-separated, descending fps order)
 
-  Example source: "1080p@24/30/60/120fps"
-    rear_video_resolutions = "1080p@24fps, 1080p@30fps, 1080p@60fps"
-    slow_motion_resolutions = "1080p@120fps"
-
-  If source says only "Slow Motion" with no fps → slow_motion_resolutions = null.
-  Never put >60fps framerates in rear_video_resolutions.
-  Never put ≤60fps framerates in slow_motion_resolutions.
-
-SLOW MOTION RESOLUTIONS — SOURCE LABEL REQUIRED:
-  slow_motion_resolutions must ONLY contain fps values that the source EXPLICITLY
-  labels as "Slow Motion", "Slow-mo", "Slo-mo", or "HFR" in the source text.
-
-  CORRECT: Source says "Slow Motion: 1080p@120fps" → slow_motion_resolutions = "1080p@120fps"
-  CORRECT: Source says "Slo-mo 720p@960fps" → slow_motion_resolutions = "720p@960fps"
-  WRONG:   Source says "FHD@30fps, FHD@60fps" with no slow motion label →
-           slow_motion_resolutions = null (these are regular video, not slow motion)
-
-  NEVER copy regular video fps values into slow_motion_resolutions.
-  NEVER infer slow motion capability from the phone's chipset, sensor, or video resolution alone.
-  If the source mentions "Slow Motion" but gives no fps value → slow_motion_resolutions = null.
-  If no source mentions slow motion at all → slow_motion_resolutions = null.
-  NULL DEFAULT: If no source text explicitly mentions "Slow Motion", "Slow-mo",
-  or "HFR" alongside a fps value greater than 60 → slow_motion_resolutions = null.
-  HARD CHECK: Any value ≤60fps in slow_motion_resolutions is WRONG. Delete it.
-  NEVER copy values from rear_video_resolutions into slow_motion_resolutions.
+  Examples:
+    Source says "4K@30fps, 1080p@60fps, 1080p@120fps, 720p@960fps"
+      → "1080p@120fps, 720p@960fps"                              ✅
+    Source says "4K@30fps, 1080p@60fps" with no higher fps
+      → null                                                      ✅
+    Source says "1080p@30fps slow motion"
+      → null  (30fps is not slow motion regardless of labelling)  ✅
 
 VARIANT DEDUPLICATION:
   Two variants with identical ram_capacity + storage_capacity = same SKU.
   Keep only the lower launch_price. Delete the duplicate.
+
+VARIANTS — RAM TYPE CONSISTENCY (variants[*].ram_type):
+  RAM technology (LPDDR4X, LPDDR5, LPDDR5X) is a chipset-level decision,
+  not a storage-tier decision. All variants of the same phone use identical
+  RAM technology regardless of RAM/storage capacity.
+
+  Rule:
+    If ram_type is identified for ANY variant, apply the same value to ALL
+    variants. Never leave ram_type null for one variant when another variant's
+    type is known from the same source.
+
+  Only use different values across variants if the source EXPLICITLY states
+  different RAM technologies per tier (extremely rare — document it if seen).
+  In that case, extract as stated and note the discrepancy in a comment.
 
 VIDEO RESOLUTIONS — ONLY FROM SOURCE:
   Never infer video capabilities from camera megapixels or chipset tier.

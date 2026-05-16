@@ -234,7 +234,9 @@ e.g. "1/1.56 inch" → 1.56. Null if notation absent.
 
 7. NAVIC: Always check OEM India page explicitly. Absence from aggregators ≠ not supported.
 
-8. SAR: India = 0mm separation. GSMArena = EU 10mm. Never use GSMArena SAR for India.
+8. SAR: Do not extract sar_head or sar_body. Both are filled by enrichment from
+   tec.fptc.gov.in. GSMArena SAR uses EU 10mm separation — never valid for India.
+   Leave both null.
 
 9. USB SPEED: Type-C connector ≠ USB 3.x. Verify usb_standard from explicit transfer rate in specs.
 
@@ -381,8 +383,9 @@ charging.charger_technologies (array — LLM may fill from training data when no
 
 --- CAMERA ---
 camera_lenses[*].lens_type (array order rule applies — Main→Ultra-wide→Telephoto→Macro→Depth→Front):
-  "Main" | "Ultra-wide" | "Telephoto" | "Periscope" | "Macro" | "Depth" | "Front"
-
+  "Main" | "Ultra-wide" | "Telephoto" | "Periscope" | "Macro" | "Depth" | "Front" | "Front (Secondary)"
+  Foldable/flip phones only:
+  "Front (Cover Display)" | "Front (Inner Display)" 
 camera_lenses[*].autofocus_type:
   "PDAF" | "Quad PDAF" | "Dual Pixel PDAF" | "Multi-directional PDAF"
   "Omni-directional PDAF" | "Super PDAF" | "All-Pixel Focus" | "Hybrid AF"
@@ -417,7 +420,8 @@ os_and_security.biometrics (array):
   "3D Face Recognition" | "Iris Scanner" | "Voice Recognition"
 
 --- CERTIFICATIONS ---
-certifications.widevine_level — see BIS/WIDEVINE rule (default L1 for phones >= 2017, no source needed):
+certifications.widevine_level — Leave null during extraction. Normalizer defaults to "L1" for
+all phones >= 2017. Lookup values listed for reference only:
   "L1" | "L2" | "L3"
 
 certifications.ip_ratings (array):

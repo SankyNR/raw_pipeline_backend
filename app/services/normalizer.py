@@ -91,6 +91,8 @@ _SIM_CONFIGURATION_ALIASES: dict[str, str] = {
     "Dual SIM (Nano-SIM + Nano-SIM)" : "Dual SIM (Nano-SIM, dual stand-by)",
     "Dual Nano-SIM"                  : "Dual SIM (Nano-SIM, dual stand-by)",
     "Dual SIM (Nano, dual stand-by)" : "Dual SIM (Nano-SIM, dual stand-by)",
+    "Dual SIM (Nano-SIM)"            : "Dual SIM (Nano-SIM, dual stand-by)",
+    "Dual SIM (Nano-SIM, dual standby)": "Dual SIM (Nano-SIM, dual stand-by)",
 }
 
 
@@ -118,6 +120,126 @@ _WIFI_TECHNOLOGIES_EXCLUDE: frozenset[str] = frozenset({
     "Wi-Fi hotspot",
     "Hotspot",
     "WiFi Hotspot",
+})
+
+
+# ---------------------------------------------------------------------------
+# Box item alias map — maps LLM-extracted item_name / combined forms to
+# canonical lookup_box_items.item_name strings before FK resolution.
+# Keys must be lowercased. Applied before fuzzy matching so common naming
+# variants never reach staging.
+# ---------------------------------------------------------------------------
+_BOX_ITEM_ALIASES: dict[str, str] = {
+    # SIM ejector variants
+    "sim tool":              "SIM Ejector",
+    "sim ejector tool":      "SIM Ejector",
+    "sim pin":               "SIM Ejector",
+    "sim card tool":         "SIM Ejector",
+    "sim tray tool":         "SIM Ejector",
+
+    # Documentation variants
+    "guides":                "Quick Start Guide",
+    "guide":                 "Quick Start Guide",
+    "booklet":               "Quick Start Guide",
+    "quick start guide":     "Quick Start Guide",
+    "getting started guide": "Quick Start Guide",
+    "user manual":           "User Manual",
+    "manual":                "User Manual",
+    "instruction manual":    "User Manual",
+    "documentation":         "Quick Start Guide",
+
+    # Case / cover variants
+    "protective cover":      "Phone Case",
+    "protective case":       "Phone Case",
+    "cover":                 "Phone Case",
+    "case":                  "Phone Case",
+    "silicone case":         "Phone Case",
+    "back cover":            "Phone Case",
+    "hard case":             "Hard Protective Case",
+    "hard cover":            "Hard Protective Case",
+    "soft case":             "Soft Protective Case",
+    "soft cover":            "Soft Protective Case",
+    "transparent case":      "Phone Case",
+    "clear case":            "Phone Case",
+
+    # Cable variants
+    "usb cable":             "USB Cable (Type-C to Type-C)",
+    "type-c cable":          "USB Cable (Type-C to Type-C)",
+    "charging cable":        "USB Cable (Type-C to Type-C)",
+    "data cable":            "USB Cable (Type-C to Type-C)",
+
+    # Charger variants — any wattage maps to plain "Charger"
+    "charger":               "Charger",
+    "wall charger":          "Charger",
+    "power adapter":         "Charger",
+    "adapter":               "Charger",
+    "charging adapter":      "Charger",
+    "travel charger":        "Charger",
+    "turbopower charger":    "Charger",
+    "supervooc charger":     "Charger",
+    "flashcharge charger":   "Charger",
+    "supercharge charger":   "Charger",
+}
+
+# Front camera shape aliases — normalizes casing/punctuation variants to
+# the canonical lookup_front_camera_shape values.
+# Keys must be lowercased with all spaces/hyphens collapsed to a single space.
+_FRONT_CAMERA_SHAPE_ALIASES: dict[str, str] = {
+    # Punch-hole variants
+    "punchhole":          "Punch-hole",
+    "punch hole":         "Punch-hole",
+    "punch-hole":         "Punch-hole",
+    "punchole":           "Punch-hole",
+    "punch hole cutout":  "Punch-hole",
+    "hole punch":         "Punch-hole",
+    # Notch variants
+    "notch":              "Notch",
+    "waterdrop notch":    "Notch",
+    "dewdrop notch":      "Notch",
+    "teardrop notch":     "Notch",
+    "dot notch":          "Notch",
+    # Pill variants
+    "pill":               "Pill",
+    "pill shape":         "Pill",
+    "pill-shaped":        "Pill",
+    # Dynamic Island
+    "dynamic island":     "Dynamic Island",
+    "dynamicisland":      "Dynamic Island",
+    # Pop-up
+    "popup":              "Pop-up",
+    "pop up":             "Pop-up",
+    "pop-up":             "Pop-up",
+    "motorized popup":    "Pop-up",
+    # Under-display
+    "underdisplay":       "Under-display",
+    "under display":      "Under-display",
+    "under-display":      "Under-display",
+    "udc":                "Under-display",
+    # Bezel / no cutout
+    "no cutout":          "Bezel",
+    "thick bezel":        "Bezel",
+    "bezel":              "Bezel",
+}
+
+# Wattage charger pattern — matches any string like "68W TurboPower Charger",
+# "45W Charger", "120W SuperVOOC Charger", "Charger (65W)", etc.
+# Used to map any wattage-specific charger name to plain "Charger".
+_WATTAGE_CHARGER_RE = re.compile(
+    r"(\d+\s*w\b.*charger|charger.*\d+\s*w\b)",
+    re.IGNORECASE,
+)
+
+# Brand keywords + generic device names used to detect handset entries.
+# The LLM may extract the phone model name, "Device", "Smartphone", etc.
+# as a box item — all map to "Handset".
+_HANDSET_KEYWORDS: frozenset[str] = frozenset({
+    # Generic device terms
+    "device", "smartphone", "phone", "mobile", "handset",
+    "the phone", "the device", "the smartphone",
+    # Brand names — phone model extracted as box item
+    "motorola", "samsung", "oneplus", "xiaomi", "redmi", "poco",
+    "realme", "oppo", "vivo", "iqoo", "google", "apple", "nothing",
+    "honor", "tecno", "infinix", "lava", "itel", "iphone", "pixel",
 })
 
 
@@ -227,6 +349,175 @@ _NO_FUZZY_TABLE_PATHS: frozenset[str] = frozenset({
 # Rationale: for a 2-char string like "L1", a distance of 2 would match
 # almost anything. For 3-char strings like "OIS", distance 2 matches "EIS".
 _FUZZY_MIN_LENGTH: int = 4
+
+# Deterministic map for deriving RAM frequency from ram_type string.
+# Applied right before the end of normalisation.
+_RAM_TYPE_FREQUENCY_MAP: dict[str, int] = {
+    "LPDDR5X": 8533,
+    "LPDDR5": 6400,
+    "LPDDR4X": 4266,
+    "LPDDR4": 3200,
+    "LPDDR3": 1866,
+    "LPDDR2": 1066,
+}
+
+
+# ---------------------------------------------------------------------------
+# CPU core tier classifier — deterministic correction of LLM misclassification
+# ---------------------------------------------------------------------------
+# LLM frequently promotes A7x cores to cpu_ultra_high_performance_cores when
+# no Cortex-X exists (training bias). This classifier examines the core
+# codename and identifies the correct tier (ULTRA / PERF / EFF).
+# Covers all chipset families: ARM Cortex, Qualcomm proprietary, Apple custom,
+# Samsung Exynos custom, MediaTek (uses ARM cores).
+
+# ULTRA tier — prime / highest-performance cores
+_TIER_ULTRA_PATTERNS: tuple[re.Pattern, ...] = (
+    # ARM Cortex-X series (X1, X2, X3, X4, X925, X1-Extreme, etc.)
+    re.compile(r"Cortex[-\s]?X\d*", re.IGNORECASE),
+    # Qualcomm Oryon Phoenix L (Snapdragon 8 Elite Gen 4+)
+    re.compile(r"Oryon\s+Phoenix\s+L", re.IGNORECASE),
+    # Qualcomm Kryo Prime (legacy 200–490 series)
+    re.compile(r"Kryo\s+Prime", re.IGNORECASE),
+    # Apple performance cores (A14/M1 onwards)
+    re.compile(r"\b(Firestorm|Avalanche|Everest|Coyote|Tempest-Prime)\b", re.IGNORECASE),
+    # Apple generic "Performance" tier label
+    re.compile(r"performance\s+core", re.IGNORECASE),
+    # Samsung Exynos custom prime cores
+    re.compile(r"\bMongoose\b", re.IGNORECASE),
+    re.compile(r"Exynos\s+M\d+", re.IGNORECASE),
+)
+
+# PERF tier — big / performance cluster (not prime)
+_TIER_PERF_PATTERNS: tuple[re.Pattern, ...] = (
+    # ARM Cortex-A7x series (A72-A78, A710-A725, A78C, A78AE)
+    re.compile(r"Cortex[-\s]?A7\d[A-Z]?\d?", re.IGNORECASE),
+    # Qualcomm Oryon Phoenix M
+    re.compile(r"Oryon\s+Phoenix\s+M", re.IGNORECASE),
+    # Qualcomm Kryo Gold (legacy)
+    re.compile(r"Kryo\s+Gold", re.IGNORECASE),
+)
+
+# EFF tier — efficiency / little cluster
+_TIER_EFF_PATTERNS: tuple[re.Pattern, ...] = (
+    # ARM Cortex-A5x series (A53, A55, A510, A520)
+    re.compile(r"Cortex[-\s]?A5\d{1,2}", re.IGNORECASE),
+    # ARM Cortex-A3x and legacy Cortex-A7 (NOT A7x — the bare A7 only)
+    re.compile(r"Cortex[-\s]?A3\d", re.IGNORECASE),
+    re.compile(r"Cortex[-\s]?A7(?![\d])", re.IGNORECASE),
+    # Qualcomm Kryo Silver (legacy)
+    re.compile(r"Kryo\s+Silver", re.IGNORECASE),
+    # Apple efficiency cores
+    re.compile(r"\b(Icestorm|Blizzard|Sawtooth|Tempest-Efficient)\b", re.IGNORECASE),
+    # Apple generic "Efficiency" tier label
+    re.compile(r"efficiency\s+core", re.IGNORECASE),
+)
+
+
+def _classify_core_tier(cluster_str: str) -> str | None:
+    """
+    Examines a CPU cluster string (e.g. "4x2.40 GHz Cortex-A78") and returns
+    which tier slot the cluster belongs in: 'ULTRA', 'PERF', 'EFF', or None
+    if no known core pattern matches.
+
+    Priority: ULTRA patterns checked first (most specific), then PERF, then EFF.
+    """
+    for pat in _TIER_ULTRA_PATTERNS:
+        if pat.search(cluster_str):
+            return "ULTRA"
+    for pat in _TIER_PERF_PATTERNS:
+        if pat.search(cluster_str):
+            return "PERF"
+    for pat in _TIER_EFF_PATTERNS:
+        if pat.search(cluster_str):
+            return "EFF"
+    return None
+
+
+def _fix_cpu_core_classification(data: dict, issues: list[dict]) -> dict:
+    """
+    Step 3.4 — Deterministic CPU core classification correction.
+
+    Examines each cluster slot (ULTRA / PERF / EFF) and identifies the actual
+    tier of the core(s) in that slot via _classify_core_tier(). If a slot
+    contains a core that belongs in a different tier, moves the value to the
+    correct slot — but only if the target slot is empty (avoids overwriting
+    correctly placed entries like Dimensity 9400's dual-ULTRA design).
+
+    Examples handled:
+      "Cortex-A78" in cpu_ultra_high_performance_cores when no Cortex-X exists
+        → moved to cpu_high_performance_cores, ULTRA set to null
+      "Kryo Gold" in cpu_ultra_high_performance_cores
+        → moved to cpu_high_performance_cores
+      "Firestorm" in cpu_efficiency_cores (Apple anomaly)
+        → moved to cpu_ultra_high_performance_cores
+    """
+    chipset = data.get("chipset")
+    if not isinstance(chipset, dict):
+        return data
+
+    slot_field_map = {
+        "ULTRA": "cpu_ultra_high_performance_cores",
+        "PERF":  "cpu_high_performance_cores",
+        "EFF":   "cpu_efficiency_cores",
+    }
+
+    # Snapshot current slot contents
+    slot_contents = {
+        slot: chipset.get(field)
+        for slot, field in slot_field_map.items()
+    }
+
+    # Identify misclassifications: (from_slot, to_slot, value)
+    corrections: list[tuple[str, str, str]] = []
+    for from_slot, value in slot_contents.items():
+        if not isinstance(value, str) or not value.strip():
+            continue
+        actual_tier = _classify_core_tier(value)
+        if actual_tier is None or actual_tier == from_slot:
+            continue
+        corrections.append((from_slot, actual_tier, value))
+
+    # Apply corrections
+    for from_slot, to_slot, value in corrections:
+        from_field = slot_field_map[from_slot]
+        to_field   = slot_field_map[to_slot]
+
+        # Refuse to overwrite a non-empty target slot — could be a real
+        # dual-tier design (e.g. Dimensity 9400: X925 + X4 both in ULTRA).
+        # If from_slot ≠ to_slot AND target is filled → genuine conflict.
+        if chipset.get(to_field) is not None:
+            issues.append({
+                "field": from_field,
+                "issue": "core_classification_conflict",
+                "raw_value": value,
+                "corrected_value": (
+                    f"would move to {to_field} but target already has "
+                    f"{chipset.get(to_field)!r} — manual review required"
+                ),
+            })
+            logger.warning(
+                "_fix_cpu_core_classification: conflict — %r in %s should be %s "
+                "but %s already has %r",
+                value, from_field, to_field, to_field, chipset.get(to_field),
+            )
+            continue
+
+        # Move the value
+        chipset[to_field] = value
+        chipset[from_field] = None
+        issues.append({
+            "field": from_field,
+            "issue": f"core_misclassified_{from_slot}_to_{to_slot}",
+            "raw_value": value,
+            "corrected_value": f"moved to {to_field}",
+        })
+        logger.info(
+            "_fix_cpu_core_classification: moved %r from %s → %s",
+            value, from_field, to_field,
+        )
+
+    return data
 
 
 async def build_lookup_cache() -> None:
@@ -582,6 +873,418 @@ _BRAND_CHARGING_FALLBACK: dict[str, str | None] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# v1 normalizer step helpers (Steps 3.5, 4-prefill, 8.7b, 8.8, 8.9)
+# ---------------------------------------------------------------------------
+
+_REAR_CAMERA_COUNT_MAP: dict[int, str] = {
+    1: "Single",
+    2: "Dual",
+    3: "Triple",
+    4: "Quad",
+}
+
+_REAR_LENS_TYPES: frozenset[str] = frozenset({
+    "main",
+    "ultra-wide",
+    "ultrawide",       # LLM variant without hyphen
+    "ultra wide",      # LLM variant with space
+    "telephoto",
+    "periscope",
+    "macro",
+    "depth",
+})
+
+
+def _derive_rear_camera_setup(data: dict, issues: list[dict]) -> dict:
+    """
+    Step 3.5 — Rear camera lens count derivation.
+
+    Always counts camera_lenses[] entries whose lens_type (lowercased) is a
+    rear-facing type and writes the canonical setup name string into
+    camera_overview.rear_camera_setup — OVERRIDING any LLM-provided value.
+
+    Runs BEFORE Step 4 (scalar FK resolution) so the written string is
+    resolved to a PK integer automatically in the same pass as all other
+    SCALAR_FK_MAP fields.
+
+    Rear lens types: Main, Ultra-wide (and variants), Telephoto, Periscope,
+    Macro, Depth. Front-facing lens types are excluded by not being in
+    _REAR_LENS_TYPES.
+
+    5+ rear lenses → "Quad" (lookup_rear_camera_setup caps at Quad).
+    0 rear lenses  → skip (leave null for gap analyzer).
+    """
+    camera_overview = data.get("camera_overview")
+    if not isinstance(camera_overview, dict):
+        return data
+
+    lenses = data.get("camera_lenses") or []
+    rear_count = sum(
+        1 for lens in lenses
+        if isinstance(lens, dict)
+        and isinstance(lens.get("lens_type"), str)
+        and lens["lens_type"].strip().lower() in _REAR_LENS_TYPES
+    )
+
+    if rear_count == 0:
+        return data  # can't derive — leave null for gap analyzer
+
+    setup_name = _REAR_CAMERA_COUNT_MAP.get(rear_count, "Quad")  # 5+ → Quad
+
+    old_value = camera_overview.get("rear_camera_setup")
+    camera_overview["rear_camera_setup"] = setup_name
+
+    issues.append({
+        "field":           "camera_overview.rear_camera_setup",
+        "issue":           "rear_camera_setup_derived",
+        "raw_value":       old_value,
+        "corrected_value": setup_name,
+    })
+    logger.debug(
+        "_derive_rear_camera_setup: %d rear lens(es) → %r (was %r)",
+        rear_count, setup_name, old_value,
+    )
+    return data
+
+
+def _prefill_widevine_defaults(data: dict, issues: list[dict]) -> dict:
+    """
+    Step 4 pre-fill — Widevine defaults.
+
+    Sets certifications.widevine_support → True and
+    certifications.widevine_level → "L1" when both are null.
+
+    Runs BEFORE Step 4 (scalar FK resolution) so "L1" is resolved to its
+    lookup PK in the same pass as all other FK fields.  The LLM is
+    instructed to leave these null; normalizer fills them deterministically
+    because 99%+ of phones ≥ 2017 support Widevine L1.
+    Only writes when value is currently null — never overrides LLM output.
+    """
+    certs = data.get("certifications")
+    if not isinstance(certs, dict):
+        return data
+
+    filled: list[str] = []
+    if certs.get("widevine_support") is None:
+        certs["widevine_support"] = True
+        filled.append("widevine_support=True")
+    if certs.get("widevine_level") is None:
+        certs["widevine_level"] = "L1"
+        filled.append("widevine_level=L1")
+
+    if filled:
+        issues.append({
+            "field":           "certifications.widevine",
+            "issue":           "widevine_prefilled",
+            "raw_value":       None,
+            "corrected_value": ", ".join(filled),
+        })
+        logger.debug("_prefill_widevine_defaults: %s", ", ".join(filled))
+    return data
+
+
+def _apply_simple_boolean_defaults(data: dict, issues: list[dict]) -> dict:
+    """
+    Step 8.7b — Simple boolean defaults for hardware presence/absence fields.
+
+    Features that are always listed on spec sheets when present — silence means
+    absent. Defaults applied only when the field is currently null.
+
+    False defaults (absence of evidence = absent):
+        connectivity.nfc         — hardware chip, always mentioned when present
+        connectivity.uwb         — hardware chip, always mentioned when present
+        connectivity.ir_blaster  — hardware feature, always mentioned when present
+        network.esim_support     — physical eSIM always listed when supported
+        network.vowifi           — listed when supported; India phones increasingly have it
+        network.vo5g             — only true when source explicitly says VoNR/Vo5G
+        charging.reverse_charging — wired reverse charging always listed when present
+        body.has_stylus          — stylus support always listed when present
+
+    True defaults:
+        network.volte            — TRAI mandates VoLTE on all Indian 4G phones;
+                                   absence of evidence means present, not absent
+    """
+    connectivity = data.get("connectivity")
+    network = data.get("network")
+    charging = data.get("charging")
+    body = data.get("body")
+    defaulted: list[str] = []
+
+    if isinstance(connectivity, dict):
+        for field in ("nfc", "uwb", "ir_blaster"):
+            if connectivity.get(field) is None:
+                connectivity[field] = False
+                defaulted.append(f"connectivity.{field}=False")
+
+    if isinstance(network, dict):
+        for field in ("esim_support", "vowifi", "vo5g"):
+            if network.get(field) is None:
+                network[field] = False
+                defaulted.append(f"network.{field}=False")
+        if network.get("volte") is None:
+            network["volte"] = True
+            defaulted.append("network.volte=True")
+
+    if isinstance(charging, dict):
+        if charging.get("reverse_charging") is None:
+            charging["reverse_charging"] = False
+            defaulted.append("charging.reverse_charging=False")
+
+    if isinstance(body, dict):
+        if body.get("has_stylus") is None:
+            body["has_stylus"] = False
+            defaulted.append("body.has_stylus=False")
+
+    if defaulted:
+        issues.append({
+            "field":           "boolean defaults",
+            "issue":           "boolean_defaults_applied",
+            "raw_value":       None,
+            "corrected_value": ", ".join(defaulted),
+        })
+        logger.debug("_apply_simple_boolean_defaults: %s", ", ".join(defaulted))
+    return data
+
+
+# Tokens that identify a non-button hardware entry — any entry whose
+# comma-separated tokens fuzzy-match any of these is dropped entirely.
+# Short tokens (≤ 3 chars) use exact match only.
+# 4–6 char tokens use Levenshtein ≤ 1.
+# 7+ char tokens use Levenshtein ≤ 2.
+_BUTTON_EXCLUDE_KEYWORDS: tuple[str, ...] = (
+    "usb", "port", "typec", "type",
+    "microphone", "mic",
+    "speaker", "grille", "grill",
+    "sim", "tray",
+    "headphone", "jack",
+    "charging", "connector",
+)
+
+# After cleanup, at least one entry must contain a token fuzzy-matching
+# each of these. If missing → warning issue is raised (field is kept).
+_BUTTON_PRIMARY_KEYWORDS: tuple[str, ...] = ("power", "volume")
+
+
+def _derive_audio_positions(data: dict, issues: list[dict]) -> dict:
+    """
+    Step 8.8 — Microphone and speaker position derivation from count.
+
+    When the LLM extracted counts but not position strings, derives canonical
+    position strings from the count. Only fills null fields — never overrides
+    an explicit LLM value.
+
+    Microphone rules:
+        count is null → default to 1 (every phone since touchscreen era has
+                        at least one mic), set position "Bottom"
+        count = 1     → "Bottom"
+        count = 2     → "Top, Bottom"
+        count ≥ 3     → leave positions null, raise manual-review issue
+
+    Speaker rules:
+        count = 1     → "Bottom"
+        count ≥ 2     → "Bottom + Earpiece (Stereo)"
+    """
+    audio = data.get("audio")
+    if not isinstance(audio, dict):
+        return data
+
+    # Change 1: Canonicalize explicit string matches
+    explicit_positions = audio.get("speaker_positions")
+    if explicit_positions:
+        p = explicit_positions.lower()
+        if p == "bottom":
+            audio["speaker_positions"] = "Bottom"
+        elif "stereo" in p or "earpiece" in p or ("top" in p and "bottom" in p):
+            audio["speaker_positions"] = "Bottom + Earpiece (Stereo)"
+
+    derived: list[str] = []
+
+    # ── Microphone positions ──────────────────────────────────────────────
+    if audio.get("microphone_positions") is None:
+        mic_count = audio.get("microphone_count")
+
+        # Default null mic count to 1 — every modern phone has at least one
+        if mic_count is None:
+            audio["microphone_count"] = 1
+            mic_count = 1
+            derived.append("microphone_count=1 (defaulted from null)")
+
+        if mic_count == 1:
+            audio["microphone_positions"] = "Bottom"
+            derived.append("microphone_positions=Bottom")
+        elif mic_count == 2:
+            audio["microphone_positions"] = "Top, Bottom"
+            derived.append("microphone_positions=Top, Bottom")
+        elif isinstance(mic_count, int) and mic_count >= 3:
+            # Cannot safely derive — requires manual review
+            issues.append({
+                "field":           "audio.microphone_positions",
+                "issue":           f"microphone_count={mic_count} exceeds 2 — positions require manual entry",
+                "raw_value":       mic_count,
+                "corrected_value": None,
+            })
+            logger.debug(
+                "_derive_audio_positions: mic_count=%d ≥ 3 — positions left null",
+                mic_count,
+            )
+
+    # ── Speaker positions ─────────────────────────────────────────────────
+    if audio.get("speaker_positions") is None:
+        speaker_count = audio.get("speaker_count")
+        if speaker_count == 1:
+            audio["speaker_positions"] = "Bottom"
+            derived.append("speaker_positions=Bottom")
+        elif isinstance(speaker_count, int) and speaker_count >= 2:
+            audio["speaker_positions"] = "Bottom + Earpiece (Stereo)"
+            derived.append("speaker_positions=Bottom + Earpiece (Stereo)")
+
+    if derived:
+        issues.append({
+            "field":           "audio positions",
+            "issue":           "audio_positions_derived",
+            "raw_value":       None,
+            "corrected_value": ", ".join(derived),
+        })
+        logger.debug("_derive_audio_positions: %s", ", ".join(derived))
+    return data
+
+
+def _cleanup_buttons_text(data: dict) -> dict:
+    """
+    Step 8.9 — Buttons text cleanup.
+
+    Splits body.buttons on commas. For each entry, strips the parenthetical
+    position annotation, tokenizes on spaces/hyphens, and fuzzy-matches each
+    token against _BUTTON_EXCLUDE_KEYWORDS. If any token hits → the entire
+    entry is dropped. Physical button entries (Power, Volume, Action, etc.)
+    are kept as-is.
+
+    Fuzzy threshold by token length:
+        ≤ 3 chars  → exact match only  (avoids false positives on "AI", "C")
+        4–6 chars  → Levenshtein ≤ 1   (catches "USN" → "usb", "speakr" → "speaker")
+        7+ chars   → Levenshtein ≤ 2   (catches "microphonr" → "microphone")
+
+    After cleanup, raises a WARNING issue (never nulls the field) if "power"
+    or "volume" tokens are absent — signals possible over-aggressive cleanup
+    or a data quality problem for admin review.
+
+    Logs all dropped entries in issues_found.
+    """
+    body = data.get("body")
+    if not isinstance(body, dict):
+        return data
+
+    buttons = body.get("buttons")
+    if not isinstance(buttons, str) or not buttons.strip():
+        return data
+
+    def _token_hits_excludes(token: str) -> bool:
+        tlen = len(token)
+        for kw in _BUTTON_EXCLUDE_KEYWORDS:
+            if tlen <= 3:
+                if token == kw:
+                    return True
+            elif tlen <= 6:
+                if levenshtein_distance(token, kw) <= 1:
+                    return True
+            else:
+                if levenshtein_distance(token, kw) <= 2:
+                    return True
+        return False
+
+    def _tokenize_entry(entry: str) -> list[str]:
+        # Strip parenthetical "(Right)", "(Bottom)" etc.
+        stripped = re.sub(r"\(.*?\)", "", entry).lower()
+        # Split on spaces and hyphens; drop empty and single-char tokens
+        tokens = re.split(r"[\s\-/]+", stripped)
+        return [t.strip(".,") for t in tokens if len(t) > 1]
+
+    entries = [e.strip() for e in buttons.split(",") if e.strip()]
+    kept: list[str] = []
+    dropped: list[str] = []
+
+    for entry in entries:
+        tokens = _tokenize_entry(entry)
+        if any(_token_hits_excludes(t) for t in tokens):
+            dropped.append(entry)
+        else:
+            kept.append(entry)
+
+    cleaned = ", ".join(kept) if kept else buttons  # fall back to original if all dropped
+
+    if dropped:
+        body["buttons"] = cleaned
+        logger.debug(
+            "_cleanup_buttons_text: dropped %d entries %r → %r",
+            len(dropped), dropped, cleaned,
+        )
+
+    # Validate primaries are still present after cleanup
+    all_kept_tokens: set[str] = set()
+    for entry in kept:
+        all_kept_tokens.update(_tokenize_entry(entry))
+
+    missing_primaries = [
+        p for p in _BUTTON_PRIMARY_KEYWORDS
+        if not any(
+            levenshtein_distance(t, p) <= (0 if len(t) <= 3 else 1 if len(t) <= 6 else 2)
+            for t in all_kept_tokens
+        )
+    ]
+
+    # Build a single combined issue entry if anything changed or is missing
+    if dropped or missing_primaries:
+        issue_parts: list[str] = []
+        if dropped:
+            issue_parts.append(f"dropped_entries={dropped}")
+        if missing_primaries:
+            issue_parts.append(f"missing_primary_buttons={missing_primaries} (WARNING: check manually)")
+        logger.debug("_cleanup_buttons_text: %s", "; ".join(issue_parts))
+    return data
+
+
+def _derive_ram_frequency(data: dict, issues: list[dict]) -> dict:
+    """
+    Step 8.10 — Deterministic RAM frequency derivation from ram_type.
+    """
+    variants = data.get("variants")
+    if not isinstance(variants, list):
+        return data
+
+    for i, variant in enumerate(variants):
+        if not isinstance(variant, dict):
+            continue
+        freq = variant.get("ram_frequency")
+        if freq is not None:
+            continue
+        rtype = variant.get("ram_type")
+        if not isinstance(rtype, str) or not rtype.strip():
+            continue
+
+        clean_type = rtype.upper().replace(" ", "").replace("-", "")
+        derived = None
+        for key, val in _RAM_TYPE_FREQUENCY_MAP.items():
+            if key in clean_type:
+                derived = val
+                break
+
+        if derived is not None:
+            variant["ram_frequency"] = derived
+            issues.append({
+                "field": f"variants[{i}].ram_frequency",
+                "issue": "ram_frequency_derived_from_type",
+                "raw_value": None,
+                "corrected_value": derived,
+            })
+            logger.debug(
+                "_derive_ram_frequency: derived %d MHz for variants[%d] from type %r",
+                derived, i, rtype,
+            )
+
+    return data
+
+
 def _apply_tier_gated_wireless_cascade(data: dict) -> dict:
     """
     Section 3.2 — Step 8.7: Tier-gated wireless charging cascade.
@@ -599,8 +1302,8 @@ def _apply_tier_gated_wireless_cascade(data: dict) -> dict:
     Case 3: wireless_charging IS TRUE
         → no action; gap analyzer handles missing power/standard fields.
 
-    cpu_clock_speed / gpu_clock_speed are NOT touched — they live in the chipset
-    block and are phone-specific; this function only touches the charging block.
+    cpu_clock_speed / gpu_clock_speed are NOT touched — they now live in the phones
+    table (Migration 49) and are written at commit time, not by this function.
     """
     charging = data.get("charging")
     if not isinstance(charging, dict):
@@ -633,6 +1336,74 @@ def _apply_tier_gated_wireless_cascade(data: dict) -> dict:
             charging["reverse_wireless_charging"] = False
         if charging.get("reverse_wireless_charging") is False:
             charging["reverse_wireless_charging_power"] = None
+
+    return data
+
+
+def _query_charging_voltage_amperage(
+    brand_name: str | None,
+    charging_standard: str | None,
+    wattage: float | None
+) -> tuple[float | None, float | None]:
+    """
+    Calls the Supabase RPC 'get_charging_specs_by_brand_tech_wattage'
+    to look up known voltage/amperage for a given combination.
+    """
+    if wattage is None or wattage <= 0 or not brand_name or not charging_standard:
+        return None, None
+
+    try:
+        supabase = get_client()
+        response = supabase.rpc(
+            "get_charging_specs_by_brand_tech_wattage",
+            {
+                "p_brand": brand_name,
+                "p_technology": charging_standard,
+                "p_power": int(wattage)
+            }
+        ).execute()
+
+        data = response.data
+        if data and len(data) > 0:
+            row = data[0]
+            return row.get("charging_voltage"), row.get("charging_ampere")
+    except Exception as e:
+        logger.warning(
+            "_query_charging_voltage_amperage DB call failed: %s", e
+        )
+
+    return None, None
+
+
+async def _inject_charging_specs(data: dict, brand_name: str | None) -> dict:
+    """
+    Step 2.6 — Charging voltage/amperage injection.
+    Looks up voltage and amperage when missing but wattage and standard are known.
+    """
+    charging = data.get("charging")
+    if not isinstance(charging, dict):
+        return data
+
+    wattage = charging.get("charging_power")
+    if wattage is None:
+        return data
+
+    v = charging.get("charging_voltage")
+    a = charging.get("charging_ampere")
+
+    if v is not None and a is not None:
+        return data
+
+    standard = charging.get("charging_standard")
+
+    db_v, db_a = await asyncio.to_thread(
+        _query_charging_voltage_amperage, brand_name, standard, wattage
+    )
+
+    if db_v is not None and v is None:
+        charging["charging_voltage"] = float(db_v)
+    if db_a is not None and a is None:
+        charging["charging_ampere"] = float(db_a)
 
     return data
 
@@ -750,6 +1521,8 @@ async def run_normalisation(output_id: int) -> dict:
         issues: list[dict] = []
         staging_count = 0
 
+        _pre_brand: str | None = None
+
         # ── Section 2 — Pre-normalizer enrichment pass ───────────────────────
         # Runs before ALL normalisation steps so prices are clean integers and
         # chipset.chipset_name is populated before Step 2.5 fires.
@@ -765,8 +1538,6 @@ async def run_normalisation(output_id: int) -> dict:
                     brand=_pre_brand,
                     model_name=_pre_model,
                     normalized_id=None,   # row not yet created at this point
-                    price_verified_at=None,
-                    force_price_check=False,
                 )
                 issues.extend(pre_issues)
                 logger.info(
@@ -817,34 +1588,28 @@ async def run_normalisation(output_id: int) -> dict:
 
                 # Section 3.1 — DB-injection: build canonical chipset block.
                 # cpu_clock_speed and gpu_clock_speed are intentionally excluded:
-                # these are phone-specific (OEMs bin/underclock the same chipset).
-                # They remain from LLM extraction or null — gap analyzer will enrich.
+                # these are phone-specific (OEMs bin/underclock the same chipset)
+                # and are now columns on mobile_specs.phones (Migration 49).
+                # gpu_unit_count and gpu_unit_type are replaced by gpu_cores (Migration 50).
                 _CHIPSET_CANONICAL_COLS = (
                     "chipset_id",
                     "chipset_name",
                     "cpu_architecture",
                     "fabrication_node",
                     "number_of_cores",
+                    "cpu_ultra_high_performance_cores",
                     "cpu_high_performance_cores",
-                    "cpu_performance_cores",
                     "cpu_efficiency_cores",
                     "gpu_name",
-                    "gpu_unit_count",
-                    "gpu_unit_type",
+                    "gpu_cores",
                     "npu_details",
                     "npu_tops",
                 )
-                # Preserve phone-specific speed fields from LLM extraction
-                lm_cpu_clock = (chipset_raw or {}).get("cpu_clock_speed")
-                lm_gpu_clock = (chipset_raw or {}).get("gpu_clock_speed")
 
                 injected_block = {
                     k: existing_chipset.get(k)
                     for k in _CHIPSET_CANONICAL_COLS
                 }
-                # Re-inject phone-specific speed fields from LLM (may be null)
-                injected_block["cpu_clock_speed"] = lm_cpu_clock
-                injected_block["gpu_clock_speed"] = lm_gpu_clock
 
                 # Also pull any extra detail fields from in-memory cache row
                 if chipset_id_from_db and chipset_id_from_db in CHIPSET_ROW_CACHE:
@@ -856,7 +1621,7 @@ async def run_normalisation(output_id: int) -> dict:
                 normalized_json["chipset"] = injected_block
                 logger.info(
                     "run_normalisation: chipset %r found in DB (chipset_id=%s) — "
-                    "DB-canonical values injected; phone-specific clock speeds retained.",
+                    "DB-canonical values injected (Migration 49: clock speeds now on phones table).",
                     chipset_name_raw, chipset_id_from_db,
                 )
             else:
@@ -868,8 +1633,49 @@ async def run_normalisation(output_id: int) -> dict:
                     chipset_name_raw,
                 )
 
+            # Step 2.5c — Defensive null-fill for chipset fields.
+            # LLM may omit fields entirely when it has no data for them
+            # (e.g. gpu_cores, npu_details, npu_tops, cpu_architecture).
+            # Ensure every canonical chipset field exists as at least null so
+            # gap analyzer picks them up as enrichable gaps.
+            _CHIPSET_REQUIRED_FIELDS = (
+                "chipset_name", "cpu_architecture", "fabrication_node",
+                "number_of_cores", "cpu_ultra_high_performance_cores",
+                "cpu_high_performance_cores", "cpu_efficiency_cores",
+                "cpu_clock_speed", "gpu_clock_speed", "gpu_name", "gpu_cores",
+                "npu_details", "npu_tops",
+            )
+            chipset_block = normalized_json.get("chipset")
+            if isinstance(chipset_block, dict):
+                for col in _CHIPSET_REQUIRED_FIELDS:
+                    if col not in chipset_block:
+                        chipset_block[col] = None
+                        logger.debug(
+                            "run_normalisation: null-filled missing chipset field %r",
+                            col,
+                        )
+
+        # Step 2.6 — Charging voltage/amperage injection
+        if _pre_brand:
+            normalized_json = await _inject_charging_specs(normalized_json, _pre_brand)
+
         # Step 3 — Discard RUN_C_CALCULATED_FIELDS
         normalized_json = _discard_run_c_fields(normalized_json, issues)
+
+        # Step 3.4 — CPU core classification correction
+        # Fixes LLM misclassification (e.g. A78 placed in ULTRA when no Cortex-X exists).
+        # Covers ARM Cortex, Qualcomm Oryon/Kryo, Apple, Samsung Exynos.
+        normalized_json = _fix_cpu_core_classification(normalized_json, issues)
+
+        # Step 3.5 — Rear camera setup derivation (v1)
+        # Counts rear-facing lenses → writes "Single"/"Dual"/"Triple"/"Quad"
+        # string before Step 4 FK-resolves it to an integer PK.
+        normalized_json = _derive_rear_camera_setup(normalized_json, issues)
+
+        # Step 4 pre-fill — Widevine defaults (v1)
+        # Sets widevine_support=True / widevine_level="L1" when null, before
+        # Step 4 FK-resolves "L1" → integer PK automatically.
+        normalized_json = _prefill_widevine_defaults(normalized_json, issues)
 
         # Step 4 — Scalar FK resolution
         normalized_json, scalar_issues, scalar_staging = await asyncio.to_thread(
@@ -910,6 +1716,21 @@ async def run_normalisation(output_id: int) -> dict:
         # Only defaults wireless_charging=False for phones < ₹30,000.
         # Premium phones (≥ ₹30,000) keep null so gap analyzer can enrich.
         normalized_json = _apply_tier_gated_wireless_cascade(normalized_json)
+
+        # Step 8.7b — Simple boolean defaults (v1)
+        # nfc/uwb/ir_blaster/esim_support → False; volte → True for null fields.
+        normalized_json = _apply_simple_boolean_defaults(normalized_json, issues)
+
+        # Step 8.8 — Microphone + speaker position derivation (v1)
+        # Derives position strings from extracted counts when positions are null.
+        normalized_json = _derive_audio_positions(normalized_json, issues)
+
+        # Step 8.9 — Buttons text cleanup (v1)
+        # Normalizes whitespace and separators in body.buttons string.
+        normalized_json = _cleanup_buttons_text(normalized_json)
+
+        # Step 8.10 — RAM frequency derivation
+        normalized_json = _derive_ram_frequency(normalized_json, issues)
 
         # Count remaining nulls
         remaining_nulls = _count_nulls(normalized_json)
@@ -1086,6 +1907,12 @@ def _resolve_scalar_fks(
             if "autofocus_type" in concrete_path:
                 lookup_value = _AUTOFOCUS_TYPE_ALIASES.get(lookup_value, lookup_value)
 
+            # Change 2A: apply front_camera_shape alias BEFORE lookup
+            # Handles casing/punctuation variants: "Punch Hole" → "Punch-hole", etc.
+            if concrete_path == "camera_overview.front_camera_shape":
+                alias_key = re.sub(r'[-\s]+', ' ', lookup_value.lower().strip())
+                lookup_value = _FRONT_CAMERA_SHAPE_ALIASES.get(alias_key, lookup_value)
+
             pk, corrected, resolution_type = resolve_lookup_value(
                 lookup_value, table_path
             )
@@ -1174,6 +2001,42 @@ def _resolve_array_fks(
             for raw_value in raw_array:
                 if raw_value is None:
                     continue
+
+                # ── in_the_box structured object handling ──────────────────────────────
+                # Extraction outputs objects: {quantity, item_name, item_specification}.
+                # Build a lookup string from item_name + item_specification,
+                # then apply aliases, wattage charger detection, and brand
+                # keyword handset detection before FK resolution.
+                if concrete_path == "in_the_box" and isinstance(raw_value, dict):
+                    item_name = (raw_value.get("item_name") or "").strip()
+                    item_spec  = (raw_value.get("item_specification") or "").strip()
+                    if not item_name:
+                        continue  # malformed entry — skip
+
+                    # Build combined form: spec first, then item name
+                    # "68W TurboPower" + "Charger" → "68W TurboPower Charger"
+                    combined       = f"{item_spec} {item_name}".strip() if item_spec else item_name
+                    combined_lower = combined.lower().strip()
+                    item_lower     = item_name.lower().strip()
+
+                    # Pass 1: wattage charger pattern — any "NNW ... Charger" → "Charger"
+                    if _WATTAGE_CHARGER_RE.search(combined):
+                        raw_value = "Charger"
+
+                    # Pass 2: alias map — try combined form, then item_name alone
+                    elif combined_lower in _BOX_ITEM_ALIASES:
+                        raw_value = _BOX_ITEM_ALIASES[combined_lower]
+                    elif item_lower in _BOX_ITEM_ALIASES:
+                        raw_value = _BOX_ITEM_ALIASES[item_lower]
+
+                    # Pass 3: brand/device keyword → Handset
+                    elif any(kw in item_lower for kw in _HANDSET_KEYWORDS):
+                        raw_value = "Handset"
+
+                    # Pass 4: no match — use combined form for FK lookup
+                    # (fuzzy may still catch it; if not → staging with clean string)
+                    else:
+                        raw_value = combined
 
                 # Change 3c: silently drop Wi-Fi Hotspot from junction table
                 if "wifi_technologies" in concrete_path and str(raw_value) in _WIFI_TECHNOLOGIES_EXCLUDE:

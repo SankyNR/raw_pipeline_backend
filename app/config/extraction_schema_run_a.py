@@ -87,15 +87,18 @@ class ChipsetData(BaseModel):
     cpu_architecture: Optional[ExtractedString] = None
     fabrication_node: Optional[ExtractedInt] = None
     number_of_cores: Optional[ExtractedInt] = None
-    cpu_high_performance_cores: Optional[ExtractedString] = None  # Change 1c: renamed from cpu_high_performance
-    cpu_performance_cores: Optional[ExtractedString] = None
+    cpu_ultra_high_performance_cores: Optional[ExtractedString] = None  # Change 1c: renamed from cpu_high_performance
+    cpu_high_performance_cores: Optional[ExtractedString] = None
     cpu_efficiency_cores: Optional[ExtractedString] = None
-    cpu_clock_speed: Optional[ExtractedFloat] = None
+    # Phone-level clock speeds — stored on mobile_specs.phones (Migration 49).
+    # Extracted here because LLM reads them from source; commit_orchestrator
+    # reads chipset_data and writes cpu_clock_speed/gpu_clock_speed to phone_row.
+    cpu_clock_speed: Optional[ExtractedFloat] = None  # GHz — phone-specific OEM binning
+    gpu_clock_speed: Optional[ExtractedFloat] = None  # MHz — phone-specific
     gpu_name: Optional[ExtractedString] = None
     # gpu_architecture removed — Change 1d: redundant, already embedded in gpu_name
-    gpu_unit_count: Optional[ExtractedInt] = None
-    gpu_unit_type: Optional[ExtractedString] = None
-    gpu_clock_speed: Optional[ExtractedFloat] = None
+    # gpu_unit_count + gpu_unit_type removed — Migration 50: replaced by gpu_cores
+    gpu_cores: Optional[ExtractedInt] = None
     npu_details: Optional[ExtractedString] = None
     npu_tops: Optional[ExtractedFloat] = None
 
@@ -218,6 +221,7 @@ class NetworkData(BaseModel):
     # Junction arrays — plain lists, no _source
     bands_4g: Optional[List[str]] = None
     bands_5g: Optional[List[str]] = None
+    bands_satellite: Optional[List[str]] = None  # Migration 51: NTN/satellite band support
     cellular_features: Optional[List[str]] = None
     volte: Optional[ExtractedBool] = None
     vo5g: Optional[ExtractedBool] = None
@@ -363,15 +367,16 @@ class SimpleChipsetData(BaseModel):
     cpu_architecture: Optional[str] = None
     fabrication_node: Optional[int] = None
     number_of_cores: Optional[int] = None
-    cpu_high_performance_cores: Optional[str] = None  # Change 1c: renamed from cpu_high_performance
-    cpu_performance_cores: Optional[str] = None
+    cpu_ultra_high_performance_cores: Optional[str] = None  # Change 1c: renamed from cpu_high_performance
+    cpu_high_performance_cores: Optional[str] = None
     cpu_efficiency_cores: Optional[str] = None
+    # Phone-level — see ChipsetData comment above
     cpu_clock_speed: Optional[float] = None
+    gpu_clock_speed: Optional[float] = None
     gpu_name: Optional[str] = None
     # gpu_architecture removed — Change 1d: redundant, already embedded in gpu_name
-    gpu_unit_count: Optional[int] = None
-    gpu_unit_type: Optional[str] = None
-    gpu_clock_speed: Optional[float] = None
+    # gpu_unit_count + gpu_unit_type removed — Migration 50: replaced by gpu_cores
+    gpu_cores: Optional[int] = None
     npu_details: Optional[str] = None
     npu_tops: Optional[float] = None
 
@@ -471,6 +476,7 @@ class SimpleNetworkData(BaseModel):
     bands_3g: Optional[str] = None
     bands_4g: Optional[List[str]] = None
     bands_5g: Optional[List[str]] = None
+    bands_satellite: Optional[List[str]] = None  # Migration 51: NTN/satellite band support
     cellular_features: Optional[List[str]] = None
     volte: Optional[bool] = None
     vo5g: Optional[bool] = None
