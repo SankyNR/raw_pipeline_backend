@@ -108,7 +108,7 @@ ARRAY_FK_MAP: dict[str, str] = {
     # camera_lenses[*].camera_features removed — Change 2e: moved to top-level camera_features
 
     # Phone-level camera features  (Change 2e: now a single shared junction, not per-lens)
-    "camera_features":                         "mobile_specs.lookup_camera_features.feature_name",
+    "camera_features":                         "mobile_specs.lookup_camera_features.canonical",
 
     # Connectivity
     "connectivity.wifi_technologies":          "mobile_specs.lookup_wifi_technologies.technology_name",

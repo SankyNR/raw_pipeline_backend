@@ -28,6 +28,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class _SuppressProgressPolls(logging.Filter):
+    """
+    Drops uvicorn access-log lines for GET /admin/scrape/progress.
+    These are high-frequency polling requests (every 3s) that add noise
+    without useful information. All other endpoints remain fully logged.
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "scrape/progress" not in msg and "youtube/progress" not in msg
+
+
+logging.getLogger("uvicorn.access").addFilter(_SuppressProgressPolls())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs once on server startup before accepting requests."""
@@ -44,6 +58,16 @@ app = FastAPI(
     description="Backend for the phone specs raw data scraping pipeline.",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # FIX-11: Attach rate limiter — extraction endpoints use @limiter.limit() decorators

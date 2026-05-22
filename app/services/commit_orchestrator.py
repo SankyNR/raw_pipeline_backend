@@ -1158,7 +1158,7 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
                 rows_inserted += 1
 
         # ── Step 20b: Root-level camera_features (junction on model_id) ───────
-        root_cf_table = "mobile_specs.lookup_camera_features.feature_name"
+        root_cf_table = "mobile_specs.lookup_camera_features.canonical"
         root_cf_ids, root_cf_un = _resolve_array_fk(
             final_json.get("camera_features", []), root_cf_table
         )

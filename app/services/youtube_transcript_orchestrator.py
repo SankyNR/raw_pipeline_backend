@@ -11,8 +11,9 @@ from app.repositories.youtube_execution_repository import (
     finish_transcript_execution,
 )
 from app.repositories.youtube_raw_transcript_repository import (
+    get_raw_transcript_data,
     insert_raw_transcript_data,
-    delete_raw_transcript_data_by_execution,   # add this
+    delete_raw_transcript_data_by_execution,
 )
 from app.repositories.youtube_video_registry_repository import (
     claim_video_for_fetching,
@@ -42,8 +43,17 @@ CONTENT_FAILURE_TYPES = (NoTranscriptFound, TranscriptsDisabled, VideoUnavailabl
 async def run_transcript_pipeline(video_registry_id: int, proxy_session_id: str | None = None) -> dict:
     """
     Full atomic transcript pipeline for one video.
-    Fetch SRT → Translate (if non-English) → Process to TXT → Insert DB row → Mark fetched_raw.
+    Fetch SRT → Store raw SRT → Strip SRT structure → Translate (if non-English)
+    → Store processed TXT → Insert DB row → Mark fetched_raw.
     Returns dict with: success, exec_id, message.
+
+    Language policy: English always wins. fetch_transcript_srt tries
+    manual EN → auto EN → manual HI → auto HI. Hindi is only fetched and
+    translated when no English transcript exists in any form.
+
+    Files produced: raw .srt + processed .txt only. There is no separate
+    translated file — for Hindi videos the translation output IS the
+    processed file.
 
     Args:
         video_registry_id: The video to process.
@@ -57,13 +67,13 @@ async def run_transcript_pipeline(video_registry_id: int, proxy_session_id: str 
        on a non-existent row.
     2. claimed flag — set_video_failed/set_video_not_fetched only called if we claimed the row.
     3. video_reg_id = None init — status reset skipped if video row fetch failed.
-    4. srt_uploaded flag — derivative cleanup only runs if SRT was successfully uploaded.
+    4. srt_uploaded flag — processed-file cleanup only runs if SRT was successfully uploaded.
     5. started_at = None init — execution log close only called if both exec_id and started_at set.
     6. HTTPException (409) re-raises directly — we never owned the row, no status reset needed.
     7. Content failures → set_video_failed (terminal).
        All other exceptions → set_video_not_fetched (retryable).
-    8. SRT is never deleted after srt_uploaded = True. Only processed_path and
-       translated_path are cleaned up on failure.
+    8. SRT is never deleted after srt_uploaded = True. Only the processed file
+       is cleaned up on failure.
     """
     # Initialize to None — failure path must never assume these were set
     exec_id = None
@@ -92,6 +102,32 @@ async def run_transcript_pipeline(video_registry_id: int, proxy_session_id: str 
             yt_video_id=video_row["yt_video_id"],
         )
 
+        # 3.5. Early-exit guard — handles the crash-after-insert scenario.
+        #      If a complete youtube_raw_transcript_data row already exists for
+        #      this video (translation_status = complete or not_required), the
+        #      transcript is fully stored. All that's missing is the
+        #      set_video_fetched_raw call (the process was killed right after
+        #      the DB insert). Skip the entire pipeline, just fix the status.
+        #      This also prevents Step 5's delete_file() from orphaning a valid
+        #      processed file that was written by a prior complete run.
+        existing_transcript = await get_raw_transcript_data(video_reg_id)
+        if existing_transcript and existing_transcript.get("translation_status") in (
+            "translation_complete", "not_required"
+        ):
+            logger.info(
+                "run_transcript_pipeline: transcript already complete for "
+                "video_registry_id=%d (raw_transcript_id=%s) — "
+                "skipping pipeline, marking fetched_raw.",
+                video_reg_id,
+                existing_transcript.get("raw_transcript_id"),
+            )
+            await set_video_fetched_raw(video_reg_id)
+            return {
+                "success": True,
+                "exec_id": existing_transcript.get("transcript_exec_id"),
+                "message": "Pipeline skipped — transcript data already complete.",
+            }
+
         # 4. Atomic claim — returns False if already currently_fetching
         claimed = await claim_video_for_fetching(video_reg_id)
         if not claimed:
@@ -100,29 +136,31 @@ async def run_transcript_pipeline(video_registry_id: int, proxy_session_id: str 
                 detail="Pipeline already running for this video."
             )
 
-        # 5. Pre-emptively delete derivative files from any previous failed run.
+        # 5. Pre-emptively delete the processed file from any previous failed run.
         #    This ensures re-fetch always starts clean.
-        #    The SRT is intentionally NOT deleted — it is overwritten at Step 7.
+        #    The SRT is intentionally NOT deleted — it is overwritten at Step 1.
+        #    No translated file exists in the current pipeline (translation output
+        #    IS the processed output) so there is nothing else to clean.
         await delete_file(paths["processed_path"])
-        await delete_file(paths["translated_path"])
 
         # 6. Open execution log with orchestrator clock timestamp
         started_at = datetime.utcnow()
         exec_id = await create_transcript_execution(video_reg_id, started_at)
 
-        # 7. Determine language fetch priority from channel language
-        lang_priority = get_language_priority(channel_language)
-
-        # === STEP 1: FETCH AND STORE SRT ===
+        # === STEP 1: FETCH AND STORE RAW SRT ===
+        # fetch_transcript_srt enforces English-first: manual EN -> auto EN ->
+        # manual HI -> auto HI. language_priority is accepted for signature
+        # compatibility but no longer drives ordering.
         srt_content, language_code, is_auto_generated = await fetch_transcript_srt(
-            video_row["yt_video_id"], lang_priority, proxy_session_id=proxy_session_id
+            video_row["yt_video_id"], get_language_priority(channel_language),
+            proxy_session_id=proxy_session_id,
         )
 
         srt_bytes = srt_content.encode("utf-8")
         try:
             await upload_file(paths["srt_path"], srt_bytes, "text/plain")
         except StorageDuplicateError:
-            # Change 8: 409 Duplicate — raw SRT already exists from a prior partial run.
+            # 409 Duplicate — raw SRT already exists from a prior partial run.
             # The file is intact; reuse it and continue the pipeline.
             logger.warning(
                 "run_transcript_pipeline: raw SRT already exists at %r — "
@@ -133,36 +171,38 @@ async def run_transcript_pipeline(video_registry_id: int, proxy_session_id: str 
         # SRT is now the immutable artifact. It is never deleted from this point,
         # even if all downstream steps fail.
 
-        # === STEP 2: TRANSLATE (non-English transcripts only) ===
+        # === STEP 2: STRIP SRT STRUCTURE ===
+        # Deterministic, code-based removal of sequence numbers, timestamps and
+        # blank lines. Runs BEFORE translation so the LLM only ever sees clean
+        # text — no SRT noise to confuse it.
+        cleaned_text = process_srt_to_txt(srt_content)
+        if not cleaned_text.strip():
+            raise ValueError("Transcript is empty after stripping SRT structure.")
+
+        # === STEP 3: TRANSLATE (Hindi / non-English transcripts only) ===
         needs_translation = language_code != "en"
-        translated_path = None
-
         if needs_translation:
-            translated_text = await translate_to_english(srt_content)
-            translated_bytes = translated_text.encode("utf-8")
-            await upload_file(paths["translated_path"], translated_bytes, "text/plain")
-            translated_path = paths["translated_path"]
-            text_for_processing = translated_text
+            phone_name = f"{phone_info['brand']} {phone_info['model_name']}"
+            final_text = await translate_to_english(cleaned_text, phone_name=phone_name)
+            if not final_text.strip():
+                raise ValueError("Translation returned empty output.")
         else:
-            text_for_processing = srt_content
+            final_text = cleaned_text
 
-        # === STEP 3: PROCESS TO TXT ===
-        # For English: strips SRT structure from srt_content
-        # For Hindi: strips any residual structure from translated_text (plain text passes through)
-        processed_text = process_srt_to_txt(text_for_processing)
-        if not processed_text.strip():
-            raise ValueError("Processed transcript is empty after cleaning.")
-
-        processed_bytes = processed_text.encode("utf-8")
+        # === STEP 4: STORE PROCESSED FILE ===
+        # For English: cleaned text. For Hindi: translated English text.
+        # There is no separate translated file — translation output is the
+        # processed output.
+        processed_bytes = final_text.encode("utf-8")
         await upload_file(paths["processed_path"], processed_bytes, "text/plain")
 
-        # === STEP 4: COMPLETE ===
+        # === STEP 5: COMPLETE ===
         await insert_raw_transcript_data(
             video_registry_id=video_reg_id,
             transcript_exec_id=exec_id,
             srt_path=paths["srt_path"],
             processed_transcript_path=paths["processed_path"],
-            translated_transcript_path=translated_path,
+            translated_transcript_path=None,  # no separate translated file
             file_size_bytes=len(srt_bytes),
             language_code=language_code,
             is_auto_generated=is_auto_generated,
@@ -196,21 +236,14 @@ async def run_transcript_pipeline(video_registry_id: int, proxy_session_id: str 
         # block before set_video_not_fetched() was reached, permanently stranding
         # the row at status='currently_fetching' with no active worker.
 
-        # Clean up derivative files — but NEVER the SRT
+        # Clean up the processed file — but NEVER the SRT.
+        # There is no separate translated file in the current pipeline.
         if srt_uploaded and paths is not None:
             try:
                 await delete_file(paths["processed_path"])
             except Exception as _del_exc:
                 logger.warning(
                     "run_transcript_pipeline: delete processed_path failed "
-                    "(video_registry_id=%s): %s — continuing cleanup",
-                    video_reg_id, _del_exc,
-                )
-            try:
-                await delete_file(paths["translated_path"])
-            except Exception as _del_exc:
-                logger.warning(
-                    "run_transcript_pipeline: delete translated_path failed "
                     "(video_registry_id=%s): %s — continuing cleanup",
                     video_reg_id, _del_exc,
                 )

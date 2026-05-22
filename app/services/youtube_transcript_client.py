@@ -88,14 +88,11 @@ _TRANSIENT_ERRORS = (
 
 def get_language_priority(channel_language: str) -> list[str]:
     """
-    Returns transcript fetch language priority based on channel's language field.
-    Hindi channels: try Hindi first, then English fallback.
-    English and Hindi/English channels: try English first, then Hindi fallback.
+    Retained for backward compatibility. The fetch order is now fixed inside
+    fetch_transcript_srt() (manual EN -> auto EN -> manual HI -> auto HI) and
+    does NOT depend on this return value. Always returns ['en', 'hi'].
     """
-    if channel_language == "Hindi":
-        return ["hi", "en"]
-    else:
-        return ["en", "hi"]
+    return ["en", "hi"]
 
 
 # ---------------------------------------------------------------------------
@@ -193,20 +190,32 @@ async def fetch_transcript_srt(
         api = YouTubeTranscriptApi(http_client=session)
         transcript_list = api.list(yt_video_id)
 
-        # Try manual transcripts first
-        try:
-            transcript = transcript_list.find_manually_created_transcript(language_priority)
+        # English-first policy: English (manual OR auto) ALWAYS beats Hindi.
+        # Fetch order: manual EN -> auto EN -> manual HI -> auto HI.
+        # language_priority is intentionally ignored for ordering here — the
+        # English-first rule is fixed regardless of channel language.
+        attempts = [
+            ("en", "manual"),
+            ("en", "auto"),
+            ("hi", "manual"),
+            ("hi", "auto"),
+        ]
+        for lang, kind in attempts:
+            try:
+                if kind == "manual":
+                    transcript = transcript_list.find_manually_created_transcript([lang])
+                    is_auto = False
+                else:
+                    transcript = transcript_list.find_generated_transcript([lang])
+                    is_auto = True
+            except NoTranscriptFound:
+                continue
             fetched_data = transcript.fetch()
             srt_content = formatter.format_transcript(fetched_data)
-            return srt_content, transcript.language_code, False
-        except NoTranscriptFound:
-            pass
+            return srt_content, transcript.language_code, is_auto
 
-        # Fall back to auto-generated transcripts
-        transcript = transcript_list.find_generated_transcript(language_priority)
-        fetched_data = transcript.fetch()
-        srt_content = formatter.format_transcript(fetched_data)
-        return srt_content, transcript.language_code, True
+        # No English or Hindi transcript in any form.
+        raise NoTranscriptFound(yt_video_id, ["en", "hi"], transcript_list)
 
     last_exc: Exception | None = None
 

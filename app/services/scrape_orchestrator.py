@@ -44,6 +44,25 @@ from app.utils.path_builder import build_storage_paths
 
 logger = logging.getLogger(__name__)
 
+# ── In-memory progress store ─────────────────────────────────────────────────────────────
+# Keyed by "brand:model_name:site_name". Safe because --workers 1 is required.
+# The frontend polls GET /admin/scrape/progress which reads directly from here.
+# No DB writes, no migrations — pure in-process state.
+
+_progress: dict[str, str] = {}
+
+
+def _set_step(brand: str, model_name: str, site_name: str, step: str) -> None:
+    _progress[f"{brand}:{model_name}:{site_name}"] = step
+
+
+def _clear_step(brand: str, model_name: str, site_name: str) -> None:
+    _progress.pop(f"{brand}:{model_name}:{site_name}", None)
+
+
+def get_current_step(brand: str, model_name: str, site_name: str) -> str | None:
+    """Called by the progress endpoint in scraper.py."""
+    return _progress.get(f"{brand}:{model_name}:{site_name}")
 
 async def run_scrape(brand: str, model_name: str, site_name: str) -> dict:
     """
@@ -100,9 +119,11 @@ async def run_scrape(brand: str, model_name: str, site_name: str) -> dict:
         )
 
         # 7. Call Firecrawl
+        _set_step(brand, model_name, site_name, "calling_firecrawl")
         response = await scrape_with_firecrawl(resolved)
 
         # 8. Validate response structure before touching any data
+        _set_step(brand, model_name, site_name, "processing_response")
         validate_firecrawl_response(response, template["template_name"])
 
         # 9. Success block — track uploads for cleanup on partial failure
@@ -134,6 +155,7 @@ async def run_scrape(brand: str, model_name: str, site_name: str) -> dict:
             screenshots      = await extract_screenshots(response, template["template_name"])
             paths            = build_storage_paths(brand, model_name, site_name)
 
+            _set_step(brand, model_name, site_name, "uploading_files")
             await upload_file(paths["markdown_path"], markdown_bytes, "text/markdown")
             uploaded_paths.append(paths["markdown_path"])
 
@@ -160,6 +182,7 @@ async def run_scrape(brand: str, model_name: str, site_name: str) -> dict:
             # If the DB insert fails, the outer except will delete the uploaded files
             # and reset status to 'not_scraped'. Order matters: DB first, status second.
             finished_at = datetime.utcnow()
+            _set_step(brand, model_name, site_name, "writing_to_database")
             await insert_raw_scraped_data(
                 url_registry_id=url_id,
                 execution_id=execution_id,
@@ -175,6 +198,7 @@ async def run_scrape(brand: str, model_name: str, site_name: str) -> dict:
 
             await finish_execution(execution_id, True, started_at, finished_at)
             await set_status_scraped_raw(url_id)
+            _clear_step(brand, model_name, site_name)
 
             return {
                 "success":      True,
@@ -239,6 +263,7 @@ async def run_scrape(brand: str, model_name: str, site_name: str) -> dict:
                     url_id,
                     reset_error,
                 )
+        _clear_step(brand, model_name, site_name)
 
         return {
             "success":      False,

@@ -51,10 +51,9 @@ output:
     cpu_ultra_high_performance_cores: null
     cpu_high_performance_cores: null
     cpu_efficiency_cores: null
-    cpu_clock_speed: null    # GHz — phone-specific (Migration 49: written to phones table at commit)
-    gpu_clock_speed: null    # MHz — phone-specific (Migration 49: written to phones table at commit)
+    cpu_clock_speed: null # GHz — phone-specific (Migration 49: written to phones table at commit)
+    gpu_clock_speed: null # MHz — phone-specific (Migration 49: written to phones table at commit)
     gpu_name: null
-    # gpu_unit_count + gpu_unit_type — removed (Migration 50: replaced by gpu_cores)
     gpu_cores: null
     npu_details: null
     npu_tops: null
@@ -155,7 +154,7 @@ output:
     bands_3g: null
     bands_4g: []
     bands_5g: []
-    bands_satellite: []  # NTN/satellite bands (n253, n254, n255, n256, NB-IoT 23, NTN)
+    bands_satellite: [] # NTN/satellite bands (n253, n254, n255, n256, NB-IoT 23, NTN)
     cellular_features: []
     volte: null
     vo5g: null

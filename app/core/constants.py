@@ -33,3 +33,14 @@ class PipelineStage:
     NORMALISING           = "normalising"
     ENRICHING             = "enriching"
     RESOLVING_CONFLICTS   = "resolving_conflicts"
+
+
+# Jarvis commit gate — the five conditions that must all be satisfied before a commit.
+# Used by validate_pre_commit, fetch_approval_package, and the commit orchestrator.
+GATE_CONDITION_KEYS: tuple[str, ...] = (
+    "spec_human_approved",
+    "experience_human_approved",
+    "experience_entries_reviewed",
+    "has_unresolved_conflicts",
+    "pending_staging_values",
+)

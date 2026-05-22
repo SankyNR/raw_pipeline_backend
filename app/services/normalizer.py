@@ -757,7 +757,7 @@ def resolve_camera_feature_value(
     Three-pass resolution for camera_features (Section 2.2 of roadmap):
       1. Brand-specific alias match  (brand_alias, brand_id)  → ALIAS_CACHE
       2. Brand-agnostic alias match  (brand_alias, NULL)      → ALIAS_CACHE
-      3. Canonical feature_name match → delegates to resolve_lookup_value()
+      3. Canonical name match → delegates to resolve_lookup_value()
          (includes Levenshtein fuzzy fallback)
       Falls through to not_found if all three passes fail — caller sends to staging.
 
@@ -780,7 +780,7 @@ def resolve_camera_feature_value(
         return ALIAS_CACHE[cleaned][None], raw_value, "alias_global"
 
     # Pass 3: canonical name match (exact + fuzzy via standard resolver)
-    return resolve_lookup_value(raw_value, "mobile_specs.lookup_camera_features.feature_name")
+    return resolve_lookup_value(raw_value, "mobile_specs.lookup_camera_features.canonical")
 
 
 # ---------------------------------------------------------------------------

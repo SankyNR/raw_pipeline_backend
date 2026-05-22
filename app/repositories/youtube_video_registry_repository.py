@@ -287,3 +287,32 @@ async def set_video_not_fetched(video_registry_id: int) -> None:
         raise RuntimeError(
             f"set_video_not_fetched() failed — video_registry_id={video_registry_id} not found or not updated."
         )
+
+
+# ---------------------------------------------------------------------------
+# delete_video() — hard delete a video row (admin curation)
+# ---------------------------------------------------------------------------
+
+async def delete_video(video_registry_id: int) -> bool:
+    """
+    Hard-deletes a single row from pipeline.youtube_video_url_registry.
+
+    Used by admins to remove false-positive videos after YouTube search
+    (e.g. 'Motorola Edge 50' appearing in results for 'Motorola Edge 50 Neo').
+
+    Any child rows in youtube_raw_transcripts that reference this video_registry_id
+    must either be CASCADE-deleted by the DB FK, or will raise a FK violation here.
+    Safe to call for any status — no status check is performed.
+
+    Returns True  if a row was deleted.
+    Returns False if no row with that ID existed (idempotent).
+    """
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("youtube_video_url_registry")
+        .delete()
+        .eq("video_registry_id", video_registry_id)
+        .execute()
+    )
+    return bool(result.data)

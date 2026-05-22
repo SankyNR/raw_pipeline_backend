@@ -47,6 +47,7 @@ from app.services.spec_json_builder import build_spec_json
 from app.services.storage_service import fetch_file_content
 from app.utils.path_builder import get_concat_order
 from app.core.constants import GATE_ERROR_PREFIX as _GATE_ERROR_PREFIX, PipelineStage
+from app.core.spec_canonicalizer import canonicalize_spec
 from app.config.extraction_schema_run_a import RunAExtractionSchema, RunAExtractionSchemaSimple
 from app.repositories.extraction_repository import (
     fetch_latest_validation,
@@ -1315,6 +1316,11 @@ async def run_spec_extraction(
             assembled_source_string=assembled_source_string,
             url_registry_id=url_registry_id,
         )
+
+        # ---------------------------------------------------------------------
+        # Step 7b — Canonicalize field order (My_data_schema.xlsx order)
+        # ---------------------------------------------------------------------
+        partial_json = canonicalize_spec(partial_json)
 
         # ---------------------------------------------------------------------
         # Step 8 — Count null vs filled fields

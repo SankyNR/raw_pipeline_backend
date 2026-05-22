@@ -20,6 +20,41 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def update_normalized_json_field(normalized_id: int, field_path: str, new_value: any) -> None:
+    """
+    Patches a single field inside normalized_spec_json.normalized_json using jsonb_set.
+    Used by staging/resolve to keep normalized_json in sync with final_json after FK resolution.
+    field_path uses dot notation: 'camera.megapixels', 'connectivity.bands_5g'
+    """
+    from app.services.conflict_resolver import _get_at_path, _set_at_path, _parse_path
+    import copy
+
+    client = get_client()
+    row = (
+        client
+        .schema("pipeline")
+        .table("normalized_spec_json")
+        .select("normalized_json")
+        .eq("normalized_id", normalized_id)
+        .single()
+        .execute()
+    )
+    if not row.data:
+        return
+
+    normalized_json = copy.deepcopy(row.data["normalized_json"] or {})
+    current_val = _get_at_path(normalized_json, field_path)
+    if isinstance(current_val, list):
+        if new_value not in current_val:
+            current_val.append(new_value)
+    else:
+        _set_at_path(normalized_json, field_path, new_value)
+
+    client.schema("pipeline").table("normalized_spec_json").update(
+        {"normalized_json": normalized_json}
+    ).eq("normalized_id", normalized_id).execute()
+
+
 # ---------------------------------------------------------------------------
 # Task 1.1 — URL coverage queries
 # ---------------------------------------------------------------------------
@@ -707,12 +742,41 @@ def bulk_insert_phone_experiences(rows: list[dict]) -> int:
 # Phase 4 — Normalisation DB layer
 # ---------------------------------------------------------------------------
 
+def fetch_run_a_outputs_for_phone(url_registry_id: int, limit: int = 20) -> list[dict]:
+    """
+    Returns recent spec_extraction_output rows for a phone, ordered newest first.
+    Used by the Normalizer UI OutputSelector to let the admin pick which
+    Run A output to normalise.
+
+    Returns columns: output_id, extraction_run_id, null_field_count,
+    filled_field_count, created_at (from spec_extraction_runs.finished_at).
+    """
+    result = (
+        get_client()
+        .schema("pipeline")
+        .table("spec_extraction_output")
+        .select(
+            "output_id, extraction_run_id, null_field_count, filled_field_count, "
+            "spec_extraction_runs(status, finished_at, extraction_schema_version)"
+        )
+        .eq("url_registry_id", url_registry_id)
+        .order("output_id", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    rows = result.data or []
+    # Flatten the nested join
+    for row in rows:
+        run = row.pop("spec_extraction_runs", None) or {}
+        row["run_status"]            = run.get("status")
+        row["finished_at"]           = run.get("finished_at")
+        row["schema_version"]        = run.get("extraction_schema_version")
+    return rows
+
+
 def fetch_spec_extraction_output(output_id: int) -> dict:
     """
     Fetches a spec_extraction_output row by output_id.
-
-    Returns the full row including partial_json, url_registry_id,
-    extraction_run_id.
 
     Raises:
         ValueError: If output_id not found.

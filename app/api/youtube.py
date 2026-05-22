@@ -8,6 +8,7 @@ Phase 17 (Task 17.1): POST /admin/youtube/fetch-transcript
 Phase 18 (Task 18.1): GET  /admin/youtube/transcript/{video_registry_id}/srt
 Phase 5  (Task 5.1):  POST /admin/youtube/debug/score-video
 Phase 20 (Task 20.1): POST /admin/youtube/fetch-transcripts-for-model
+Phase 21 (Task 21.1): GET  /admin/youtube/progress
 """
 
 import asyncio
@@ -23,6 +24,7 @@ from app.repositories.youtube_raw_transcript_repository import get_raw_transcrip
 from app.repositories.youtube_video_registry_repository import (
     get_videos_for_phone,
     reset_stale_video_locks,
+    delete_video,
 )
 from app.repositories.pipeline_run_repository import (
     create_pipeline_run,
@@ -33,6 +35,25 @@ from app.services.youtube_search_orchestrator import run_youtube_search
 from app.services.youtube_transcript_orchestrator import run_transcript_pipeline
 
 logger = logging.getLogger(__name__)
+
+
+# ── In-memory progress store ──────────────────────────────────────────────────
+# Keyed by "operation:brand:model_name" where operation is 'search' or 'fetch'.
+# Safe because --workers 1 is required. Zero DB cost.
+
+_yt_progress: dict[str, str] = {}
+
+
+def _yt_set(brand: str, model_name: str, operation: str, step: str) -> None:
+    _yt_progress[f"{operation}:{brand}:{model_name}"] = step
+
+
+def _yt_clear(brand: str, model_name: str, operation: str) -> None:
+    _yt_progress.pop(f"{operation}:{brand}:{model_name}", None)
+
+
+def _yt_get(brand: str, model_name: str, operation: str) -> str | None:
+    return _yt_progress.get(f"{operation}:{brand}:{model_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -172,17 +193,18 @@ async def trigger_youtube_search(body: YouTubeSearchRequest):
         )
 
     try:
+        _yt_set(body.brand, body.model_name, "search", "querying_youtube_api")
         result = await run_youtube_search(body.brand, body.model_name, body.triggered_by)
+        _yt_clear(body.brand, body.model_name, "search")
 
-        # run_youtube_search() catches all errors and returns a dict with success=False.
-        # It never re-raises — so map success=False to HTTP 500 here.
         if not result["success"]:
             raise HTTPException(status_code=500, detail=result["message"])
 
         return result
 
     except HTTPException:
-        raise  # 400 and 500 pass through unchanged
+        _yt_clear(body.brand, body.model_name, "search")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -282,8 +304,42 @@ async def get_youtube_videos(
 
 
 # ---------------------------------------------------------------------------
-# Phase 17 — Task 17.1: POST /admin/youtube/fetch-transcript
+# DELETE /admin/youtube/video/{video_registry_id} — admin curation
 # ---------------------------------------------------------------------------
+
+@router.delete("/youtube/video/{video_registry_id}")
+async def delete_youtube_video(video_registry_id: int):
+    """
+    Hard-deletes a single video row from pipeline.youtube_video_url_registry.
+
+    Used by admins to remove false-positive search results before triggering
+    transcript fetching (e.g. 'Motorola Edge 50' slipping into 'Edge 50 Neo' results).
+
+    Safe to call for any video status. Idempotent — returns 404 if the row
+    doesn't exist rather than raising a server error.
+
+    Success (HTTP 200):
+        { "deleted": true, "video_registry_id": 101 }
+
+    Not found (HTTP 404):
+        { "detail": "Video 101 not found — may have already been deleted." }
+    """
+    try:
+        was_deleted = await delete_video(video_registry_id)
+    except Exception as e:
+        logger.error(
+            "delete_youtube_video DB error (video_registry_id=%d): %s",
+            video_registry_id, e,
+        )
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    if not was_deleted:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Video {video_registry_id} not found \u2014 may have already been deleted.",
+        )
+
+    return {"deleted": True, "video_registry_id": video_registry_id}
 
 class FetchTranscriptRequest(BaseModel):
     video_registry_id: int
@@ -343,7 +399,15 @@ async def get_transcript_srt(video_registry_id: int):
             detail="No transcript data found for this video. Run the pipeline first.",
         )
 
-    srt_path = row["srt_path"]
+    srt_path = row["processed_transcript_path"]
+    if not srt_path:
+        # Fallback to raw SRT if processed path is missing
+        srt_path = row.get("srt_path")
+    if not srt_path:
+        raise HTTPException(
+            status_code=404,
+            detail="No transcript file path found for this video.",
+        )
     try:
         response = (
             _get_client()
@@ -381,8 +445,29 @@ async def get_transcript_srt(video_registry_id: int):
     return {
         "signed_url": signed_url,
         "expires_in": _SRT_SIGNED_URL_EXPIRY_SECONDS,
-        "srt_path": srt_path,
+        "transcript_path": srt_path,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 21 — Task 21.1: GET /admin/youtube/progress
+# ---------------------------------------------------------------------------
+
+@router.get("/youtube/progress")
+async def get_youtube_progress(
+    brand:      str = Query(...),
+    model_name: str = Query(...),
+    operation:  str = Query(...),  # 'search' or 'fetch'
+):
+    """
+    Returns the current in-progress step for a YouTube search or fetch operation.
+    Reads from an in-memory dict — zero DB cost.
+    Polled by the frontend every 3s while searching or bulk-fetching.
+
+    Returns:
+        { "current_step": str | null }
+    """
+    return {"current_step": _yt_get(brand, model_name, operation)}
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +620,7 @@ async def trigger_fetch_transcripts_for_model(body: FetchTranscriptsForModelRequ
         "(brand=%s, model=%s)",
         len(to_process), body.brand, body.model_name,
     )
+    _yt_set(body.brand, body.model_name, "fetch", f"Starting batch of {len(to_process)} videos")
 
     # Create a pipeline_runs tracking row for the entire batch.
     # If this fails, pipeline_run_id stays None and all _track() calls are no-ops.
@@ -561,6 +647,9 @@ async def trigger_fetch_transcripts_for_model(body: FetchTranscriptsForModelRequ
         title     = video.get("video_title", "")
 
         try:
+            title_short = title[:45] + "…" if len(title) > 45 else title
+            _yt_set(body.brand, body.model_name, "fetch",
+                    f"Video {idx + 1}/{len(to_process)}: {title_short}")
             # S3-P1-4: _run_with_retry adds a 90s timeout + 1 transient retry
             result = await _run_with_retry(vid_id, proxy_session_id=None)
 
@@ -683,6 +772,7 @@ async def trigger_fetch_transcripts_for_model(body: FetchTranscriptsForModelRequ
                  failed_items=failed,
                  current_step="Done.",
                  completed_at=_completed_at)
+    _yt_clear(body.brand, body.model_name, "fetch")
 
     return {
         "overall_status":           overall_status,

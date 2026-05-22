@@ -44,7 +44,7 @@ import logging
 from collections import defaultdict
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Security
+from fastapi import APIRouter, Depends, Header, HTTPException, Security, Query
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, field_validator
 
@@ -70,6 +70,7 @@ from app.repositories.extraction_repository import (
     update_final_json_direct,
     update_gate_conditions,
     update_staging_entry_metadata,
+    update_normalized_json_field,
 )
 from app.services.conflict_resolver import (
     _coerce_to_match,
@@ -260,17 +261,100 @@ class StagingResolveRequest(BaseModel):
 # Task 8.2a — Phones ready for review
 # ---------------------------------------------------------------------------
 
+@router.get("/resolve-final-id")
+async def resolve_final_id(
+    brand:      str = Query(..., description="Phone brand"),
+    model_name: str = Query(..., description="Phone model name"),
+):
+    """
+    GET /approval/resolve-final-id?brand=Samsung&model_name=Galaxy+S25
+
+    Returns the most recent final_id for the given phone.
+    Used by the frontend to enter Jarvis from a (brand, model_name) selection
+    without having to load the full approval queue.
+
+    Response:
+        { "final_id": 42, "url_registry_id": 101, "normalized_id": 88, "ready_for_commit": bool }
+
+    Raises 404 if no final_merged_json row exists for this phone.
+    """
+    from app.repositories.extraction_repository import fetch_canonical_id_by_brand_model
+
+    brand      = brand.strip()
+    model_name = model_name.strip()
+
+    try:
+        canonical_url_id = await asyncio.to_thread(
+            fetch_canonical_id_by_brand_model, brand, model_name
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail={"error": "PHONE_NOT_FOUND", "message": str(exc)})
+
+    from app.core.supabase_client import get_client
+    client = get_client()
+
+    try:
+        row = (
+            client
+            .schema("pipeline")
+            .table("final_merged_json")
+            .select("final_id, normalized_id, url_registry_id, ready_for_commit")
+            .eq("url_registry_id", canonical_url_id)
+            .order("final_id", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if not row.data:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "NO_FINAL_JSON",
+                "message": f"No final_merged_json found for {brand!r} {model_name!r}. Run the pipeline first.",
+            },
+        )
+
+    r = row.data[0]
+    return {
+        "final_id":        r["final_id"],
+        "url_registry_id": r["url_registry_id"],
+        "normalized_id":   r["normalized_id"],
+        "ready_for_commit": r.get("ready_for_commit", False),
+    }
+
+
 @router.get("/phones")
-async def list_phones_for_review():
+async def list_phones_for_review(
+    ready_only:    bool      = Query(False, description="Only return phones where ready_for_commit=true"),
+    has_conflicts: bool | None = Query(None, description="Filter by has_unresolved_conflicts"),
+    limit:         int       = Query(100, ge=1, le=500),
+    offset:        int       = Query(0, ge=0),
+):
     """
     GET /approval/phones
 
-    Returns all phones in the pipeline that have a final_merged_json row.
-    Includes all five gate-condition columns and ready_for_commit flag.
-    Frontend uses this to populate the admin queue list.
+    Returns phones in the pipeline that have a final_merged_json row.
+
+    Query params:
+        ready_only=true     → only phones where ready_for_commit=true
+        has_conflicts=true  → only phones with unresolved conflicts
+        has_conflicts=false → only phones with no unresolved conflicts
+        limit, offset       → pagination
     """
     phones = await asyncio.to_thread(fetch_phones_ready_for_review)
-    return {"phones": phones, "count": len(phones)}
+
+    # Apply filters in Python (the repository returns all rows; push to SQL later if perf demands it)
+    if ready_only:
+        phones = [p for p in phones if p.get("ready_for_commit")]
+    if has_conflicts is not None:
+        phones = [p for p in phones if bool(p.get("has_unresolved_conflicts")) == has_conflicts]
+
+    total = len(phones)
+    phones = phones[offset: offset + limit]
+
+    return {"phones": phones, "count": len(phones), "total": total, "offset": offset}
 
 
 # ---------------------------------------------------------------------------
@@ -300,12 +384,29 @@ async def get_approval_package(final_id: int):
         asyncio.to_thread(fetch_pending_staging_entries, url_registry_id),
     )
 
+    _GATE_KEYS = (
+        "spec_human_approved",
+        "experience_human_approved",
+        "experience_entries_reviewed",
+        "has_unresolved_conflicts",
+        "pending_staging_values",
+        "fields_remaining_null",
+        "ready_for_commit",
+    )
+    gate_conditions = {k: row.get(k) for k in _GATE_KEYS}
+    base_package = {k: v for k, v in row.items() if k not in _GATE_KEYS}
+
     return {
-        "approval_package":      row,
-        "flagged_conflicts":     flagged_conflicts,
+        "final_id":               row["final_id"],
+        "url_registry_id":        row["url_registry_id"],
+        "normalized_id":          row["normalized_id"],
+        "final_json":             row.get("final_json"),
+        "gate_conditions":        gate_conditions,
+        "approver_metadata":      base_package,
+        "flagged_conflicts":      flagged_conflicts,
         "flagged_conflict_count": len(flagged_conflicts),
-        "pending_staging":       staging_entries,
-        "pending_staging_count": len(staging_entries),
+        "pending_staging":        staging_entries,
+        "pending_staging_count":  len(staging_entries),
     }
 
 
@@ -923,13 +1024,27 @@ async def approve_experiences_endpoint(
 # ---------------------------------------------------------------------------
 
 @router.get("/staging-queue")
-async def get_staging_queue(url_registry_id: int):
+async def get_staging_queue(
+    url_registry_id: int | None = Query(None),
+    final_id:        int | None = Query(None),
+):
     """
-    GET /approval/staging-queue?url_registry_id={id}
+    GET /approval/staging-queue?url_registry_id=X
+    GET /approval/staging-queue?final_id=X   ← resolves url_registry_id internally
 
-    Returns all pending lookup_value_staging rows for this phone,
-    grouped by target_lookup_table for the admin staging panel.
+    Accepts either param. If both are provided, url_registry_id takes precedence.
     """
+    if url_registry_id is None and final_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either url_registry_id or final_id as a query parameter.",
+        )
+
+    if url_registry_id is None:
+        pkg = await asyncio.to_thread(fetch_approval_package, final_id)
+        if not pkg:
+            raise HTTPException(status_code=404, detail=f"final_id={final_id} not found.")
+        url_registry_id = pkg["url_registry_id"]
     entries = await asyncio.to_thread(
         fetch_pending_staging_entries, url_registry_id
     )
@@ -1038,6 +1153,28 @@ async def resolve_staging(
                 "append" if isinstance(current_val, list) else "replace",
                 req.final_id,
             )
+
+            # Back-propagate into normalized_spec_json so re-runs don't re-stage the same value.
+            normalized_id_for_patch: int | None = pkg.get("normalized_id")
+            if normalized_id_for_patch and field_path_to_patch and req.resolved_lookup_id is not None:
+                try:
+                    await asyncio.to_thread(
+                        update_normalized_json_field,
+                        normalized_id_for_patch,
+                        field_path_to_patch,
+                        req.resolved_lookup_id,
+                    )
+                    logger.info(
+                        "staging/resolve: back-propagated resolved_lookup_id=%d "
+                        "into normalized_json field_path=%r for normalized_id=%d",
+                        req.resolved_lookup_id, field_path_to_patch, normalized_id_for_patch,
+                    )
+                except Exception as _np_exc:
+                    logger.warning(
+                        "staging/resolve: normalized_json patch failed for normalized_id=%d "
+                        "field_path=%r — staging resolve still succeeded. Error: %s",
+                        normalized_id_for_patch, field_path_to_patch, _np_exc,
+                    )
         else:
             logger.warning(
                 "staging/resolve: staging_id=%d resolved but fetch_approval_package "
@@ -1138,13 +1275,8 @@ async def validate_pre_commit(
         admin, result["commit_val_id"],
     )
 
-    if not result["passed"]:
-        # 400 with the full error payload so the admin UI can surface specific failures
-        raise HTTPException(
-            status_code=400,
-            detail=result,
-        )
-
+    # Always return 200. passed=False is a valid query result, not a server error.
+    # The frontend reads result["passed"] to decide whether to enable the commit button.
     return result
 
 
@@ -1236,7 +1368,7 @@ async def commit_to_db(
         # First press — surface what will be inserted so admin can confirm
         return {
             "requires_confirmation": True,
-            "pending_inserts": [
+            "pending_deferred_inserts": [
                 {
                     "staging_id":              p["staging_id"],
                     "extracted_value":         p["extracted_value"],

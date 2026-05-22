@@ -858,21 +858,17 @@ async def _run_single_transcript_stage1(
     )
 
     try:
-        # Resolve transcript path
+        # Resolve transcript path.
+        # The processed file is always the final usable transcript — it holds
+        # cleaned English text for English videos and translated English text
+        # for Hindi videos. There is no separate translated file.
         transcript_row = await asyncio.to_thread(fetch_transcript_row, raw_transcript_id)
-        translation_status = transcript_row.get("translation_status")
-        if translation_status == "translation_complete":
-            transcript_path = (
-                transcript_row.get("translated_transcript_path")
-                or transcript_row.get("processed_transcript_path")
-            )
-        else:
-            transcript_path = transcript_row.get("processed_transcript_path")
+        transcript_path = transcript_row.get("processed_transcript_path")
 
         if not transcript_path:
             raise ValueError(
                 f"_run_single_transcript_stage1: raw_transcript_id={raw_transcript_id} "
-                f"has no usable path (translation_status={translation_status!r})."
+                f"has no processed_transcript_path."
             )
 
         async with _RUN_B_STORAGE_SEMAPHORE:

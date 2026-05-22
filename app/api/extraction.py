@@ -1013,6 +1013,86 @@ async def get_run_status(run_id: str):
 
 
 # ---------------------------------------------------------------------------
+# GET /extraction/output/{output_id}  — Raw JSON viewer
+# ---------------------------------------------------------------------------
+
+@router.get("/output/{output_id}")
+async def get_extraction_output(output_id: int):
+    """
+    Returns the partial_json for a spec_extraction_output row.
+    Used by the Normalizer UI raw JSON viewer.
+    """
+    from app.repositories.extraction_repository import fetch_spec_extraction_output
+    try:
+        row = await asyncio.to_thread(fetch_spec_extraction_output, output_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.exception("get_extraction_output: error for output_id=%d", output_id)
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {
+        "output_id":          row["output_id"],
+        "partial_json":       row["partial_json"],
+        "null_field_count":   row["null_field_count"],
+        "filled_field_count": row["filled_field_count"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /extraction/run-a-outputs  — OutputSelector data source
+# ---------------------------------------------------------------------------
+
+@router.get("/run-a-outputs")
+async def get_run_a_outputs(
+    brand: str = Query(..., description="Phone brand, e.g. 'Motorola'"),
+    model_name: str = Query(..., description="Phone model name, e.g. 'Edge 50 Fusion 5G'"),
+    limit: int = Query(default=20, ge=1, le=50),
+):
+    """
+    Returns recent spec_extraction_output rows for a phone, newest first.
+    Used by the Normalizer UI OutputSelector.
+
+    Accepts brand + model_name and resolves the canonical url_registry_id
+    (GSMArena anchor) internally — same pattern as all extraction endpoints.
+    This avoids the mismatch where /admin/models returns a non-GSMArena
+    url_id as the first row, which never matches spec_extraction_output.
+
+    Unlike /recent-runs (which queries pipeline_runs and never stores output_id),
+    this endpoint queries spec_extraction_output directly so output_ids are
+    always present.
+
+    Response:
+        { "outputs": [ { output_id, extraction_run_id, null_field_count,
+                          filled_field_count, run_status, finished_at,
+                          schema_version }, ... ] }
+    """
+    from app.repositories.extraction_repository import (
+        fetch_canonical_id_by_brand_model,
+        fetch_run_a_outputs_for_phone,
+    )
+    brand, model_name = _normalize_brand_model(brand, model_name)
+    try:
+        canonical_url_id = await asyncio.to_thread(
+            fetch_canonical_id_by_brand_model, brand, model_name
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "PHONE_NOT_FOUND", "message": str(exc)},
+        )
+    try:
+        rows = await asyncio.to_thread(
+            fetch_run_a_outputs_for_phone, canonical_url_id, limit
+        )
+    except Exception as exc:
+        logger.exception(
+            "get_run_a_outputs: DB error for brand=%r model_name=%r", brand, model_name
+        )
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"outputs": rows}
+
+
+# ---------------------------------------------------------------------------
 # GET /extraction/recent-runs  — Run history for a phone
 # ---------------------------------------------------------------------------
 
@@ -1200,7 +1280,7 @@ class PromoteNormalizedRequest(BaseModel):
 class EnrichRequest(BaseModel):
     normalized_id: int
     brand: str
-    model: str
+    model_name: str
 
 
 class EnrichResponse(BaseModel):
@@ -1238,7 +1318,7 @@ async def trigger_enrichment(request: Request, body: EnrichRequest) -> EnrichRes
         result = await run_enrichment(
             normalized_id=body.normalized_id,
             brand=body.brand,
-            model=body.model,
+            model=body.model_name,
         )
         return EnrichResponse(
             success=result["success"],

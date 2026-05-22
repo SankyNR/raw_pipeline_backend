@@ -2,12 +2,13 @@
 Scraper API Router.
 
 Phase 9 (Task 9.1): POST /admin/scrape
+Phase 9 (Task 9.2): GET  /admin/scrape/progress
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from app.services.scrape_orchestrator import run_scrape
+from app.services.scrape_orchestrator import get_current_step, run_scrape
 
 router = APIRouter(prefix="/admin", tags=["scraper"])
 
@@ -51,3 +52,25 @@ async def trigger_scrape(body: ScrapeRequest):
 
     except HTTPException:
         raise  # 409 (and now 500 from above) pass through unchanged
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 — Task 9.2: GET /admin/scrape/progress
+# ---------------------------------------------------------------------------
+
+@router.get("/scrape/progress")
+async def get_scrape_progress(
+    brand:      str = Query(...),
+    model_name: str = Query(...),
+    site_name:  str = Query(...),
+):
+    """
+    Returns the live scraping progress for a given phone+site combination.
+    Reads from an in-memory dict in scrape_orchestrator.py — zero DB cost.
+    Polled by the frontend every 1.5s while scrapeState.kind === 'loading'.
+
+    Returns:
+        { "current_step": "calling_firecrawl" | "processing_response" |
+                          "uploading_files" | "writing_to_database" | null }
+    """
+    return {"current_step": get_current_step(brand, model_name, site_name)}
