@@ -1841,16 +1841,10 @@ def fetch_oem_raw_ids_for_phone(url_registry_id: int) -> set[int]:
 
 def fetch_phones_ready_for_review() -> list[dict]:
     """
-    Returns all final_merged_json rows where pre-UI validation passed
-    and admin has not yet approved spec OR experience.
-
-    Columns returned (summary for list view):
-        final_id, url_registry_id, normalized_id,
-        fields_remaining_null, has_unresolved_conflicts, pending_staging_values,
-        spec_human_approved, experience_human_approved, experience_entries_reviewed,
-        ready_for_commit, created_at, updated_at
+    Returns all final_merged_json rows joined with url_registry for brand/model.
+    Includes phones not yet committed (ready_for_commit=False) AND those already
+    committed but not yet approved (so the admin can still access them).
     """
-    # P8-5: only return phones that still need admin action
     result = (
         get_client()
         .schema("pipeline")
@@ -1859,12 +1853,18 @@ def fetch_phones_ready_for_review() -> list[dict]:
             "final_id, url_registry_id, normalized_id, "
             "fields_remaining_null, has_unresolved_conflicts, pending_staging_values, "
             "spec_human_approved, experience_human_approved, experience_entries_reviewed, "
-            "ready_for_commit, created_at, updated_at"
+            "ready_for_commit, created_at, updated_at, "
+            "url_registry(brand, model_name)"
         )
-        .eq("ready_for_commit", False)
         .execute()
     )
-    return result.data or []
+    rows = result.data or []
+    # Flatten the nested url_registry join
+    for row in rows:
+        nested = row.pop("url_registry", None) or {}
+        row["brand"]      = nested.get("brand", "Unknown")
+        row["model_name"] = nested.get("model_name", "Unknown")
+    return rows
 
 
 def fetch_approval_package(final_id: int) -> dict | None:
@@ -3140,48 +3140,40 @@ def fetch_evidence_json_for_final(final_id: int) -> dict | None:
 
     Traversal chain:
         final_merged_json.final_id
-        → final_merged_json.normalized_id
-        → spec_extraction_output.output_id  (via normalized_spec.output_id)
+        → final_merged_json.url_registry_id
+        → spec_extraction_output (most recent row by output_id for that url_registry_id)
         → spec_extraction_output.evidence_json (JSONB)
+
+    Note: normalized_spec_json does NOT have an output_id column.
+    The correct anchor is url_registry_id, not normalized_id.
 
     Returns:
         The evidence_json dict, or None if any step in the chain is missing.
     """
     client = get_client()
 
-    # Step 1 — Resolve normalized_id from final_id
+    # Step 1 — Resolve url_registry_id from final_id
     fmj_result = (
         client
         .schema("pipeline")
         .table("final_merged_json")
-        .select("normalized_id")
+        .select("url_registry_id")
         .eq("final_id", final_id)
         .execute()
     )
     if not fmj_result.data:
         return None
-    normalized_id: int = fmj_result.data[0]["normalized_id"]
+    url_registry_id: int = fmj_result.data[0]["url_registry_id"]
 
-    # Step 2 — Resolve output_id from normalized_spec
-    ns_result = (
-        client
-        .schema("pipeline")
-        .table("normalized_spec_json")
-        .select("output_id")
-        .eq("normalized_id", normalized_id)
-        .execute()
-    )
-    if not ns_result.data:
-        return None
-    output_id: int = ns_result.data[0]["output_id"]
-
-    # Step 3 — Fetch evidence_json from spec_extraction_output
+    # Step 2 — Fetch the most recent evidence_json from spec_extraction_output
     eo_result = (
         client
         .schema("pipeline")
         .table("spec_extraction_output")
         .select("evidence_json")
-        .eq("output_id", output_id)
+        .eq("url_registry_id", url_registry_id)
+        .order("output_id", desc=True)
+        .limit(1)
         .execute()
     )
     if not eo_result.data:

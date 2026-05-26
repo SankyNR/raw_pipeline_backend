@@ -543,14 +543,19 @@ async def build_lookup_cache() -> None:
         "build_lookup_cache: loading %d lookup tables...", len(all_table_paths)
     )
 
-    for table_path in all_table_paths:
-        try:
-            await asyncio.to_thread(_load_one_table, table_path)
-        except Exception as exc:
-            logger.error(
-                "build_lookup_cache: failed to load table_path=%r: %s",
-                table_path, exc,
-            )
+    _sem = asyncio.Semaphore(10)  # cap concurrent Supabase connections to free-tier safe limit
+
+    async def _load_safe(table_path: str) -> None:
+        async with _sem:
+            try:
+                await asyncio.to_thread(_load_one_table, table_path)
+            except Exception as exc:
+                logger.error(
+                    "build_lookup_cache: failed to load table_path=%r: %s",
+                    table_path, exc,
+                )
+
+    await asyncio.gather(*[_load_safe(tp) for tp in all_table_paths])
 
     logger.info(
         "build_lookup_cache: complete. %d tables cached.", len(LOOKUP_CACHE)

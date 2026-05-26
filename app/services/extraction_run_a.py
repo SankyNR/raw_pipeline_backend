@@ -281,7 +281,7 @@ async def assemble_run_a_input(
     raw_source_ids: list[int],
     raw_transcript_ids: list[int],
     brand: str,
-) -> tuple[str, dict[str, int | list[int]], list[int]]:
+) -> tuple[str, dict[str, int | list[int]], list[int], dict[int, str], dict[int, str]]:
     """
     Fetches all source files from Supabase Storage and concatenates them
     in a fixed order for Run A (v5: multi-transcript support).
@@ -348,6 +348,8 @@ async def assemble_run_a_input(
     sections: list[str] = []
     file_map: dict[str, int | list[int]] = {}
     failed_source_ids: list[int] = []
+    source_content_map: dict[int, str] = {}     # raw_id → raw file content (before XML wrap)
+    transcript_content_map: dict[int, str] = {} # raw_transcript_id → raw transcript content
 
     for row in source_rows:
         raw_id = row["raw_id"]
@@ -364,6 +366,7 @@ async def assemble_run_a_input(
             failed_source_ids.append(raw_id)
             continue
 
+        source_content_map[raw_id] = content  # capture raw content before XML wrapping
         file_map[site_name] = raw_id
         sections.append(_format_scraped_section(site_name, raw_id, content))
         logger.info(
@@ -399,6 +402,7 @@ async def assemble_run_a_input(
 
         try:
             transcript_content = await fetch_file_content(transcript_path)
+            transcript_content_map[raw_transcript_id] = transcript_content  # capture raw content before XML wrapping
             fetched_transcript_ids.append(raw_transcript_id)
             transcript_rank = len(fetched_transcript_ids)  # 1-indexed rank (1 = best)
             sections.append(
@@ -435,7 +439,7 @@ async def assemble_run_a_input(
         "failed_source_ids=%s",
         len(sections), len(combined_content), failed_source_ids,
     )
-    return combined_content, file_map, failed_source_ids
+    return combined_content, file_map, failed_source_ids, source_content_map, transcript_content_map
 
 
 # ---------------------------------------------------------------------------
@@ -1241,13 +1245,14 @@ async def run_spec_extraction(
     try:
         # ---------------------------------------------------------------------
         # Step 4 — Assemble source content
-        # Returns (combined_content, file_map, failed_ids).
-        # combined_content is also the assembled_source_string for char offsets.
+        # Returns (combined_content, file_map, failed_ids, source_content_map, transcript_content_map).
+        # source_content_map / transcript_content_map hold raw per-file content
+        # (before XML wrapping) for accurate char-offset evidence attribution.
         # ---------------------------------------------------------------------
         await _track(pipeline_run_id,
                      current_stage=PipelineStage.ASSEMBLING_SOURCES,
                      current_step="Assembling source documents...")
-        assembled_source_string, file_map, failed_source_ids = await assemble_run_a_input(
+        assembled_source_string, file_map, failed_source_ids, source_content_map, transcript_content_map = await assemble_run_a_input(
             raw_source_ids=raw_source_ids,
             raw_transcript_ids=raw_transcript_ids,
             brand=brand,
@@ -1314,6 +1319,8 @@ async def run_spec_extraction(
             raw_source_ids=raw_source_ids,
             raw_transcript_ids=raw_transcript_ids,
             assembled_source_string=assembled_source_string,
+            source_content_map=source_content_map,
+            transcript_content_map=transcript_content_map,
             url_registry_id=url_registry_id,
         )
 

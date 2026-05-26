@@ -241,19 +241,26 @@ def _extract_value_and_source(field_value: Any) -> tuple[Any, dict | None]:
 def _build_evidence_entry(
     source_dict: dict | None,
     assembled_source_string: str,
+    source_content_map: dict[int, str] | None = None,
+    transcript_content_map: dict[int, str] | None = None,
 ) -> dict | None:
     """
     Builds the final evidence_json entry including char offsets.
 
     Layer 1: parse raw_id/raw_transcript_id + evidence_text from source_dict.
-    Layer 2: locate evidence_text in assembled_source_string via str.find().
+    Layer 2: locate evidence_text in the INDIVIDUAL raw file content (from
+             source_content_map or transcript_content_map) so that char_start/
+             char_end are relative to the file shown in SourceFileViewer.
 
-    Normalization: before matching, both strings are normalized via
-    _normalize_text() to handle multi-line source content. If normalized match 
-    succeeds, offsets are NOT set — they cannot be reliably mapped back to 
-    original string positions. Tooltip works; click-to-highlight disabled gracefully.
-    If str.find() returns -1 (model paraphrased), char_start and char_end are
-    None. Hover tooltip still works; click-to-highlight disabled gracefully.
+    IMPORTANT: offsets are computed against the per-source raw content, NOT
+    against assembled_source_string (which is an XML-wrapped multi-file blob
+    whose offsets are meaningless relative to individual storage files).
+    assembled_source_string is accepted for API compatibility but is not used
+    for offset computation here.
+
+    If the individual file content is unavailable (map not provided or key
+    missing), char_start/char_end are left as None. The hover tooltip still
+    works; click-to-highlight is gracefully disabled.
 
     Returns None if source_dict is None (ungrounded field).
     """
@@ -264,34 +271,51 @@ def _build_evidence_entry(
     char_start: int | None = None
     char_end: int | None = None
 
-    if evidence_text and assembled_source_string:
-        # Attempt 1: exact match
-        idx = assembled_source_string.find(evidence_text)
-        if idx != -1:
-            char_start = idx
-            char_end = idx + len(evidence_text)
-        else:
-            # Attempt 2: normalized match
-            norm_source = _normalize_text(assembled_source_string)
-            norm_evidence = _normalize_text(evidence_text)
-            idx_norm = norm_source.find(norm_evidence)
+    if evidence_text:
+        # Select the individual file content so char_start/char_end are relative
+        # to the raw file shown in SourceFileViewer, not the XML-wrapped merged blob.
+        raw_id_key = source_dict.get("raw_id")
+        rtid_key   = source_dict.get("raw_transcript_id")
 
-            if idx_norm != -1:
-                # Normalized match confirms extraction is correct but offsets
-                # cannot be reliably mapped back to original string positions.
-                # Do NOT assign char_start / char_end.
-                logger.debug(
-                    "_build_evidence_entry: normalized match succeeded for "
-                    "evidence_text=%r. Offsets not set to avoid incorrect highlighting.",
-                    evidence_text[:80],
-                )
+        search_target: str | None = None
+        if raw_id_key is not None and source_content_map:
+            search_target = source_content_map.get(raw_id_key)
+        elif rtid_key is not None and transcript_content_map:
+            search_target = transcript_content_map.get(rtid_key)
+
+        if search_target is None:
+            # Map was not provided or key is missing — cannot compute offsets.
+            # Do NOT fall back to assembled_source_string (those offsets are wrong).
+            # Leave char_start / char_end as None; tooltip still works.
+            logger.warning(
+                "_build_evidence_entry: no individual source content available "
+                "for raw_id=%s raw_transcript_id=%s — char offsets set to None.",
+                raw_id_key, rtid_key,
+            )
+        else:
+            # Attempt 1: exact match in the individual file content
+            idx = search_target.find(evidence_text)
+            if idx != -1:
+                char_start = idx
+                char_end = idx + len(evidence_text)
             else:
-                logger.warning(
-                    "_build_evidence_entry: str.find() returned -1 for "
-                    "evidence_text=%r (both exact and normalized). "
-                    "Model may have paraphrased. char_start/char_end set to None.",
-                    evidence_text[:80] if evidence_text else "",
-                )
+                # Attempt 2: normalized match
+                norm_source   = _normalize_text(search_target)
+                norm_evidence = _normalize_text(evidence_text)
+                idx_norm = norm_source.find(norm_evidence)
+                if idx_norm != -1:
+                    logger.debug(
+                        "_build_evidence_entry: normalized match for %r. "
+                        "Offsets not set (cannot map back to original positions).",
+                        evidence_text[:80],
+                    )
+                else:
+                    logger.warning(
+                        "_build_evidence_entry: str.find() -1 for evidence_text=%r "
+                        "(exact and normalized). Model may have paraphrased. "
+                        "char_start/char_end set to None.",
+                        evidence_text[:80] if evidence_text else "",
+                    )
 
     raw_id = source_dict.get("raw_id")
     raw_transcript_id = source_dict.get("raw_transcript_id")
@@ -345,6 +369,8 @@ def _walk_section(
     assembled_source_string: str,
     partial_json: dict,
     evidence_json: dict,
+    source_content_map: dict[int, str] | None = None,
+    transcript_content_map: dict[int, str] | None = None,
 ) -> None:
     """
     Walks a single-entity section dict (e.g. chipset, body, charging).
@@ -379,7 +405,10 @@ def _walk_section(
         section_out[field_key] = value
 
         if value is not None and source_dict is not None:
-            ev = _build_evidence_entry(source_dict, assembled_source_string)
+            ev = _build_evidence_entry(
+                source_dict, assembled_source_string,
+                source_content_map, transcript_content_map,
+            )
             if ev is not None:
                 field_path = f"{section_key}.{field_key}"
                 evidence_json[field_path] = ev
@@ -393,6 +422,8 @@ def _walk_array_section(
     assembled_source_string: str,
     partial_json: dict,
     evidence_json: dict,
+    source_content_map: dict[int, str] | None = None,
+    transcript_content_map: dict[int, str] | None = None,
 ) -> None:
     """
     Walks an indexed array section (variants[], displays[], camera_lenses[]).
@@ -432,7 +463,10 @@ def _walk_array_section(
             item_out[field_key] = value
 
             if value is not None and source_dict is not None:
-                ev = _build_evidence_entry(source_dict, assembled_source_string)
+                ev = _build_evidence_entry(
+                    source_dict, assembled_source_string,
+                    source_content_map, transcript_content_map,
+                )
                 if ev is not None:
                     field_path = f"{schema_key}[{idx}].{field_key}"
                     evidence_json[field_path] = ev
@@ -478,6 +512,8 @@ def build_spec_json(
     raw_source_ids: list[int],
     raw_transcript_ids: list[int],
     assembled_source_string: str,
+    source_content_map: dict[int, str] | None = None,
+    transcript_content_map: dict[int, str] | None = None,
     url_registry_id: int | None = None,
 ) -> tuple[dict, dict]:
     """
@@ -535,6 +571,8 @@ def build_spec_json(
             assembled_source_string=assembled_source_string,
             partial_json=partial_json,
             evidence_json=evidence_json,
+            source_content_map=source_content_map,
+            transcript_content_map=transcript_content_map,
         )
 
     # -------------------------------------------------------------------------
@@ -547,6 +585,8 @@ def build_spec_json(
             assembled_source_string=assembled_source_string,
             partial_json=partial_json,
             evidence_json=evidence_json,
+            source_content_map=source_content_map,
+            transcript_content_map=transcript_content_map,
         )
 
     # -------------------------------------------------------------------------
@@ -622,13 +662,19 @@ def build_spec_json(
 
             # Evidence for item_name
             if item_name_source is not None:
-                ev = _build_evidence_entry(item_name_source, assembled_source_string)
+                ev = _build_evidence_entry(
+                    item_name_source, assembled_source_string,
+                    source_content_map, transcript_content_map,
+                )
                 if ev is not None:
                     evidence_json[f"in_the_box[{idx}].item_name"] = ev
 
             # Evidence for item_specification
             if item_spec_value is not None and item_spec_source is not None:
-                ev = _build_evidence_entry(item_spec_source, assembled_source_string)
+                ev = _build_evidence_entry(
+                    item_spec_source, assembled_source_string,
+                    source_content_map, transcript_content_map,
+                )
                 if ev is not None:
                     evidence_json[f"in_the_box[{idx}].item_specification"] = ev
 

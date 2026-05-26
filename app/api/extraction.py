@@ -1186,6 +1186,9 @@ async def refresh_lookup_cache():
         {"message": "LOOKUP_CACHE refreshed. N tables loaded."}
     """
     from app.services.normalizer import build_lookup_cache, LOOKUP_CACHE
+    from app.api.admin_lookup import _SCHEMA_CACHE
+    _SCHEMA_CACHE.clear()
+    logger.info("cache/refresh: _SCHEMA_CACHE cleared.")
     await build_lookup_cache()
     return {"message": f"LOOKUP_CACHE refreshed. {len(LOOKUP_CACHE)} tables loaded."}
 

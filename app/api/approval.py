@@ -258,6 +258,148 @@ class StagingResolveRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Available sources for a phone — scraped files + transcripts
+# ---------------------------------------------------------------------------
+
+@router.get("/sources/{url_registry_id}")
+async def get_phone_sources(url_registry_id: int):
+    """
+    GET /approval/sources/{url_registry_id}
+
+    Returns all available scraped files and transcripts for a phone,
+    independent of which sources were actually grounded during extraction.
+
+    Scraped files are stored under different url_registry_ids per site
+    (one row per site_name for the same phone). This endpoint resolves
+    brand + model_name from the given (canonical) url_registry_id, then
+    fetches raw_scraped_data across ALL url_ids that share that brand/model.
+
+    Transcripts are anchored to the canonical url_registry_id only —
+    youtube_video_url_registry links videos directly to the canonical.
+
+    Used by the Jarvis right panel:
+      - ScrapedFilesTab chips  (raw_id + site_name)
+      - TranscriptsTab chips   (raw_transcript_id)
+    """
+    from app.core.supabase_client import get_client
+    client = get_client()
+
+    # Step 1: Resolve brand + model_name from the canonical url_registry_id
+    anchor_result = await asyncio.to_thread(
+        lambda: client
+        .schema("pipeline")
+        .table("url_registry")
+        .select("brand, model_name")
+        .eq("url_id", url_registry_id)
+        .execute()
+    )
+    if not anchor_result.data:
+        raise HTTPException(
+            status_code=404,
+            detail=f"url_registry_id={url_registry_id} not found.",
+        )
+    brand      = anchor_result.data[0]["brand"]
+    model_name = anchor_result.data[0]["model_name"]
+
+    # Step 2: Find ALL url_ids for this phone (across all sites)
+    all_urls_result = await asyncio.to_thread(
+        lambda: client
+        .schema("pipeline")
+        .table("url_registry")
+        .select("url_id, site_name")
+        .eq("brand", brand)
+        .eq("model_name", model_name)
+        .execute()
+    )
+    url_id_to_site = {
+        r["url_id"]: r["site_name"]
+        for r in (all_urls_result.data or [])
+    }
+    all_url_ids = list(url_id_to_site.keys())
+
+    # Step 3: Fetch raw_scraped_data across ALL url_ids for this phone
+    scraped: list[dict] = []
+    if all_url_ids:
+        scraped_result = await asyncio.to_thread(
+            lambda: client
+            .schema("pipeline")
+            .table("raw_scraped_data")
+            .select("raw_id, url_registry_id")
+            .in_("url_registry_id", all_url_ids)
+            .execute()
+        )
+        scraped = [
+            {
+                "raw_id":    row["raw_id"],
+                "site_name": url_id_to_site.get(row["url_registry_id"]) or f"source_{row['raw_id']}",
+            }
+            for row in (scraped_result.data or [])
+        ]
+        scraped.sort(key=lambda r: r["raw_id"])
+
+    # Step 4: Transcript sources — anchored to canonical url_registry_id only
+    video_result = await asyncio.to_thread(
+        lambda: client
+        .schema("pipeline")
+        .table("youtube_video_url_registry")
+        .select("video_registry_id")
+        .eq("url_registry_id", url_registry_id)
+        .eq("status", "fetched_raw")
+        .execute()
+    )
+    video_ids = [r["video_registry_id"] for r in (video_result.data or [])]
+
+    transcripts: list[dict] = []
+    if video_ids:
+        transcript_result = await asyncio.to_thread(
+            lambda: client
+            .schema("pipeline")
+            .table("youtube_raw_transcript_data")
+            .select("raw_transcript_id, video_registry_id")
+            .in_("video_registry_id", video_ids)
+            .execute()
+        )
+        # Build video_registry_id → channel_id map from the earlier video_result
+        vid_to_channel_id = {
+            r["video_registry_id"]: r.get("channel_id")
+            for r in (video_result.data or [])
+        }
+        # Fetch channel names for all channel_ids referenced by this phone's videos
+        channel_ids = list({cid for cid in vid_to_channel_id.values() if cid is not None})
+        channel_id_to_name: dict[int, str] = {}
+        if channel_ids:
+            ch_result = await asyncio.to_thread(
+                lambda: client
+                .schema("pipeline")
+                .table("youtube_channels")
+                .select("channel_id, channel_name")
+                .in_("channel_id", channel_ids)
+                .execute()
+            )
+            channel_id_to_name = {
+                r["channel_id"]: r["channel_name"]
+                for r in (ch_result.data or [])
+            }
+        transcripts = [
+            {
+                "raw_transcript_id": r["raw_transcript_id"],
+                "channel_name":      channel_id_to_name.get(
+                    vid_to_channel_id.get(r["video_registry_id"]),
+                    f"Transcript",
+                ),
+            }
+            for r in (transcript_result.data or [])
+        ]
+        transcripts.sort(key=lambda r: r["raw_transcript_id"])
+
+    return {
+        "url_registry_id":    url_registry_id,
+        "scraped_sources":    scraped,
+        "transcript_sources": transcripts,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Task 8.2a — Phones ready for review
 # ---------------------------------------------------------------------------
 
@@ -411,26 +553,124 @@ async def get_approval_package(final_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Task 8.2c — Source file proxy (stub)
+# Task 8.2c — Source file proxy (signed URL from Supabase Storage)
 # ---------------------------------------------------------------------------
+
+_SOURCE_FILE_SIGNED_URL_EXPIRY = 3600
+_RAW_FILES_BUCKET = "raw_files"
+
+
+def _extract_signed_url(response: Any) -> str | None:
+    """Extract signed URL from Supabase Storage create_signed_url response.
+    Supports both v1 (dict) and v2 (object with .data attribute)."""
+    if isinstance(response, dict):
+        return response.get("signedURL") or response.get("signedUrl")
+    if hasattr(response, "data"):
+        data = response.data
+        if isinstance(data, dict):
+            return data.get("signedURL") or data.get("signedUrl")
+        return getattr(data, "signedURL", None) or getattr(data, "signedUrl", None)
+    return None
+
 
 @router.get("/source-file/{source_type}/{source_id}")
 async def get_source_file(source_type: str, source_id: int):
     """
     GET /approval/source-file/{source_type}/{source_id}
 
-    Proxy endpoint for source file retrieval. Never exposes signed URLs directly.
+    Returns a signed Supabase Storage URL for a scraped file or transcript.
+    Same pattern as GET /admin/youtube/transcript/{id}/srt.
 
-    source_type: 'raw_scraped' | 'transcript'
-    source_id:   raw_id or raw_transcript_id
+    source_type:
+        'raw_scraped' → query pipeline.raw_scraped_data by raw_id, use markdown_path
+        'transcript'  → query pipeline.youtube_raw_transcript_data by raw_transcript_id,
+                        use processed_transcript_path (fallback to translated_transcript_path)
 
-    STUB: Returns a placeholder in v1. Full signed-URL proxy is a Phase 10 task.
+    Returns:
+        {
+          "source_type":  str,
+          "source_id":    int,
+          "signed_url":   str,
+          "expires_in":   int,    # seconds
+          "path":         str,    # storage path used
+          "content_type": str,    # 'markdown' | 'transcript'
+        }
     """
+    from app.core.supabase_client import get_client
+    client = get_client()
+
+    storage_path: str | None = None
+    content_type: str = ""
+
+    if source_type == "raw_scraped":
+        row_result = await asyncio.to_thread(
+            lambda: client
+            .schema("pipeline")
+            .table("raw_scraped_data")
+            .select("raw_id, markdown_path")
+            .eq("raw_id", source_id)
+            .execute()
+        )
+        if not row_result.data:
+            raise HTTPException(status_code=404, detail=f"raw_id={source_id} not found.")
+        storage_path = row_result.data[0].get("markdown_path")
+        content_type = "markdown"
+
+    elif source_type == "transcript":
+        row_result = await asyncio.to_thread(
+            lambda: client
+            .schema("pipeline")
+            .table("youtube_raw_transcript_data")
+            .select("raw_transcript_id, processed_transcript_path, translated_transcript_path")
+            .eq("raw_transcript_id", source_id)
+            .execute()
+        )
+        if not row_result.data:
+            raise HTTPException(status_code=404, detail=f"raw_transcript_id={source_id} not found.")
+        row = row_result.data[0]
+        # processed_transcript_path takes precedence; translated is the fallback
+        storage_path = row.get("processed_transcript_path") or row.get("translated_transcript_path")
+        content_type = "transcript"
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown source_type {source_type!r}. Use 'raw_scraped' or 'transcript'.",
+        )
+
+    if not storage_path:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No file path found for {source_type} {source_id}.",
+        )
+
+    # Generate signed URL
+    try:
+        response = await asyncio.to_thread(
+            lambda: client
+            .storage
+            .from_(_RAW_FILES_BUCKET)
+            .create_signed_url(storage_path, _SOURCE_FILE_SIGNED_URL_EXPIRY)
+        )
+    except Exception as exc:
+        logger.error(
+            "get_source_file storage error (type=%s, id=%d, path=%s): %s",
+            source_type, source_id, storage_path, exc,
+        )
+        raise HTTPException(status_code=500, detail=f"Storage error: {exc}")
+
+    signed_url = _extract_signed_url(response)
+    if not signed_url:
+        logger.error("Failed to extract signed URL from response: %s", response)
+        raise HTTPException(status_code=500, detail="Could not generate signed URL.")
+
     return {
-        "source_type": source_type,
-        "source_id":   source_id,
-        "status":      "stub — signed URL proxy not yet implemented.",
-        "content":     None,
+        "source_type":  source_type,
+        "source_id":    source_id,
+        "signed_url":   signed_url,
+        "expires_in":   _SOURCE_FILE_SIGNED_URL_EXPIRY,
+        "path":         storage_path,
+        "content_type": content_type,
     }
 
 

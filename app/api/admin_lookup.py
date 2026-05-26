@@ -6,10 +6,12 @@ Phase 1  (Tasks 1.1–1.3): GET /admin/brands, /admin/models, /admin/sites
 Phase 11 (Lookup Wizard): GET /admin/lookup/schema, /admin/lookup/values
 """
 
+import asyncio
 import logging
 from collections import defaultdict
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 from app.core.supabase_client import get_client
 from app.config.field_mapping import SCALAR_FK_MAP, ARRAY_FK_MAP
@@ -34,6 +36,10 @@ def _build_allowed_tables() -> set[str]:
     return tables
 
 _ALLOWED_LOOKUP_TABLES: set[str] = _build_allowed_tables()
+
+# Schema RPC result cache — populated on first call per table, cleared on cache/refresh.
+# Lookup table schema never changes without a migration + restart, so no TTL needed.
+_SCHEMA_CACHE: dict[str, list] = {}
 
 # Postgres type → wizard field type mapping
 _PG_TYPE_MAP: dict[str, str] = {
@@ -97,8 +103,8 @@ async def get_brands():
     Response: { "brands": ["Apple", "CMF", "Google", ...] }
     """
     try:
-        result = (
-            get_client()
+        result = await asyncio.to_thread(
+            lambda: get_client()
             .schema("pipeline")
             .table("url_registry")
             .select("brand")
@@ -168,8 +174,8 @@ async def get_models(brand: str = Query(..., description="Brand name to filter b
         }
     """
     try:
-        result = (
-            get_client()
+        result = await asyncio.to_thread(
+            lambda: get_client()
             .schema("pipeline")
             .table("url_registry")
             .select("url_id, model_name, status")    # add url_id
@@ -249,8 +255,8 @@ async def get_sites(
         }
     """
     try:
-        result = (
-            get_client()
+        result = await asyncio.to_thread(
+            lambda: get_client()
             .schema("pipeline")
             .table("url_registry")
             .select("url_id, site_name, status, lookup_source_registry(display_name)")
@@ -334,8 +340,8 @@ async def get_lookup_schema(
     schema_name, table_name = _validate_lookup_table(table)
 
     try:
-        result = (
-            get_client()
+        result = await asyncio.to_thread(
+            lambda: get_client()
             .rpc(
                 "get_lookup_table_schema",
                 {"p_schema": schema_name, "p_table": table_name},
@@ -392,8 +398,10 @@ async def get_lookup_schema(
 
 @router.get("/lookup/values")
 async def get_lookup_values(
-    table:  str = Query(..., description="Fully qualified table name, e.g. mobile_specs.lookup_camera_features"),
-    column: str = Query(..., description="Column to return values for, e.g. feature_name"),
+    table:         str      = Query(..., description="Fully qualified table name, e.g. mobile_specs.lookup_camera_features"),
+    column:        str      = Query(..., description="Column to return values for, e.g. feature_name"),
+    filter_column: str | None = Query(None, description="Optional column to filter rows by, e.g. network_type"),
+    filter_value:  str | None = Query(None, description="Value to filter filter_column by, e.g. 4G"),
 ):
     """
     Returns all existing canonical values for one column in a lookup table,
@@ -413,42 +421,67 @@ async def get_lookup_values(
     """
     schema_name, table_name = _validate_lookup_table(table)
 
-    # --- 1. Query the committed lookup table rows ---
+    # --- Schema: from cache or RPC (schema is invariant per table) ---
+    async def _fetch_schema() -> list:
+        if table not in _SCHEMA_CACHE:
+            try:
+                result = await asyncio.to_thread(
+                    lambda: get_client()
+                    .rpc(
+                        "get_lookup_table_schema",
+                        {"p_schema": schema_name, "p_table": table_name},
+                    )
+                    .execute()
+                )
+                _SCHEMA_CACHE[table] = result.data or []
+            except Exception as e:
+                logger.warning(
+                    "get_lookup_values: schema RPC failed for %s: %s "
+                    "— row IDs will be null.", table, e,
+                )
+                # Cache empty list so thundering-herd retries are avoided.
+                # Trade-off: a transient failure permanently nulls row IDs until cache/refresh.
+                _SCHEMA_CACHE[table] = []
+        return _SCHEMA_CACHE[table]
+
+    # --- Run all 3 I/O calls in parallel ---
     try:
-        committed_result = (
-            get_client()
-            .schema(schema_name)
-            .table(table_name)
-            .select("*")
-            .execute()
+        def _fetch_committed():
+            q = get_client().schema(schema_name).table(table_name).select("*")
+            if filter_column and filter_value:
+                q = q.eq(filter_column, filter_value)
+            return q.execute()
+
+        committed_result, schema_rows, staging_result = await asyncio.gather(
+            asyncio.to_thread(_fetch_committed),
+            _fetch_schema(),
+            asyncio.to_thread(
+                lambda: get_client()
+                .schema("pipeline")
+                .table("lookup_value_staging")
+                .select("staging_id, extracted_value")
+                .eq("target_lookup_table", table)
+                .eq("status", "inserted_new")
+                .execute()
+            ),
         )
     except Exception as e:
-        logger.error("get_lookup_values DB error (table=%s): %s", table, e)
+        logger.error(
+            "get_lookup_values: parallel fetch failed (table=%s): %s", table, e
+        )
         raise HTTPException(status_code=500, detail=f"DB error querying {table}: {e}")
 
     committed_rows = committed_result.data or []
 
-    # Resolve the true PK column via the schema RPC — do NOT guess by name convention.
-    # Guessing (first key ending in _id) silently picks the wrong column for any
-    # multi-FK table where a FK column appears before the PK in definition order.
-    pk_col: str | None = None
-    try:
-        schema_result = (
-            get_client()
-            .rpc(
-                "get_lookup_table_schema",
-                {"p_schema": schema_name, "p_table": table_name},
-            )
-            .execute()
-        )
-        pk_col = next(
-            (r["column_name"] for r in (schema_result.data or []) if r.get("is_pk")),
-            None,
-        )
-    except Exception as e:
+    # Resolve PK column from cached schema
+    pk_col: str | None = next(
+        (r["column_name"] for r in schema_rows if r.get("is_pk")),
+        None,
+    )
+    if not pk_col:
         logger.warning(
-            "get_lookup_values: could not resolve PK column for %s via RPC: %s "
-            "— row IDs will be null.", table, e,
+            "get_lookup_values: could not resolve PK column for %s "
+            "— row IDs will be null.", table
         )
 
     values = []
@@ -462,43 +495,76 @@ async def get_lookup_values(
             "source": "committed",
         })
 
-    # --- 2. Union with pending staging rows for this table ---
-    includes_pending = False
-    try:
-        staging_result = (
-            get_client()
-            .schema("pipeline")
-            .table("lookup_value_staging")
-            .select("staging_id, extracted_value")
-            .eq("target_lookup_table", table)
-            .eq("status", "inserted_new")
-            .execute()
-        )
-        staging_rows = staging_result.data or []
-        includes_pending = True  # query succeeded — we can report coverage
-
-        # Deduplicate: skip staging values already present in committed set
-        committed_vals = {v["value"] for v in values}
-        for srow in staging_rows:
-            extracted = srow.get("extracted_value")
-            if extracted and extracted not in committed_vals:
-                values.append({
-                    "id":     None,
-                    "value":  extracted,
-                    "source": "pending_staging",
-                })
-                committed_vals.add(extracted)
-
-    except Exception as e:
-        logger.warning(
-            "get_lookup_values: staging union failed (table=%s): %s — "
-            "returning committed values only.", table, e,
-        )
-        includes_pending = False
+    # Union with pending staging rows, deduplicating
+    staging_rows = staging_result.data or []
+    committed_vals = {v["value"] for v in values}
+    for srow in staging_rows:
+        extracted = srow.get("extracted_value")
+        if extracted and extracted not in committed_vals:
+            values.append({
+                "id":     None,
+                "value":  extracted,
+                "source": "pending_staging",
+            })
+            committed_vals.add(extracted)
 
     return {
         "table":                    table,
         "column":                   column,
         "values":                   values,
-        "includes_pending_staging": includes_pending,
+        "includes_pending_staging": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 — POST /admin/lookup/insert
+# ---------------------------------------------------------------------------
+
+class InsertLookupRowRequest(BaseModel):
+    table:    str
+    row_data: dict
+
+
+@router.post("/lookup/insert")
+async def insert_lookup_value(req: InsertLookupRowRequest):
+    """
+    Inserts a new row into a whitelisted lookup table and returns the inserted
+    row (including the new PK).
+
+    Used by the Jarvis FK array editor to add new canonical lookup values
+    directly from the rendered spec view without going through the staging queue.
+
+    Request body:
+        { "table": "mobile_specs.lookup_sensors", "row_data": { "sensor_name": "NavIC" } }
+
+    Response:
+        { "inserted": { "sensor_id": 42, "sensor_name": "NavIC" }, "table": "..." }
+    """
+    schema_name, table_name = _validate_lookup_table(req.table)
+
+    if not req.row_data:
+        raise HTTPException(status_code=400, detail="row_data must not be empty.")
+
+    try:
+        result = await asyncio.to_thread(
+            lambda: get_client()
+            .schema(schema_name)
+            .table(table_name)
+            .insert(req.row_data)
+            .execute()
+        )
+    except Exception as e:
+        logger.error("insert_lookup_value DB error (table=%s): %s", req.table, e)
+        raise HTTPException(status_code=500, detail=f"Insert failed: {e}")
+
+    if not result.data:
+        raise HTTPException(
+            status_code=500,
+            detail="Insert returned no data — check the row_data keys match the table schema.",
+        )
+
+    logger.info(
+        "insert_lookup_value: inserted into %s — row=%s",
+        req.table, result.data[0],
+    )
+    return {"inserted": result.data[0], "table": req.table}
