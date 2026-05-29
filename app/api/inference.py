@@ -44,25 +44,23 @@ async def run_inference_batch(body: RunBatchRequest):
     """
     POST /admin/inference/run-batch
 
-    Triggers Run C (inference engine) for one or more committed phones.
+    Triggers Run C (Groups A–H, new orchestrator) for one or more committed phones.
+    Previously called the legacy run_inference_engine(); now calls run_c_engine()
+    from run_c_orchestrator.py which uses the correct Group A–H handlers with
+    band sets from constants.py.
 
     body.model_ids = [1, 2, 3]  -> run for those model_ids only
     body.model_ids = null        -> run for ALL committed phones (paginated by batch_size)
 
-    Runs sequentially per phone (zero API cost -- no parallelism needed).
+    Runs sequentially per phone.
     Returns per-phone results including rules_written and any errors.
 
     M3 -- Pagination for full-catalogue runs:
       Default batch_size=50. Max 100. Pass offset to continue from where you left off.
       Repeat until response.total_remaining == 0.
-
-    C4 -- url_registry_id resolution:
-      Uses pipeline.phone_spec_inferences first (fast path for re-runs), then falls
-      back to pipeline.db_commit_runs (has both model_id and url_registry_id).
-      Does NOT query url_registry.model_id (column does not exist on that table).
     """
     import asyncio
-    from app.services.inference_engine import run_inference_engine
+    from app.services.run_c_orchestrator import run_c_engine
 
     # Clamp batch_size
     batch_size = max(1, min(body.batch_size, 100))
@@ -99,12 +97,13 @@ async def run_inference_batch(body: RunBatchRequest):
             "results":         [],
         }
 
-    # Fast path: resolve url_registry_id from existing phone_spec_inferences rows
+    # Fast path: resolve url_registry_id from existing inferred_specs rows
+    # (written by run_c_engine / Groups A–H). Falls back to db_commit_runs.
     client = get_client()
     inf_res = (
         client
         .schema("pipeline")
-        .table("phone_spec_inferences")
+        .table("inferred_specs")
         .select("model_id, url_registry_id")
         .in_("model_id", target_ids)
         .execute()
@@ -151,7 +150,7 @@ async def run_inference_batch(body: RunBatchRequest):
             continue
 
         try:
-            result = await run_inference_engine(
+            result = await run_c_engine(
                 model_id=mid,
                 url_registry_id=url_registry_id,
                 triggered_by="admin_batch",
@@ -179,4 +178,163 @@ async def run_inference_batch(body: RunBatchRequest):
         "failed":          failed,
         "skipped":         skipped,
         "results":         results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/inference/run-c/{url_registry_id}
+# Run C deterministic engine — Groups A–H — for a single phone.
+# ---------------------------------------------------------------------------
+
+@router.post("/inference/run-c/{url_registry_id}")
+async def run_c_for_phone(url_registry_id: int):
+    """
+    POST /admin/inference/run-c/{url_registry_id}
+
+    Triggers the full Run C deterministic inference engine (Groups A–H)
+    for the committed phone identified by url_registry_id.
+
+    Resolves model_id from pipeline.db_commit_runs (most recent completed row).
+    Runs synchronously — waits for all groups to complete before returning.
+
+    Returns:
+      {
+        "success":         bool,
+        "model_id":        int,
+        "url_registry_id": int,
+        "rules_evaluated": int,
+        "rules_written":   int,
+        "rules_skipped":   int,
+        "errors":          list[str],
+      }
+    """
+    from app.services.run_c_orchestrator import run_c_engine, _resolve_model_id
+
+    # Resolve model_id
+    model_id = await _resolve_model_id(url_registry_id)
+    if model_id is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No completed db_commit_run found for url_registry_id={url_registry_id}. "
+                "Run the DB commit first."
+            ),
+        )
+
+    try:
+        result = await run_c_engine(
+            model_id=model_id,
+            url_registry_id=url_registry_id,
+            triggered_by="admin_manual",
+        )
+    except Exception as exc:
+        logger.error(
+            "run_c_for_phone: FAILED url_registry_id=%d model_id=%d: %s",
+            url_registry_id, model_id, exc, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if not result["success"]:
+        # Partial failure — return 207 Multi-Status with details
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=207, content=result)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/inference/specs/{url_registry_id}
+# Read inferred_specs + inference_entries for one phone.
+# ---------------------------------------------------------------------------
+
+@router.get("/inference/specs/{url_registry_id}")
+async def get_inferred_specs(url_registry_id: int):
+    """
+    GET /admin/inference/specs/{url_registry_id}
+
+    Returns the full inferred_specs row and all inference_entries for a phone.
+    Useful for admin review / debugging Run C outputs.
+
+    Returns 404 if Run C has not yet been run for this phone.
+    """
+    client = get_client()
+
+    # Fetch inferred_specs
+    specs_res = await __import__("asyncio").to_thread(lambda: (
+        client
+        .schema("pipeline")
+        .table("inferred_specs")
+        .select("*")
+        .eq("url_registry_id", url_registry_id)
+        .limit(1)
+        .execute()
+    ))
+    specs = (specs_res.data or [])
+    if not specs:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No inferred_specs found for url_registry_id={url_registry_id}. Run C may not have run yet.",
+        )
+
+    # Fetch inference_entries
+    entries_res = await __import__("asyncio").to_thread(lambda: (
+        client
+        .schema("pipeline")
+        .table("inference_entries")
+        .select("rule_key, inference_text, sentiment, confidence, defers_to_runb_category, emitted_to_embedding, conflict_flag, confidence")
+        .eq("url_registry_id", url_registry_id)
+        .order("rule_key")
+        .execute()
+    ))
+    entries = entries_res.data or []
+
+    return {
+        "url_registry_id": url_registry_id,
+        "inferred_specs":  specs[0],
+        "inference_entries": entries,
+        "total_entries":   len(entries),
+        "emitted_count":   sum(1 for e in entries if e.get("emitted_to_embedding")),
+        "conflict_count":  sum(1 for e in entries if e.get("conflict_flag")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/inference/conflicts
+# HITL queue — all conflict_flag=True inference_entries across all phones.
+# ---------------------------------------------------------------------------
+
+@router.get("/inference/conflicts")
+async def get_conflict_flags(limit: int = 50, offset: int = 0):
+    """
+    GET /admin/inference/conflicts?limit=50&offset=0
+
+    Returns all inference_entries where conflict_flag=True.
+    These are cases where Run C fired but Run B has authoritative data —
+    an admin should verify the Run B entry is correct before clearing.
+
+    Ordered by url_registry_id, rule_key for deterministic pagination.
+    """
+    client = get_client()
+
+    res = await __import__("asyncio").to_thread(lambda: (
+        client
+        .schema("pipeline")
+        .table("inference_entries")
+        .select(
+            "url_registry_id, model_id, rule_key, inference_text, sentiment, "
+            "confidence, defers_to_runb_category, input_field_snapshot"
+        )
+        .eq("conflict_flag", True)
+        .order("url_registry_id")
+        .order("rule_key")
+        .range(offset, offset + limit - 1)
+        .execute()
+    ))
+    rows = res.data or []
+
+    return {
+        "total_returned": len(rows),
+        "limit":          limit,
+        "offset":         offset,
+        "conflicts":      rows,
     }

@@ -447,7 +447,8 @@ Extract every buyer-meaningful observation as a separate entry. Over-extraction 
 _STAGE2_TIMEOUT_SECONDS: float = 120.0
 _STAGE2_MAX_INPUT_CANDIDATES: int = 200
 
-_STAGE2_SYSTEM_PROMPT = """\
+# Kept as backup so a rollback is one rename away. Do not delete.
+_STAGE2_SYSTEM_PROMPT_V1 = """\
 You are aggregating phone experience candidates extracted from multiple reviewer
 transcripts into a final deduplicated set of experiences.
 
@@ -654,6 +655,346 @@ Return JSON with key "experiences" (list). Each item must have:
 
 
 # ---------------------------------------------------------------------------
+# Stage 2 system prompt — V2 (ACTIVE)
+# ---------------------------------------------------------------------------
+# Changes vs. V1:
+#   1. Redundancy test added as the FIRST rule the LLM applies, before the
+#      aspect lists.  V1 let the no-merge list be the first thing the LLM saw,
+#      so its default was "these are in different buckets, keep both" — which
+#      caused the over-extraction failures seen on the Edge 50 Fusion sample
+#      (lines 43+44+45 speakers, 65+66 thermal, 67+68+69 haptics, 79+80+81+82
+#      software, 85-91 OVERALL).
+#   2. Per-aspect cap replaces per-category cap.  V1's RULE 7 ("aim for no
+#      more than 6 entries per category") was the single biggest contributor
+#      to OVERALL bloat and forced false merges in Camera.  V2 has no flat
+#      cap per category — the constraint is one entry per ASPECT.
+#   3. Sharpened spec-drop test.  V1 relied on examples; V2 adds the reusable
+#      test "would this be true if every reviewer hated the phone?" which
+#      catches decorated hybrid specs (lines 70, 84, 87 from the sample).
+#   4. Contradiction handling clause added.  V1 had no rule for contradictory
+#      candidates within an aspect.  V2 resolves them deterministically.
+#   5. Fixed output range removed from rule 8.  V1's "expect 45-70 final
+#      experiences" was anchoring the LLM regardless of actual aspect
+#      coverage.  V2 says the count is a consequence of the rules, not a
+#      constraint.
+#
+# The few-shot examples in extraction_examples_run_b_v2_stage2.py are the
+# primary teaching mechanism for these rules. The prompt and examples must
+# stay aligned.
+_STAGE2_SYSTEM_PROMPT = """\
+You are aggregating phone experience candidates extracted from multiple reviewer
+transcripts into a final deduplicated set of experiences.
+
+You will be given a labeled candidate list (one block per candidate) and you
+must return the final aggregated experience set. Your output must follow the
+schema in the OUTPUT FORMAT section at the bottom of this prompt.
+
+=== HOW TO THINK ABOUT THIS TASK ===
+
+Your job is NOT to keep every candidate. Your job is to produce the set of
+final experiences a buyer would actually find useful when deciding whether to
+buy this phone. That means:
+
+  - Multiple candidates describing the same observation must collapse to ONE
+    entry. Different wording from different reviewers about the same thing is
+    not new information.
+  - Candidates that describe genuinely different things must stay separate,
+    even when they sit in the same category.
+  - Candidates that are spec facts dressed up with subjective decoration must
+    be dropped. They do not become experiences just because the reviewer
+    sounded enthusiastic.
+  - Candidates that bundle multiple aspects into one statement must be dropped
+    (the individual aspects should have been captured separately in Stage 1).
+
+The mental model: imagine a friend asking "what is this phone actually like
+to use?" Your output is the answer to that question, with no repetition, no
+specs disguised as opinions, and no bundled summaries.
+
+=== REDUNDANCY TEST — APPLY THIS FIRST, BEFORE ANY OTHER RULE ===
+
+Before deciding whether to keep two candidates as separate entries, ask:
+
+  "Would a buyer learn anything genuinely new from reading both candidates,
+   compared to reading just one of them?"
+
+If NO → they describe the same observation. MERGE them into a single entry.
+If YES → they describe different observations. Keep them separate.
+
+Examples of "no, same observation, MERGE":
+  - "Battery lasts a full day" + "Got around 7 hours SOT" + "Easily survives
+     a heavy day" → all three describe day-long endurance. ONE entry.
+  - "Speakers are loud and rich" + "No distortion at max volume" + "Dolby
+     Atmos is immersive" → all three orbit "speakers are very good". ONE entry
+    that folds in all three qualifying details.
+  - "Hello UI is clean" + "Near-stock interface" + "Almost zero bloatware" →
+    all three describe a clean software experience. ONE entry.
+
+Examples of "yes, different observations, KEEP SEPARATE":
+  - "Got 7 hours SOT" + "Loses only 2% overnight on standby" → screen-on time
+    and standby drain are different aspects. TWO entries.
+  - "Portrait edge detection is sharp" + "Portrait bokeh is too aggressive" →
+    edge detection and bokeh intensity are different aspects, with different
+    sentiments. TWO entries.
+  - "Charges 0-100% in 45 minutes" + "Charges very slowly while in active use"
+    → idle charging speed and in-use charging speed are different scenarios.
+    TWO entries.
+
+The redundancy test fires BEFORE you consult the aspect lists. The aspect
+lists tell you what NOT to merge ACROSS aspects. The redundancy test tells
+you what TO merge WITHIN an aspect.
+
+=== PER-ASPECT CAP (replaces the old per-category cap) ===
+
+There is NO cap on the number of entries per category. Camera may produce
+fifteen entries; Thermal may produce one. Both are correct outcomes when
+they reflect what reviewers actually observed.
+
+The cap is per ASPECT:
+
+  AT MOST ONE entry per aspect, where the aspect lists below enumerate the
+  distinct aspects within each category.
+
+How to apply this:
+  1. For each candidate, identify which aspect from the lists below it
+     describes.
+  2. Group all candidates by aspect.
+  3. Within each aspect group: apply the redundancy test. If the group
+     contains candidates that say the same thing differently, merge them.
+     If it contains candidates that contradict, apply the contradiction rule
+     below. The output for that aspect group is exactly one entry.
+  4. Across aspects: keep one entry per aspect. Do not merge across aspects.
+
+If a candidate does not clearly map to any listed aspect, keep it as an
+extra entry only if it carries a genuinely distinct, buyer-meaningful
+observation. Otherwise drop it.
+
+=== ASPECT LISTS — DO NOT MERGE ACROSS THESE WITHIN A CATEGORY ===
+
+Each item below is a DISTINCT aspect. Within one aspect, multiple reviewers'
+candidates merge into ONE entry. Across aspects, entries stay separate.
+
+CAMERA:
+  Daylight color science | Daylight detail/sharpness | Daylight dynamic range/HDR |
+  Portrait edge detection | Portrait bokeh intensity | Portrait skin tone accuracy |
+  Night photo quality | Night mode artifacts | Low-light indoor performance |
+  Ultrawide sharpness/distortion | Ultrawide color consistency | Ultrawide low-light |
+  Selfie detail/skin tone | Selfie portrait/edge detection |
+  Video stabilization | Video color science | Video exposure consistency | Video audio quality |
+  Horizon lock | Slow motion | Macro | Zoom optical quality | Capture speed | Camera app features (Pro mode, special modes)
+
+DISPLAY:
+  Outdoor brightness/sunlight legibility | Color accuracy/calibration | Smoothness/refresh-rate feel |
+  Black depth/contrast | Wet touch response | Accidental touch rejection on curved edges |
+  HDR content rendering | Always-on display behavior | Eye comfort/PWM flicker
+
+PERFORMANCE:
+  App launch speed | Multitasking/RAM retention | UI smoothness/jank |
+  Storage speed | Fingerprint sensor responsiveness | Face unlock responsiveness |
+  Heavy workload handling | Micro-stutters under sustained load
+
+AUDIO:
+  Loudness | Clarity/distortion at max volume | Bass response |
+  Stereo separation/soundstage | Dolby Atmos/spatial audio effect |
+  Earpiece call clarity | Microphone quality
+
+BUILD QUALITY:
+  In-hand feel/grip | Weight/balance | Thinness/pocketability |
+  Frame/back material quality | Smudge/fingerprint attraction |
+  Structural rigidity/creak | Drop survivability (long-term only)
+
+SOFTWARE:
+  Bloatware presence/quantity | Ads in system apps | UI design/cleanliness |
+  Update policy reality | Unique/exclusive software features | Software reliability/bugs |
+  Customization depth | Notification handling
+
+GAMING:
+  Frame rate in demanding titles | Frame rate stability over long sessions |
+  Touch response/latency in games | Gaming thermal | High-FPS mode availability |
+  Speaker vibration during gaming | Game Mode features
+
+BATTERY LIFE:
+  Screen-on time | Heavy-use endurance/drain rate |
+  Light-use/standby endurance | Background drain | Long-term degradation
+
+CHARGING SPEED:
+  Full charge time (0-100%) | First-half speed (0-50%) |
+  In-use charging speed | Charger hardware quality |
+  Wireless charging speed | Reverse wireless charging usefulness
+
+THERMAL:
+  Gaming thermal | Charging thermal |
+  Sustained-load thermal | Daily-use thermal | Throttling impact on performance
+
+HAPTICS:
+  Typing feedback feel | Notification/call vibration strength |
+  Motor type/precision quality | System UI haptic feedback
+
+CONNECTIVITY:
+  5G real-world speed | 5G consistency/band stability | Wi-Fi speed/range |
+  Wi-Fi stability | Bluetooth stability | Bluetooth codec quality |
+  USB connectivity behavior | Mobile hotspot performance
+
+CALL QUALITY:
+  Earpiece voice clarity | Noise cancellation effectiveness |
+  VoLTE call quality | VoNR/Vo5G call quality | Loudspeaker call quality | Signal reception strength
+
+IN THE BOX:
+  Charger quality/versatility | Cable quality | Case/cover quality |
+  Packaging quality/sustainability | Missing accessories
+
+DURABILITY:
+  IP rating real-world performance | Drop survivability outcomes |
+  Screen scratch resistance | Back/finish wear over time | Glass protection effectiveness
+
+OVERALL:
+  Value-for-money verdict | Target audience fit |
+  Long-term ownership verdict | Buy/skip recommendation
+
+=== CONTRADICTION HANDLING ===
+
+When two or more candidates within the same aspect contradict each other
+(one says haptics are weak, another says they're strong), resolve as follows:
+
+  1. If confidences differ by 0.10 or more → keep the higher-confidence
+     candidate, drop the other.
+  2. If confidences are within 0.10 of each other AND one is Negative while
+     the other is Positive → keep the Negative-sentiment entry. Reviewers
+     are more reliable about identifying flaws than about generic praise,
+     and surfacing a flaw in the embedding helps the recommendation engine
+     avoid mismatching that phone to a buyer who cares about that aspect.
+  3. If both are high-confidence (≥ 0.85) and both have specific evidence
+     quotes that genuinely describe different sub-conditions (e.g. "haptics
+     are weak for typing" vs "haptics are decent for notifications"), they
+     are actually describing different sub-aspects — keep both and write
+     experience_text to make the distinction explicit.
+
+=== RULES ===
+
+RULE 1 — APPLY THE REDUNDANCY TEST AND PER-ASPECT CAP
+See the two sections above. These are the primary rules.
+
+RULE 2 — CANONICAL REWRITING
+Write experience_text as a neutral, precise, present-tense third-person
+statement. When merging multiple candidates, fold their qualifying details
+into one well-composed sentence — do not just pick one candidate's text and
+discard the rest. Use the most specific and informative phrasing the cluster
+provides. Avoid vague phrases ("phone is good", "overall balanced", "quite
+decent") — prefer specific observable claims.
+
+RULE 3 — EVIDENCE QUOTE (REQUIRED — NEVER NULL)
+Select ONE verbatim evidence_quote from the input candidates in the merged
+cluster. NEVER generate a new quote. Copy it character-for-character from
+the input. The representative_raw_transcript_id must match the transcript
+that supplied that quote. If NO candidate in the cluster has a non-null
+evidence_quote, DROP the entire cluster.
+
+When choosing the representative quote from a merged cluster, prefer the
+quote that is most concrete and specific — quotes with numbers, named
+scenarios, or precise sensory descriptions beat generic praise.
+
+RULE 4 — DROP SPEC FACTS (SHARPENED TEST)
+A spec fact is an objective property of every unit of this phone, true
+regardless of how it is used. To test whether a candidate is a spec fact,
+ask:
+
+  "Would this statement still be TRUE if every reviewer disliked this phone?"
+
+If YES → it is a spec fact. DROP it, even when the candidate decorates the
+fact with subjective language like "standout", "rare at this price",
+"impressive commitment", "robust", "promising", "future-proof".
+
+DROP (spec facts, including hybrid decorations):
+  "Phone has 5000mAh battery"                                          → DROP
+  "Supports Wi-Fi 6 and NFC"                                           → DROP
+  "Includes 68W charger in box"                                        → DROP
+  "Has IP68 rating"                                                    → DROP
+  "3 years OS updates, 4 years security patches"                       → DROP
+  "IP68 at this price is a standout feature"                           → DROP
+  "Supports 15 5G bands which is rare in this segment"                 → DROP
+  "Motorola's 4-year update promise is impressive at this price"       → DROP
+
+KEEP (genuinely subjective experiences derived from the same hardware):
+  "IP68 gave real peace of mind using it in heavy rain"                → KEEP
+  "68W charger filled the phone in under 45 minutes from empty"        → KEEP
+  "Display brightness stayed legible outdoors at midday"               → KEEP
+
+RULE 5 — DROP COMPARISONS WITH OTHER PHONES
+Drop any candidate that names a competing brand or specific competing model.
+  "Better than the OnePlus"                       → DROP
+  "Beats Samsung in battery life"                 → DROP
+  "OnePlus has superior haptics"                  → DROP
+  "Display brighter than the Nord CE4"            → DROP
+
+KEEP statements about this phone alone:
+  "Display is bright enough for direct sunlight"  → KEEP
+
+RULE 6 — DROP WEAK OR BUNDLED ENTRIES
+Drop entries where experience_text is fewer than 10 meaningful words.
+Drop bundled-multi-aspect entries that mash several distinct observations
+into one statement:
+  "Premium design with IP68, clean software, great camera and good battery" → DROP
+The individual aspects of a bundled entry should appear as separate atomic
+entries from other candidates. If they don't, that's a Stage 1 gap, not
+something Stage 2 should paper over.
+
+RULE 7 — PER-ASPECT CAP (REPLACES OLD CATEGORY CAP)
+At most ONE entry per aspect from the aspect lists above. No flat cap per
+category. A category with many independently-observed aspects (Camera,
+Display) naturally produces many entries; a category with few observed
+aspects (Thermal, Haptics on most phones) naturally produces few. Both are
+correct outcomes.
+
+If two candidates appear to fall under the same aspect but one is a strict
+specialisation of the other (e.g. "low-light photos are noisy" and "low-light
+indoor photos under tubelight are particularly noisy"), keep the more
+specific one and drop the more general one. Specificity carries more buyer
+signal than generality.
+
+RULE 8 — OUTPUT GUIDANCE (no fixed range)
+Do not target a fixed entry count. The correct count is determined by:
+  - How many distinct aspects reviewers actually observed
+  - After merging same-aspect candidates and dropping specs/comparisons
+Treat the final count as a consequence of the rules, not as a constraint
+the rules must satisfy.
+
+RULE 9 — source_transcript_count
+Count distinct raw_transcript_ids from the input candidates that contributed
+to this final entry. Minimum 1. An entry sourced from a single transcript
+with strong evidence is valid; an entry sourced from many transcripts gains
+no special status, only stronger consensus.
+
+RULE 10 — confidence
+Confidence on output entries is a fixed downstream value and is set by the
+pipeline code after your output. You do not need to emit a confidence field;
+if you do, it will be overridden. Focus on the textual quality of the entry.
+
+=== INPUT FORMAT ===
+
+You will receive a list of candidates in the following form:
+
+  [CANDIDATE] transcript={raw_transcript_id} category={category} conf={confidence}
+  experience_text: {text}
+  evidence_quote: {verbatim quote or null}
+
+Followed by the next candidate block, and so on.
+
+=== OUTPUT FORMAT ===
+
+Return JSON with key "experiences" (a list). Each item must contain:
+
+  experience_text                  (string — the merged, rewritten observation)
+  sentiment                        (string — Positive | Negative | Neutral | Mixed)
+  evidence_quote                   (string — verbatim from input, NEVER null)
+  category                         (string — must be one of the 16 valid categories)
+  source_transcript_count          (integer ≥ 1)
+  representative_raw_transcript_id (integer — id of transcript providing evidence_quote)
+
+Do NOT include any text outside the JSON. Do NOT add commentary, explanations,
+or rule citations in the output.
+"""
+
+
+# ---------------------------------------------------------------------------
 # Schema version → examples module mapping
 # ---------------------------------------------------------------------------
 
@@ -692,6 +1033,46 @@ def _load_run_b_examples(schema_version: str):
         getattr(mod, "RUN_B_STAGE1_EXAMPLES", None)
         or getattr(mod, "RUN_B_EXAMPLES", [])
     )
+    return examples, schema_version
+
+
+# ---------------------------------------------------------------------------
+# Schema version → Stage 2 examples module mapping
+# ---------------------------------------------------------------------------
+# Stage 2 examples are separate from Stage 1 examples because the two stages
+# have different inputs (raw transcript vs. labeled candidate list) and
+# different outputs (per-transcript candidates vs. final deduplicated set).
+# Mirrors the _EXAMPLES_MODULE_MAP_B pattern above.
+
+_EXAMPLES_MODULE_MAP_B_STAGE2: dict[str, str] = {
+    "v2": "app.config.extraction_examples_run_b_v2_stage2",
+}
+
+_DEFAULT_SCHEMA_VERSION_B_STAGE2 = "v2"
+
+
+@functools.lru_cache(maxsize=None)
+def _load_run_b_stage2_examples(schema_version: str):
+    """
+    Loads RUN_B_STAGE2_EXAMPLES from the module for schema_version.
+    Falls back to _DEFAULT_SCHEMA_VERSION_B_STAGE2 with a warning if not found.
+    Mirrors _load_run_b_examples() but for the Stage 2 aggregator.
+
+    Returns:
+        (examples_list, actual_schema_version_used)
+    """
+    import importlib
+    module_path = _EXAMPLES_MODULE_MAP_B_STAGE2.get(schema_version)
+    if module_path is None:
+        logger.warning(
+            "_load_run_b_stage2_examples: schema_version=%r not in "
+            "_EXAMPLES_MODULE_MAP_B_STAGE2. Falling back to %r.",
+            schema_version, _DEFAULT_SCHEMA_VERSION_B_STAGE2,
+        )
+        module_path = _EXAMPLES_MODULE_MAP_B_STAGE2[_DEFAULT_SCHEMA_VERSION_B_STAGE2]
+        schema_version = _DEFAULT_SCHEMA_VERSION_B_STAGE2
+    mod = importlib.import_module(module_path)
+    examples = getattr(mod, "RUN_B_STAGE2_EXAMPLES", [])
     return examples, schema_version
 
 
@@ -1074,12 +1455,28 @@ async def _run_stage2_aggregation(
                 f"experience_text: {c['experience_text']}\n"
                 f"evidence_quote: {eq}\n"
             )
-        user_content = (
+        candidates_block = (
             f"Phone: {brand} {model_name}\n"
             f"Total candidates: {len(candidates_to_use)} "
             f"from {unique_transcript_count} transcripts\n\n"
             + "\n".join(lines)
         )
+
+        # Prepend Stage 2 few-shot examples so the LLM sees concrete merge/keep/drop
+        # decisions before processing the real candidate list. The examples teach
+        # the redundancy test, per-aspect cap, decoration-cluster merging, spec-fact
+        # dropping, and within-Camera-aspect merging — behaviours that prose rules
+        # alone failed to enforce reliably (see Edge 50 Fusion sample analysis).
+        stage2_examples, _ = _load_run_b_stage2_examples(schema_version)
+        few_shot_block = _build_few_shot_block(stage2_examples)
+        if few_shot_block:
+            user_content = (
+                f"FEW-SHOT EXAMPLES OF CORRECT AGGREGATION:\n\n"
+                f"{few_shot_block}\n\n---\n\n"
+                f"CANDIDATES TO AGGREGATE:\n\n{candidates_block}"
+            )
+        else:
+            user_content = candidates_block
 
         logger.info(
             "_run_stage2_aggregation: aggregation_run_id=%d — "

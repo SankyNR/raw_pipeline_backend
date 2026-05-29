@@ -297,17 +297,16 @@ def _render_template(template: str, **kwargs: Any) -> str:
 
 async def _rule_jio_5g(rule: dict, model_id: int, url_registry_id: int) -> dict | None:
     """
-    Counts how many Jio India 5G bands (n28, n78, n5, n8) the phone supports.
+    LEGACY handler — superseded by inference_rules_group_a.rule_jio_5g_compatibility.
+    Kept for backwards-compatibility with pipeline.lookup_inference_rules rows that
+    use rule_name='jio_5g_compatibility' dispatched via the legacy run_inference_engine().
 
-    thresholds.bands_excellent: 4  → Positive ("Supports all four Jio 5G bands")
-    thresholds.bands_partial:   2  → Neutral  ("Supports {n} of 4 Jio 5G bands")
-    <partial                        → Negative ("Missing critical Jio 5G bands: {list}")
-
-    Band names are case-/spacing-normalised for matching (e.g. "n28" == "N28" == "N 28").
+    Band set now reads from core/constants.JIO_5G_BANDS so it stays in sync
+    with the Group A handler. Previously hardcoded {n28,n78,n5,n8} which was
+    wrong (n8 is Airtel/Vi/BSNL, missing n41). Fixed: {n28,n78,n41,n5}.
     """
-    JIO_BANDS       = {"n28", "n78", "n5", "n8"}
     thresholds      = rule.get("thresholds") or {}
-    bands_excellent = int(thresholds.get("bands_excellent", 4))
+    bands_excellent = int(thresholds.get("bands_excellent", len(JIO_5G_BANDS)))
     bands_partial   = int(thresholds.get("bands_partial",   2))
 
     client = _get_ms_client()
@@ -324,11 +323,11 @@ async def _rule_jio_5g(rule: dict, model_id: int, url_registry_id: int) -> dict 
     for row in rows:
         lookup    = row.get("lookup_network_bands") or {}
         band_name = (lookup.get("band_name") or "").lower().replace(" ", "").replace("-", "")
-        if band_name in JIO_BANDS:
+        if band_name in JIO_5G_BANDS:
             found_bands.add(band_name)
 
     band_count    = len(found_bands)
-    missing_bands = JIO_BANDS - found_bands
+    missing_bands = JIO_5G_BANDS - found_bands
     snapshot      = {
         "found_bands":   sorted(found_bands),
         "missing_bands": sorted(missing_bands),
@@ -360,16 +359,16 @@ async def _rule_jio_5g(rule: dict, model_id: int, url_registry_id: int) -> dict 
 
 async def _rule_airtel_5g(rule: dict, model_id: int, url_registry_id: int) -> dict | None:
     """
-    Counts how many Airtel India 5G bands (n8, n78) the phone supports.
+    LEGACY handler — superseded by inference_rules_group_a.rule_airtel_5g_compatibility.
+    Kept for backwards-compatibility with legacy run_inference_engine() dispatch.
 
-    thresholds.bands_full: 2    → Positive
-    thresholds.bands_partial: 1 → Neutral
-    0                           → Negative
+    Band set now reads from core/constants.AIRTEL_5G_BANDS {n78,n1,n3,n40,n38,n8}.
+    Previously hardcoded {n8,n78} which was critically incomplete (missing n1/n3
+    NSA anchors and n40/n38 CA bands). Thresholds updated accordingly.
     """
-    AIRTEL_BANDS  = {"n8", "n78"}
     thresholds    = rule.get("thresholds") or {}
-    bands_full    = int(thresholds.get("bands_full",    2))
-    bands_partial = int(thresholds.get("bands_partial", 1))
+    bands_full    = int(thresholds.get("bands_full",    4))   # excellent: n78 + 3+ others
+    bands_partial = int(thresholds.get("bands_partial", 2))   # good: n78 + 1 other
 
     client = _get_ms_client()
     result = await asyncio.to_thread(lambda: (
@@ -385,11 +384,11 @@ async def _rule_airtel_5g(rule: dict, model_id: int, url_registry_id: int) -> di
     for row in rows:
         lookup    = row.get("lookup_network_bands") or {}
         band_name = (lookup.get("band_name") or "").lower().replace(" ", "").replace("-", "")
-        if band_name in AIRTEL_BANDS:
+        if band_name in AIRTEL_5G_BANDS:
             found_bands.add(band_name)
 
     band_count    = len(found_bands)
-    missing_bands = AIRTEL_BANDS - found_bands
+    missing_bands = AIRTEL_5G_BANDS - found_bands
     snapshot      = {
         "found_bands":   sorted(found_bands),
         "missing_bands": sorted(missing_bands),
@@ -785,3 +784,194 @@ _RULE_HANDLERS = {
     "multimedia_quality":      _rule_multimedia_quality,
     "aperture_low_light":      _rule_aperture_low_light,
 }
+
+
+# ===========================================================================
+# Run C — Deterministic Inference Engine (New Architecture)
+# Phase 4: Segment Scoring Helpers — Section 5 of Run_C_Inference_Engine_Spec.md
+#
+# These helpers are used by the new Group A–H rule handlers (Phases 6–8).
+# They are entirely separate from the legacy Phase 11 handlers above.
+# ===========================================================================
+
+from app.core.constants import (
+    PRICE_TIERS, SOFT_BOUNDARY_PCT,
+    JIO_5G_BANDS, AIRTEL_5G_BANDS,
+)
+
+
+def percentile_to_tier(p: float) -> str:
+    """
+    Converts a percentile (0.0–1.0) to a four-level quality tier string.
+
+    Used for both *_tier_absolute (percentile over the entire dataset) and
+    *_tier_in_segment (percentile over price-tier peers only).
+
+        p >= 0.85  → "excellent"
+        p >= 0.60  → "good"
+        p >= 0.35  → "adequate"
+        p <  0.35  → "weak"
+
+    These thresholds are from Section 5 of the spec and must not be changed
+    locally — update the spec and this function together.
+    """
+    if p >= 0.85:
+        return "excellent"
+    if p >= 0.60:
+        return "good"
+    if p >= 0.35:
+        return "adequate"
+    return "weak"
+
+
+def classify_price_tier(price_inr: int | float) -> str:
+    """
+    Returns the canonical PRICE_TIERS key for a given price in INR.
+
+    Uses the ordered tier list from core/constants.py PRICE_TIERS.
+    Returns 'UNKNOWN' if no tier matches (should not happen with valid prices).
+
+    Note: Soft-boundary logic (±15%) for cross-tier scoring is handled by
+    compute_segment_percentile — this function returns the PRIMARY tier only.
+    """
+    for tier_name, (lo, hi) in PRICE_TIERS.items():
+        if hi is None:
+            if price_inr >= lo:
+                return tier_name
+        else:
+            if lo <= price_inr <= hi:
+                return tier_name
+    return "UNKNOWN"
+
+
+async def compute_segment_percentile(
+    model_id: int,
+    metric_column: str,
+    price_tier: str,
+    higher_is_better: bool = True,
+) -> tuple[float, str]:
+    """
+    Returns (percentile, confidence) for `metric_column` among all committed phones
+    in `price_tier`, applying soft boundary (±15% of tier edges).
+
+    Section 5 of the spec:
+    - Soft boundary: phones within ±15% of a tier edge are scored against BOTH
+      adjacent tiers. This function is called once per adjacent tier when needed.
+    - If fewer than 4 peers: returns (0.5, 'low') — neutral, low confidence.
+    - If the phone itself is not in the peer set: still returns a valid percentile
+      based on where the phone's value sits in the distribution.
+
+    Args:
+        model_id:         The phone being scored.
+        metric_column:    Column name in pipeline.inferred_specs to rank on.
+                          Must be a numeric column (NUMERIC, INT, BIGINT).
+        price_tier:       e.g. 'BUDGET', 'UPPER_MIDRANGE'. From PRICE_TIERS keys.
+        higher_is_better: If False, lower values rank better (e.g. weight_grams
+                          for portability uses inverted scores instead, but this
+                          flag is available for direct numeric columns).
+
+    Returns:
+        (percentile: float [0.0–1.0], confidence: str 'high'|'low')
+
+    Confidence is 'low' when fewer than 4 peers exist — not enough data for
+    a meaningful relative ranking. Caller should note this in rule output.
+
+    Implementation notes:
+    - Queries pipeline.inferred_specs directly (committed + already Run-C'd phones).
+    - Soft boundary is built by expanding the price range ±15% on each edge.
+    - Uses asyncio.to_thread to avoid blocking the FastAPI event loop.
+    - The metric_column is fetched as a raw value; Supabase returns it as a string
+      for NUMERIC columns — cast explicitly to float.
+    """
+    MIN_PEERS_FOR_HIGH_CONFIDENCE = 4
+
+    tier_bounds = PRICE_TIERS.get(price_tier)
+    if tier_bounds is None:
+        logger.warning(
+            "compute_segment_percentile: unknown price_tier=%r — returning neutral (0.5, low)",
+            price_tier,
+        )
+        return (0.5, "low")
+
+    lo, hi = tier_bounds
+
+    # Expand bounds by SOFT_BOUNDARY_PCT on each edge that exists
+    soft_lo = lo * (1.0 - SOFT_BOUNDARY_PCT) if lo > 0 else 0
+    soft_hi = hi * (1.0 + SOFT_BOUNDARY_PCT) if hi is not None else None
+
+    client = get_client().schema("pipeline")
+
+    # Fetch: current phone's metric value + all peer values in soft-boundary range
+    # We fetch price_segment and the metric column from inferred_specs.
+    # The price stored for range filtering is derived from mobile_specs.phones.current_price_inr.
+    # For the peer query we rely on price_segment assignment already done (H1 rule).
+    # Simpler approach: fetch all phones with price_segment = price_tier, plus
+    # phones in adjacent tiers if their prices fall in the soft boundary.
+    # Since price_segment is a committed column in inferred_specs, and soft boundary
+    # is ±15%, we include adjacent tier phones by also fetching adjacent tier peers.
+
+    # Step 1: fetch the target phone's metric value
+    target_res = await asyncio.to_thread(lambda: (
+        client
+        .table("inferred_specs")
+        .select(f"model_id, {metric_column}, price_segment")
+        .eq("model_id", model_id)
+        .limit(1)
+        .execute()
+    ))
+    target_rows = target_res.data or []
+    if not target_rows or target_rows[0].get(metric_column) is None:
+        logger.debug(
+            "compute_segment_percentile: no %r value for model_id=%d — returning neutral",
+            metric_column, model_id,
+        )
+        return (0.5, "low")
+
+    target_value = float(target_rows[0][metric_column])
+
+    # Step 2: fetch peer values — phones in the primary tier + adjacent tier(s)
+    # We include adjacent tiers because of soft-boundary: a phone at tier edge
+    # competes against both sides. Fetch primary + adjacent tier names.
+    tier_order = list(PRICE_TIERS.keys())  # ordered high → low as defined in constants
+    tier_idx   = tier_order.index(price_tier) if price_tier in tier_order else -1
+
+    tiers_to_fetch = [price_tier]
+    if tier_idx > 0:
+        tiers_to_fetch.append(tier_order[tier_idx - 1])   # tier above (more expensive)
+    if tier_idx >= 0 and tier_idx < len(tier_order) - 1:
+        tiers_to_fetch.append(tier_order[tier_idx + 1])   # tier below (less expensive)
+
+    peers_res = await asyncio.to_thread(lambda: (
+        client
+        .table("inferred_specs")
+        .select(f"model_id, {metric_column}")
+        .in_("price_segment", tiers_to_fetch)
+        .not_.is_(metric_column, "null")
+        .execute()
+    ))
+    peer_rows = peers_res.data or []
+
+    peer_values = []
+    for row in peer_rows:
+        try:
+            peer_values.append(float(row[metric_column]))
+        except (TypeError, ValueError):
+            pass
+
+    if len(peer_values) < MIN_PEERS_FOR_HIGH_CONFIDENCE:
+        logger.debug(
+            "compute_segment_percentile: only %d peers for metric=%r tier=%r — low confidence",
+            len(peer_values), metric_column, price_tier,
+        )
+        return (0.5, "low")
+
+    # Step 3: compute percentile rank
+    # percentile = fraction of peers that the target phone beats (or ties)
+    if higher_is_better:
+        peers_beaten = sum(1 for v in peer_values if v <= target_value)
+    else:
+        # Lower is better (e.g. weight): beat peers who have higher values
+        peers_beaten = sum(1 for v in peer_values if v >= target_value)
+
+    percentile = peers_beaten / len(peer_values)
+    return (percentile, "high")

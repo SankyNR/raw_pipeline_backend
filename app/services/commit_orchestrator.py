@@ -74,6 +74,7 @@ Any exception mid-sequence:
 from __future__ import annotations
 
 import asyncio
+import math
 import logging
 import traceback
 from typing import Any
@@ -432,6 +433,16 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
         display_features_written = False
 
         for idx, display in enumerate(displays):
+            # ── PPI computation (Run C deterministic) ────────────────────────
+            # Compute before drow is built so _copy_if_present picks it up via
+            # the existing "ppi": "ppi" mapping.  All three inputs must be
+            # present and non-zero; otherwise skip silently (ppi stays absent).
+            h = display.get("resolution_height_px")
+            w = display.get("resolution_width_px")
+            s = display.get("size_inch")
+            if h and w and s and float(s) > 0:
+                display["ppi"] = round(math.sqrt(h ** 2 + w ** 2) / float(s))
+
             # S2-P1-8: derive display_position from display_type semantics,
             # not from array index. Foldable phones may have Cover at index 0.
             display_type = display.get("display_type") or "main"
@@ -1207,37 +1218,18 @@ async def run_db_commit(final_id: int, session_id: int | None) -> dict:
             len(tables_written), rows_inserted, len(unresolved_fields),
         )
 
-        # ── Step 24: Fire Run C asynchronously ────────────────────────────────
-        # M6 fix: wrap the task coroutine so exceptions are logged at ERROR level
-        # and never silently swallowed by the event loop.
-        async def _run_inference_safely(
-            _model_id: int = model_id,
-            _url_registry_id: int = url_registry_id,
-            _commit_run_id: int = commit_run_id,
-        ) -> None:
-            try:
-                from app.services.inference_engine import run_inference_engine  # deferred
-                await run_inference_engine(
-                    model_id=_model_id,
-                    url_registry_id=_url_registry_id,
-                )
-                logger.info(
-                    "Run C: inference_engine completed for model_id=%d", _model_id
-                )
-            except ImportError:
-                logger.info(
-                    "Run C: inference_engine not yet implemented — skipping (model_id=%d).",
-                    _model_id,
-                )
-            except Exception as _exc:
-                logger.error(
-                    "Run C: inference_engine FAILED for model_id=%d commit_run_id=%d: %s",
-                    _model_id, _commit_run_id, _exc,
-                    exc_info=True,
-                )
-
-        asyncio.create_task(_run_inference_safely())
-        logger.info("run_db_commit: Run C task scheduled for model_id=%d", model_id)
+        # ── Step 24: Fire Run C (Groups A–H) asynchronously ──────────────────
+        # run_c_safely wraps run_c_engine — exceptions are caught and logged,
+        # never propagated to the commit response.
+        from app.services.run_c_orchestrator import run_c_safely  # deferred import
+        asyncio.create_task(
+            run_c_safely(
+                model_id=model_id,
+                url_registry_id=url_registry_id,
+                commit_run_id=commit_run_id,
+            )
+        )
+        logger.info("run_db_commit: Run C orchestrator task scheduled for model_id=%d", model_id)
 
         return {
             "success":           True,

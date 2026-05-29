@@ -2246,26 +2246,108 @@ def fetch_experiences_for_phone(url_registry_id: int) -> list[dict]:
     """
     Returns all active (non-superseded) phone_experiences rows for this phone,
     ordered by category_id. Includes admin_edited and is_suppressed flags for
-    UI colour coding.
+    UI colour coding. Also joins youtube metadata (video_title, video_url,
+    channel_name) via raw_transcript_id -> video_registry -> channel chain.
 
     IMPORTANT: Always filters is_superseded=FALSE. Superseded rows from
     previous Run B re-runs must never be surfaced to the admin UI.
     """
-    result = (
-        get_client()
+    client = get_client()
+
+    # Step 1 -- base experiences (include raw_transcript_id for the join)
+    base_result = (
+        client
         .schema("pipeline")
         .table("phone_experiences")
         .select(
-            "experience_id, exp_run_id, category_id, experience_text, "
-            "sentiment, evidence_quote, confidence, is_suppressed, "
-            "is_verified, admin_edited, created_at, updated_at"
+            "experience_id, exp_run_id, url_registry_id, category_id, "
+            "experience_text, sentiment, evidence_quote, confidence, "
+            "is_suppressed, is_verified, admin_edited, created_at, updated_at, "
+            "raw_transcript_id, "
+            "lookup_experience_categories(category_name)"
         )
         .eq("url_registry_id", url_registry_id)
         .eq("is_superseded", False)
         .order("category_id")
         .execute()
     )
-    return result.data or []
+    rows: list[dict] = list(base_result.data or [])
+
+    # Step 2 -- collect unique raw_transcript_ids that are not null
+    rtids = list({r["raw_transcript_id"] for r in rows if r.get("raw_transcript_id") is not None})
+    video_meta: dict[int, dict] = {}  # raw_transcript_id -> {video_title, video_url, channel_name}
+
+    if rtids:
+        # transcript_id -> video_registry_id
+        tr = (
+            client
+            .schema("pipeline")
+            .table("youtube_raw_transcript_data")
+            .select("raw_transcript_id, video_registry_id")
+            .in_("raw_transcript_id", rtids)
+            .execute()
+        )
+        rtid_to_vrid: dict[int, int] = {
+            r["raw_transcript_id"]: r["video_registry_id"]
+            for r in (tr.data or [])
+        }
+
+        vrids = list(set(rtid_to_vrid.values()))
+        if vrids:
+            # video_registry_id -> video_title, video_url, channel_id
+            vr = (
+                client
+                .schema("pipeline")
+                .table("youtube_video_url_registry")
+                .select("video_registry_id, video_title, video_url, channel_id")
+                .in_("video_registry_id", vrids)
+                .execute()
+            )
+            vrid_to_info: dict[int, dict] = {
+                r["video_registry_id"]: r for r in (vr.data or [])
+            }
+
+            # channel_id -> channel_name
+            channel_ids = list({
+                r["channel_id"] for r in vrid_to_info.values() if r.get("channel_id")
+            })
+            cid_to_name: dict[int, str] = {}
+            if channel_ids:
+                cr = (
+                    client
+                    .schema("pipeline")
+                    .table("youtube_channels")
+                    .select("channel_id, channel_name")
+                    .in_("channel_id", channel_ids)
+                    .execute()
+                )
+                cid_to_name = {r["channel_id"]: r["channel_name"] for r in (cr.data or [])}
+
+            for rtid, vrid in rtid_to_vrid.items():
+                info = vrid_to_info.get(vrid, {})
+                channel_id = info.get("channel_id")
+                video_meta[rtid] = {
+                    "video_title":  info.get("video_title"),
+                    "video_url":    info.get("video_url"),
+                    "channel_name": cid_to_name.get(channel_id) if channel_id else None,
+                }
+
+    # Step 3 -- merge video metadata; pop raw_transcript_id (not part of public API)
+    # Also flatten nested lookup_experience_categories join result.
+    for row in rows:
+        rtid = row.pop("raw_transcript_id", None)
+        meta = video_meta.get(rtid) if rtid is not None else None
+        row["video_title"]  = meta["video_title"]  if meta else None
+        row["video_url"]    = meta["video_url"]    if meta else None
+        row["channel_name"] = meta["channel_name"] if meta else None
+        # Flatten the nested category join: {category_name: ...} -> flat string
+        cat_nested = row.pop("lookup_experience_categories", None)
+        if isinstance(cat_nested, dict):
+            row["category_name"] = cat_nested.get("category_name")
+        else:
+            row["category_name"] = None
+
+    return rows
 
 
 def fetch_experience_by_id(experience_id: int) -> dict | None:
@@ -2467,6 +2549,31 @@ def resolve_staging_entry(
         .eq("staging_id", staging_id)
         .execute()
     )
+
+
+def reset_staging_entries(url_registry_id: int) -> int:
+    """
+    Revert all non-pending staging rows for a phone back to 'pending_review'.
+    Clears resolution metadata. Returns the number of rows reset.
+    """
+    from app.core.supabase_client import get_client
+    client = get_client()
+    result = (
+        client
+        .schema("pipeline")
+        .table("lookup_value_staging")
+        .update({
+            "status":                  "pending_review",
+            "resolution":              None,
+            "resolved_lookup_id":      None,
+            "resolution_target_table": None,
+            "new_row_data":            None,
+        })
+        .eq("url_registry_id", url_registry_id)
+        .neq("status", "pending_review")
+        .execute()
+    )
+    return len(result.data or [])
 
 
 # ===========================================================================

@@ -63,6 +63,7 @@ from app.repositories.extraction_repository import (
     insert_admin_experience_override,
     insert_admin_field_override,
     insert_admin_review_session,
+    reset_staging_entries,
     resolve_staging_entry,
     set_experience_suppressed,
     update_conflict_resolution,
@@ -257,6 +258,11 @@ class StagingResolveRequest(BaseModel):
         return v
 
 
+class StagingResetRequest(BaseModel):
+    url_registry_id: int
+    final_id:        int
+
+
 # ---------------------------------------------------------------------------
 # Available sources for a phone — scraped files + transcripts
 # ---------------------------------------------------------------------------
@@ -342,7 +348,7 @@ async def get_phone_sources(url_registry_id: int):
         lambda: client
         .schema("pipeline")
         .table("youtube_video_url_registry")
-        .select("video_registry_id")
+        .select("video_registry_id, channel_id, video_url, yt_video_id")
         .eq("url_registry_id", url_registry_id)
         .eq("status", "fetched_raw")
         .execute()
@@ -359,9 +365,17 @@ async def get_phone_sources(url_registry_id: int):
             .in_("video_registry_id", video_ids)
             .execute()
         )
-        # Build video_registry_id → channel_id map from the earlier video_result
+        # Build video_registry_id → channel_id / video_url / yt_video_id maps
         vid_to_channel_id = {
             r["video_registry_id"]: r.get("channel_id")
+            for r in (video_result.data or [])
+        }
+        vid_to_video_url = {
+            r["video_registry_id"]: r.get("video_url")
+            for r in (video_result.data or [])
+        }
+        vid_to_yt_video_id = {
+            r["video_registry_id"]: r.get("yt_video_id")
             for r in (video_result.data or [])
         }
         # Fetch channel names for all channel_ids referenced by this phone's videos
@@ -387,6 +401,8 @@ async def get_phone_sources(url_registry_id: int):
                     vid_to_channel_id.get(r["video_registry_id"]),
                     f"Transcript",
                 ),
+                "video_url":         vid_to_video_url.get(r["video_registry_id"]),
+                "yt_video_id":       vid_to_yt_video_id.get(r["video_registry_id"]),
             }
             for r in (transcript_result.data or [])
         ]
@@ -602,18 +618,24 @@ async def get_source_file(source_type: str, source_id: int):
     storage_path: str | None = None
     content_type: str = ""
 
+    screenshot_before_path: str | None = None
+    screenshot_after_path:  str | None = None
+
     if source_type == "raw_scraped":
         row_result = await asyncio.to_thread(
             lambda: client
             .schema("pipeline")
             .table("raw_scraped_data")
-            .select("raw_id, markdown_path")
+            .select("raw_id, markdown_path, screenshot_before_path, screenshot_after_path")
             .eq("raw_id", source_id)
             .execute()
         )
         if not row_result.data:
             raise HTTPException(status_code=404, detail=f"raw_id={source_id} not found.")
-        storage_path = row_result.data[0].get("markdown_path")
+        row_data               = row_result.data[0]
+        storage_path           = row_data.get("markdown_path")
+        screenshot_before_path = row_data.get("screenshot_before_path")
+        screenshot_after_path  = row_data.get("screenshot_after_path")
         content_type = "markdown"
 
     elif source_type == "transcript":
@@ -664,13 +686,39 @@ async def get_source_file(source_type: str, source_id: int):
         logger.error("Failed to extract signed URL from response: %s", response)
         raise HTTPException(status_code=500, detail="Could not generate signed URL.")
 
+    # Generate screenshot signed URLs in parallel if paths exist
+    screenshot_before_url: str | None = None
+    screenshot_after_url:  str | None = None
+
+    async def _sign(path: str) -> str | None:
+        if not path:
+            return None
+        try:
+            resp = await asyncio.to_thread(
+                lambda: client
+                .storage
+                .from_(_RAW_FILES_BUCKET)
+                .create_signed_url(path, _SOURCE_FILE_SIGNED_URL_EXPIRY)
+            )
+            return _extract_signed_url(resp)
+        except Exception:
+            return None
+
+    if screenshot_before_path or screenshot_after_path:
+        screenshot_before_url, screenshot_after_url = await asyncio.gather(
+            _sign(screenshot_before_path or ""),
+            _sign(screenshot_after_path  or ""),
+        )
+
     return {
-        "source_type":  source_type,
-        "source_id":    source_id,
-        "signed_url":   signed_url,
-        "expires_in":   _SOURCE_FILE_SIGNED_URL_EXPIRY,
-        "path":         storage_path,
-        "content_type": content_type,
+        "source_type":           source_type,
+        "source_id":             source_id,
+        "signed_url":            signed_url,
+        "expires_in":            _SOURCE_FILE_SIGNED_URL_EXPIRY,
+        "path":                  storage_path,
+        "content_type":          content_type,
+        "screenshot_before_url": screenshot_before_url,
+        "screenshot_after_url":  screenshot_after_url,
     }
 
 
@@ -1322,10 +1370,10 @@ async def resolve_staging(
     """
     admin = _admin_user(x_admin_user)
 
-    if req.resolution in ("inserted_new", "mapped_to_existing") and req.resolved_lookup_id is None:
+    if req.resolution == "mapped_to_existing" and req.resolved_lookup_id is None:
         raise HTTPException(
             status_code=400,
-            detail=f"resolved_lookup_id is required for resolution='{req.resolution}'.",
+            detail="resolved_lookup_id is required for resolution='mapped_to_existing'.",
         )
 
     # Fix 7: Capture field_path BEFORE marking the entry resolved.
@@ -1449,6 +1497,41 @@ async def resolve_staging(
         "resolution":            req.resolution,
         "resolved_lookup_id":    req.resolved_lookup_id,
         "pending_staging_values": pending_count,
+    }
+
+
+@router.post("/staging/reset")
+async def reset_staging(
+    req: StagingResetRequest,
+    x_admin_user: str | None = Header(default=None),
+):
+    """
+    POST /approval/staging/reset
+
+    Reverts ALL resolved staging entries for a phone back to status='pending_review'.
+    Clears resolution, resolved_lookup_id, resolution_target_table, new_row_data.
+    Used by the 'Unlock staging' button. Recounts and updates the
+    pending_staging_values gate counter.
+    """
+    admin = _admin_user(x_admin_user)
+    reset_count = await asyncio.to_thread(reset_staging_entries, req.url_registry_id)
+
+    remaining = await asyncio.to_thread(
+        fetch_pending_staging_entries, req.url_registry_id
+    )
+    await asyncio.to_thread(
+        update_gate_conditions,
+        req.final_id,
+        {"pending_staging_values": len(remaining)},
+    )
+    logger.info(
+        "staging/reset: url_registry_id=%d reset_count=%d admin=%s",
+        req.url_registry_id, reset_count, admin,
+    )
+    return {
+        "url_registry_id":        req.url_registry_id,
+        "reset_count":            reset_count,
+        "pending_staging_values": len(remaining),
     }
 
 

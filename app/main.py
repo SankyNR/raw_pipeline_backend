@@ -17,9 +17,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.core.config import validate_config
-from app.api import scraper, youtube, extraction, inference, approval, admin_lookup
+from app.api import scraper, youtube, extraction, inference, approval, admin_lookup, embeddings
 from app.services.ecd_generator import pre_warm_ecd
 from app.services.normalizer import build_lookup_cache
+from app.services.embedding_queue_worker import (
+    start_embedding_queue_worker,
+    stop_embedding_queue_worker,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,8 +52,15 @@ async def lifespan(app: FastAPI):
     validate_config()                 # includes v2 coverage check
     pre_warm_ecd()                    # Task 0.4 — load and validate ECD YAML files
     await build_lookup_cache()        # Task 4.1 — populate LOOKUP_CACHE for normaliser
+
+    # EM6 — start embedding queue background worker
+    worker_task = await start_embedding_queue_worker()
     logger.info("Extraction pipeline backend (v5) started.")
+
     yield
+
+    # EM6 — stop worker cleanly before shutdown
+    await stop_embedding_queue_worker(worker_task)
     logger.info("Extraction pipeline backend shut down.")
 
 
@@ -84,3 +95,4 @@ app.include_router(youtube.router)
 app.include_router(inference.router)
 app.include_router(extraction.router)
 app.include_router(approval.router)
+app.include_router(embeddings.router)
